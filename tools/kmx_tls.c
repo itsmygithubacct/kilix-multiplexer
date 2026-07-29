@@ -58,6 +58,12 @@ certificate_fingerprint(X509 *certificate, char *out, size_t size) {
     unsigned int length = 0;
     if (size <= KMX_TLS_FINGERPRINT_HEX) return false;
     if (!X509_digest(certificate, EVP_sha256(), digest, &length)) return false;
+    /* The fingerprint comparison reads exactly KMX_TLS_FINGERPRINT_HEX
+     * characters, so a digest of any other length would leave part of `out`
+     * unwritten and the comparison would run over uninitialised bytes.  SHA-256
+     * always gives 32, but that is a fact about the algorithm rather than
+     * something this function was checking. */
+    if ((size_t)length * 2u != KMX_TLS_FINGERPRINT_HEX) return false;
     hex_digest(digest, length, out);
     return true;
 }
@@ -143,17 +149,29 @@ wrap(SSL *ssl) {
 }
 
 kmx_tls_session *
-kmx_tls_server_accept(kmx_tls_server *server, int fd) {
+kmx_tls_server_begin(kmx_tls_server *server, int fd) {
     SSL *ssl;
     if (!server) return NULL;
     ssl = SSL_new(server->context);
     if (!ssl) return NULL;
     SSL_set_fd(ssl, fd);
-    if (SSL_accept(ssl) != 1) {
-        SSL_free(ssl);
-        return NULL;
-    }
     return wrap(ssl);
+}
+
+kmx_tls_progress
+kmx_tls_server_step(kmx_tls_session *session) {
+    int rc;
+    if (!session) return KMX_TLS_FAILED;
+    rc = SSL_accept(session->ssl);
+    if (rc == 1) return KMX_TLS_DONE;
+    switch (SSL_get_error(session->ssl, rc)) {
+    case SSL_ERROR_WANT_READ:
+        return KMX_TLS_WANT_READ;
+    case SSL_ERROR_WANT_WRITE:
+        return KMX_TLS_WANT_WRITE;
+    default:
+        return KMX_TLS_FAILED;
+    }
 }
 
 kmx_tls_client *

@@ -97,7 +97,7 @@ kmx_compress(const void *data, size_t size, kmx_buffer *out) {
 }
 
 kmx_result
-kmx_decompress(const void *data, size_t size, kmx_buffer *out) {
+kmx_decompress(const void *data, size_t size, kmx_buffer *out, size_t limit) {
     const unsigned char *bytes = data;
     size_t offset = 0;
     uint64_t raw_size;
@@ -110,8 +110,8 @@ kmx_decompress(const void *data, size_t size, kmx_buffer *out) {
     result = get_varint_buffer(bytes, size, &offset, &raw_size);
     if (result != KMX_OK) return result;
     /* The declared size drives an allocation, so it is bounded by what the
-     * cell codec could ever legitimately produce. */
-    if (raw_size > (uint64_t)KMX_MAX_CELLS * 16u) return KMX_ERR_LIMIT;
+     * caller says its plane can legitimately produce. */
+    if (!limit || raw_size > (uint64_t)limit) return KMX_ERR_LIMIT;
 
     if (codec == KMX_CODEC_RAW) {
         if (size - offset != raw_size) return KMX_ERR_PROTOCOL;
@@ -453,7 +453,8 @@ kmx_receiver_apply(
     result = get_varint_buffer(bytes, size, &offset, &seq);
     if (result != KMX_OK) return result;
     kmx_buffer_init(&plain);
-    result = kmx_decompress(bytes + offset, size - offset, &plain);
+    result = kmx_decompress(
+        bytes + offset, size - offset, &plain, KMX_CELLS_WIRE_MAX);
     if (result == KMX_OK) {
         result = kmx_cells_apply(&receiver->grid, plain.data, plain.size);
     }

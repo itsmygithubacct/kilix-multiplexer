@@ -55,17 +55,25 @@ ssh -o BatchMode=yes "$remote" "cd '$remote_path' && make --silent" >/dev/null 2
 echo "built on both"
 echo
 
+# Every TCP bind requires a token now, loopback included - a loopback port has
+# no SO_PEERCRED behind it, so without one any local user could attach as a
+# control client.  These sessions are given a fixed one rather than reading back
+# the minted one, because half of them are started on the other machine and
+# scraping a remote process's stderr through ssh is more moving parts than the
+# test needs.
+net_token=0f1e2d3c4b5a69788796a5b4c3d2e1f0
+
 # --- a session here, a client there ----------------------------------------
 here_port=$base_port
 there_port=$((base_port + 1))
-setsid "$root/build/kmx-serve" --socket "127.0.0.1:$here_port" --rows 12 --cols 60 \
+setsid "$root/build/kmx-serve" --socket "127.0.0.1:$here_port" --token "$net_token" --rows 12 --cols 60 \
     -- /bin/sh -c 'stty -echo; printf "LOCAL_PANE\r\n"; while IFS= read -r l; do printf "ECHO[%s]\r\n" "$l"; done' \
     >/dev/null 2>&1 &
 sleep 1.5
 # -R publishes a port on the remote that reaches this machine's loopback.
 out=$(timeout 60 ssh -o BatchMode=yes -o ExitOnForwardFailure=yes \
     -R "$there_port:127.0.0.1:$here_port" "$remote" \
-    "'$remote_path/build/kmx-attach' --socket 127.0.0.1:$there_port --dump --seconds 4 --send 'FROM_REMOTE
+    "'$remote_path/build/kmx-attach' --socket 127.0.0.1:$there_port --token $net_token --dump --seconds 4 --send 'FROM_REMOTE
 '" 2>/dev/null | visible)
 if printf '%s' "$out" | grep -q LOCAL_PANE; then
     report pass "a remote client renders a session running here"
@@ -84,14 +92,14 @@ sleep 0.5
 remote_port=$((base_port + 2))
 local_port=$((base_port + 3))
 ssh -o BatchMode=yes "$remote" \
-    "pkill -x kmx-serve 2>/dev/null; setsid nohup '$remote_path/build/kmx-serve' --socket 127.0.0.1:$remote_port --rows 12 --cols 60 -- /bin/sh -c 'stty -echo; printf \"REMOTE_PANE\r\n\"; while IFS= read -r l; do printf \"ECHO[%s]\r\n\" \"\$l\"; done' >/dev/null 2>&1 </dev/null & sleep 1" \
+    "pkill -x kmx-serve 2>/dev/null; setsid nohup '$remote_path/build/kmx-serve' --socket 127.0.0.1:$remote_port --token $net_token --rows 12 --cols 60 -- /bin/sh -c 'stty -echo; printf \"REMOTE_PANE\r\n\"; while IFS= read -r l; do printf \"ECHO[%s]\r\n\" \"\$l\"; done' >/dev/null 2>&1 </dev/null & sleep 1" \
     >/dev/null 2>&1
 ssh -o BatchMode=yes -o ExitOnForwardFailure=yes \
     -L "$local_port:127.0.0.1:$remote_port" -N "$remote" &
 tunnel=$!
 sleep 2
 out=$(timeout 30 "$root/build/kmx-attach" --socket "127.0.0.1:$local_port" \
-    --dump --seconds 4 --send 'FROM_LOCAL
+    --token "$net_token" --dump --seconds 4 --send 'FROM_LOCAL
 ' 2>/dev/null | visible)
 kill "$tunnel" 2>/dev/null
 tunnel=""

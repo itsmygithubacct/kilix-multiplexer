@@ -25,6 +25,17 @@ extern "C" {
 #define KMX_MAX_DIMENSION 2000
 #define KMX_MAX_CELLS 500000
 
+/* An upper bound on what the cell encoder can produce for one screen, used to
+ * bound the allocation a peer's declared uncompressed size asks for.
+ *
+ * Derived rather than measured, from the worst case the encoder allows: every
+ * cell in its own run, so each pays a full run header (column and length
+ * varints, attributes, underline and width, two four-byte colours) plus its
+ * character list (a count and up to KMX_MAX_CHARS codepoints, three varint
+ * bytes each at U+10FFFF).  That comes to about 45 bytes; 64 leaves room for
+ * per-row overhead without the bound becoming decorative. */
+#define KMX_CELLS_WIRE_MAX ((size_t)KMX_MAX_CELLS * 64u + 64u)
+
 typedef enum {
     KMX_OK = 0,
     KMX_ERR_INVALID = 1,
@@ -157,7 +168,18 @@ kmx_result kmx_cells_apply(kmx_grid *grid, const void *data, size_t size);
  * The framing records which it chose, so an incompressible message costs one
  * byte rather than growing. */
 kmx_result kmx_compress(const void *data, size_t size, kmx_buffer *out);
-kmx_result kmx_decompress(const void *data, size_t size, kmx_buffer *out);
+
+/* `limit` bounds the declared uncompressed size, because that number drives an
+ * allocation and arrives from a peer.  It is a parameter rather than a
+ * constant because each plane's legitimate maximum differs by orders of
+ * magnitude: a cell message and a video frame have no business sharing a
+ * bound. */
+kmx_result kmx_decompress(
+    const void *data,
+    size_t size,
+    kmx_buffer *out,
+    size_t limit
+);
 
 /* ---- state synchronisation -------------------------------------------- */
 

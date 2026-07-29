@@ -28,10 +28,24 @@ typedef struct kmx_tls_session kmx_tls_session;
 kmx_tls_server *kmx_tls_server_create(char *fingerprint, size_t size);
 void kmx_tls_server_free(kmx_tls_server *server);
 
-/* Wrap an accepted socket.  Returns NULL if the handshake fails, which is not
- * an error worth reporting in detail: a peer that cannot complete it is not a
- * peer. */
-kmx_tls_session *kmx_tls_server_accept(kmx_tls_server *server, int fd);
+/* How a handshake in progress wants to be driven. */
+typedef enum {
+    KMX_TLS_DONE,
+    KMX_TLS_WANT_READ,
+    KMX_TLS_WANT_WRITE,
+    KMX_TLS_FAILED
+} kmx_tls_progress;
+
+/* Wrap an accepted socket without performing the handshake.
+ *
+ * Split in two because a handshake done inline is a handshake a peer controls
+ * the duration of: a single-threaded server that runs SSL_accept to completion
+ * inside its accept path stops serving everyone else until some stranger
+ * finishes talking, or does not.  So the socket stays non-blocking and the
+ * caller drives kmx_tls_server_step from its poll loop, under whatever deadline
+ * it considers reasonable. */
+kmx_tls_session *kmx_tls_server_begin(kmx_tls_server *server, int fd);
+kmx_tls_progress kmx_tls_server_step(kmx_tls_session *session);
 
 /* `fingerprint` is required: a client that would take any certificate has no
  * more assurance than no TLS at all, and a comforting one. */

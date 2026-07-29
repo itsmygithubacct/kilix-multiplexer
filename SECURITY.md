@@ -97,13 +97,20 @@ Every length that arrives from a peer is bounded before it is believed:
 | Frame length | `KMX_MESSAGE_MAX`, 8 MiB | `src/frame.c` |
 | Pending unparsed bytes | 2 × `KMX_MESSAGE_MAX` | `src/frame.c`, `kmx_framer_push` |
 | Grid dimensions | `KMX_MAX_DIMENSION`, `KMX_MAX_CELLS` | `include/kilix_mux.h`, `src/grid.c` |
-| Decompressed size | `KMX_MAX_CELLS * 16` | `src/sync.c`, `kmx_decompress` |
+| Decompressed size | per plane, passed in: `KMX_CELLS_WIRE_MAX` for cells, 64 MiB + 64 KiB for motion, `KMX_AUDIO_BLOCK_MAX` + 64 for audio | `src/sync.c`, `kmx_decompress` |
 | Pane count and geometry | `KMX_MAX_PANES`, must fit the screen | `src/layout.c` |
 | Image payload | `KMX_MESSAGE_MAX`; cache bounded in entries and bytes | `src/graphics.c` |
 | Motion frame | 8192 per axis, 64 MiB total | `src/motion.c` |
 | Audio block | `KMX_AUDIO_BLOCK_MAX`, 1 MiB; rate and channels range-checked | `src/audio.c` |
 | Clients | `KMX_MAX_CLIENTS`, 8 | `tools/kmx_serve.c` |
 | Per-client backlog | `KMX_CLIENT_QUEUE_LIMIT`, 4 MiB, then disconnect | `tools/kmx_serve.c` |
+| Per-pane typed-ahead input | `KMX_PANE_INPUT_LIMIT`, 256 KiB, then dropped | `tools/kmx_serve.c` |
+| Time to finish connecting | `KMX_SETTLE_MS`, 10 s for handshake and HELLO | `tools/kmx_serve.c` |
+
+One correction to the row above. `kmx_decompress` originally took no bound and
+applied a single cell-plane figure to every caller, which was both too small
+for the motion plane and far too large for audio. It is now a parameter,
+because a cell message and a video frame have no business sharing a limit.
 
 ### How often a peer may try
 
@@ -115,10 +122,34 @@ shutdown so the behaviour is visible rather than silent.
 
 ### What a peer can make the server do
 
-Nothing that blocks it. Client sockets are non-blocking with a bounded
-backlog, so a peer that stops reading is disconnected rather than allowed to
-stall the panes or the other clients — asserted by an integration check that
-connects and never reads while a pane floods.
+Nothing that blocks it — but that claim was wrong twice, and both are worth
+recording rather than quietly fixed.
+
+Client sockets are non-blocking with a bounded backlog, so a peer that stops
+reading is disconnected rather than allowed to stall the panes or the other
+clients — asserted by an integration check that connects and never reads while
+a pane floods. That part held.
+
+**Writes to the pane did not.** Input arriving from a client was written to the
+pty master with a blocking write, so a program that stopped reading its own
+input could stop the server: not just its own pane, but every pane, every other
+client, and the shutdown path. Reaching it needs a pane in raw mode with echo
+off — in canonical mode the tty echoes input back and the server drains it, so
+the buffer never fills, which is why it survived every earlier test. Measured
+against the version before the fix, the server stopped serving after 0.1 MB and
+had to be killed. Input is now queued per pane, bounded, and drained on POLLOUT
+like everything else; `tests/backpressure.sh` fails against the old binary and
+passes against the new one.
+
+**The TLS handshake did not either.** It ran to completion inside the accept
+path on a blocking socket, so a peer that connected and then went quiet held
+the whole loop. A receive timeout was not enough on its own: it is per-recv, so
+a peer sending a byte every four seconds resets it forever. The handshake is
+now driven from the poll loop a step at a time, and a connection that has not
+finished handshaking *and* sent HELLO within `KMX_SETTLE_MS` is released —
+swept over every slot, not only the readable ones, because a peer that has gone
+quiet generates no events. Asserted by a test that fills all eight slots with
+silent peers and checks a real client gets in afterwards.
 
 ### Parsers
 
@@ -129,6 +160,19 @@ too, because that is what the client does with it next.
 
 The suite additionally asserts that **every proper prefix** of a valid message
 is rejected and that trailing bytes are an error rather than ignored.
+
+Fuzzing found one bug that short runs did not: the motion decoder validated
+dimensions *after* narrowing them to `int`, so a declared width of 0x100000001
+truncated to 1, passed the check, and then asked for twenty petabytes. It also
+missed a second bug of the same shape for a while because the fuzz targets
+built a fresh sink per input, which made the delta path unreachable — the sinks
+are now persistent, and the delta path is reached.
+
+`clang --analyze` runs clean across `src/` and `tools/`. It found three things
+the compiler did not: an uninitialised `count` read in the motion decoder's
+loop condition, a `memcpy` from a null pointer with zero length in the image
+cache, and a fingerprint comparison that would have read uninitialised bytes if
+`X509_digest` ever returned a length other than 32.
 
 ## Known gaps
 
@@ -145,8 +189,13 @@ Stated plainly rather than left to be discovered.
    line. That is the operator's own input, not a peer's, but it is worth
    naming: a peer cannot start a pane, and there is no message that does.
 4. **The audio and pixel sources are shell commands** with the same property.
-5. **Not reviewed by anyone else.** This is a self-review by the author of the
-   code, which is worth less than an independent one.
+5. **A peer can still cost the server time, just not stop it.** Every blocking
+   path above now has a bound; none of them is zero. A same-uid or
+   token-holding peer can occupy a slot for `KMX_SETTLE_MS` and can reconnect.
+   The accept bucket is what makes that finite rather than free.
+6. **Independent review has not been completed.** The tests and defect history
+   in this document are evidence about specific behavior, not a substitute for
+   an independent security review.
 
 ## Things deliberately not done
 

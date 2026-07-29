@@ -196,7 +196,10 @@ kmx_image_cache_put(
     if (!slot) return KMX_ERR_LIMIT;
     copy = malloc(size ? size : 1);
     if (!copy) return KMX_ERR_MEMORY;
-    memcpy(copy, data, size);
+    /* Guarded rather than relying on a zero length making the pointer moot:
+     * memcpy requires both pointers to be valid even when it copies nothing,
+     * and a zero-size entry with a null `data` is accepted above. */
+    if (size) memcpy(copy, data, size);
     slot->key = *key;
     slot->data = copy;
     slot->size = size;

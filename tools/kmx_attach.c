@@ -335,6 +335,16 @@ main(int argc, char **argv) {
                 /* A pane that ended is not a link that dropped; do not chase
                  * a session that is over. */
                 if (pane_ended || reconnect_seconds <= 0) break;
+                /* The TLS session goes first, while its descriptor is still
+                 * its own.  Freeing it after the close would send close_notify
+                 * to whatever number the kernel has since handed out - which,
+                 * because descriptors are reused lowest-first, is reliably the
+                 * replacement connection about to be handshaked on. */
+                if (tls) {
+                    kmx_tls_session_free(tls);
+                    tls = NULL;
+                    active_tls = NULL;
+                }
                 close(fd);
                 replacement = reconnect(&endpoint, reconnect_seconds);
                 if (replacement < 0) {
@@ -346,8 +356,6 @@ main(int argc, char **argv) {
                     /* A new connection is a new handshake, and the
                      * fingerprint is checked again: a server that changed
                      * identity while we were away is not the same server. */
-                    kmx_tls_session_free(tls);
-                    active_tls = NULL;
                     tls = kmx_tls_client_connect(tls_client, fd);
                     active_tls = tls;
                     if (!tls) {

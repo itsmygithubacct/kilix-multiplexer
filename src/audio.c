@@ -239,7 +239,8 @@ kmx_audio_sink_apply(kmx_audio_sink *sink, const void *data, size_t size) {
     }
 
     kmx_buffer_init(&plain);
-    result = kmx_decompress(bytes + 4, size - 4, &plain);
+    result = kmx_decompress(
+        bytes + 4, size - 4, &plain, KMX_AUDIO_BLOCK_MAX + 64u);
     if (result != KMX_OK) {
         kmx_buffer_free(&plain);
         return result;

@@ -308,7 +308,16 @@ kmx_motion_sink_apply(kmx_motion_sink *sink, const void *data, size_t size) {
     }
 
     kmx_buffer_init(&plain);
-    result = kmx_decompress(bytes + 4, size - 4, &plain);
+    /* The largest frame valid_dimensions permits, plus the framing around it.
+     *
+     * The slack has to cover a delta, not just a keyframe: at 8192 rows and a
+     * 16-row band that is 512 band headers on top of the pixels, and dimensions
+     * exist (2731x8191, say) whose pixels come within one byte of the 64 MiB
+     * ceiling.  Sixty-four bytes of slack, which is what this had, would have
+     * rejected those frames as over-long.  64 KiB is far more than the headers
+     * can occupy and still a bound. */
+    result = kmx_decompress(
+        bytes + 4, size - 4, &plain, 64u * 1024u * 1024u + 64u * 1024u);
     if (result != KMX_OK) {
         kmx_buffer_free(&plain);
         return result;
@@ -360,11 +369,16 @@ kmx_motion_sink_apply(kmx_motion_sink *sink, const void *data, size_t size) {
         return KMX_OK;
     }
     {
-        uint64_t count;
+        /* Initialised because get_varint leaves its output untouched when it
+         * fails, and the loop condition below reads `count` before it reads
+         * `result`.  No band would have been decoded either way - the second
+         * operand stops it - but reading an indeterminate value to decide that
+         * is undefined behaviour, and it is what clang's analyzer points at. */
+        uint64_t count = 0;
         uint64_t band;
         result = get_varint(&in, &count);
         if (result == KMX_OK && count > (uint64_t)height) result = KMX_ERR_PROTOCOL;
-        for (band = 0; band < count && result == KMX_OK; band++) {
+        for (band = 0; result == KMX_OK && band < count; band++) {
             uint64_t row;
             uint64_t rows;
             size_t offset;
@@ -372,7 +386,19 @@ kmx_motion_sink_apply(kmx_motion_sink *sink, const void *data, size_t size) {
             result = get_varint(&in, &row);
             if (result == KMX_OK) result = get_varint(&in, &rows);
             if (result != KMX_OK) break;
-            if (!rows || row + rows > height) {
+            /* Each operand is bounded before they are added.
+             *
+             * Checking only the sum is not enough: these are unbounded 64-bit
+             * varints, so row = 2^64-1 with rows = 1 wraps to 0 and passes,
+             * after which `offset` wraps too and the memcpy below writes
+             * backwards off the front of the buffer.  The length check that
+             * follows cannot catch it, because that validates against the
+             * source and the damage is at the destination.
+             *
+             * This is the second bug of this exact shape here - the first was
+             * the dimensions above, validated after being narrowed. Both were
+             * a bound applied to the wrong thing. */
+            if (!rows || row >= height || rows > height - row) {
                 result = KMX_ERR_PROTOCOL;
                 break;
             }

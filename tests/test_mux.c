@@ -435,7 +435,7 @@ test_compression_roundtrip(void) {
     kmx_buffer_init(&plain);
     CHECK(kmx_compress(repetitive, sizeof repetitive, &wire) == KMX_OK);
     CHECK(wire.size < sizeof repetitive / 4);
-    CHECK(kmx_decompress(wire.data, wire.size, &plain) == KMX_OK);
+    CHECK(kmx_decompress(wire.data, wire.size, &plain, KMX_CELLS_WIRE_MAX) == KMX_OK);
     CHECK(plain.size == sizeof repetitive);
     CHECK(memcmp(plain.data, repetitive, plain.size) == 0);
 
@@ -448,7 +448,7 @@ test_compression_roundtrip(void) {
     kmx_buffer_reset(&plain);
     CHECK(kmx_compress(noise, sizeof noise, &wire) == KMX_OK);
     CHECK(wire.size <= sizeof noise + 8);
-    CHECK(kmx_decompress(wire.data, wire.size, &plain) == KMX_OK);
+    CHECK(kmx_decompress(wire.data, wire.size, &plain, KMX_CELLS_WIRE_MAX) == KMX_OK);
     CHECK(plain.size == sizeof noise);
     CHECK(memcmp(plain.data, noise, plain.size) == 0);
 
@@ -456,7 +456,7 @@ test_compression_roundtrip(void) {
     for (index = 0; index < wire.size; index++) {
         kmx_buffer scratch;
         kmx_buffer_init(&scratch);
-        CHECK(kmx_decompress(wire.data, index, &scratch) != KMX_OK);
+        CHECK(kmx_decompress(wire.data, index, &scratch, KMX_CELLS_WIRE_MAX) != KMX_OK);
         kmx_buffer_free(&scratch);
     }
     kmx_buffer_free(&wire);
@@ -1362,6 +1362,50 @@ test_motion_sink_rejects_truncating_dimensions(void) {
     kmx_buffer_free(&body);
 }
 
+/* The decoder's allowance has to cover the largest legitimate frame, which is a
+ * delta rather than a keyframe: at 8192 rows and a 16-row band that is 512 band
+ * headers on top of the pixels.  2731x8191 puts the pixels one byte under the
+ * 64 MiB ceiling, so the headers are entirely slack - and with the 64 bytes
+ * this originally allowed, a frame the encoder had just produced came back
+ * rejected as over-long. */
+static void
+test_motion_accepts_a_frame_at_the_ceiling(void) {
+    const int width = 2731;
+    const int height = 8191;
+    size_t bytes = (size_t)width * (size_t)height * 3u;
+    unsigned char *frame = malloc(bytes);
+    kmx_motion *motion = NULL;
+    kmx_motion_sink *sink = NULL;
+    kmx_buffer message;
+    bool produced = false;
+    size_t index;
+
+    if (!frame) return;   /* not a failure: this machine cannot hold the case */
+    for (index = 0; index < bytes; index++) frame[index] = (unsigned char)(index * 31);
+    CHECK(kmx_motion_create(&motion, 0) == KMX_OK);
+    CHECK(kmx_motion_sink_create(&sink) == KMX_OK);
+
+    kmx_buffer_init(&message);
+    CHECK(kmx_motion_offer(motion, frame, width, height, 0, &message, &produced, NULL) == KMX_OK);
+    CHECK(produced);
+    CHECK(kmx_motion_sink_apply(sink, message.data, message.size) == KMX_OK);
+
+    /* One pixel per band, so every band header is present in the delta. */
+    for (index = 0; index + 1 < (size_t)height; index += 16) {
+        frame[index * (size_t)width * 3u] ^= 0xff;
+    }
+    kmx_buffer_reset(&message);
+    produced = false;
+    CHECK(kmx_motion_offer(motion, frame, width, height, 100, &message, &produced, NULL) == KMX_OK);
+    CHECK(produced);
+    CHECK(kmx_motion_sink_apply(sink, message.data, message.size) == KMX_OK);
+
+    kmx_buffer_free(&message);
+    kmx_motion_sink_free(sink);
+    kmx_motion_free(motion);
+    free(frame);
+}
+
 static void
 test_motion_sink_rejects_malformed_input(void) {
     enum { WIDTH = 32, HEIGHT = 16 };
@@ -1666,6 +1710,7 @@ main(void) {
     RUN(test_motion_drops_rather_than_queues);
     RUN(test_motion_sink_rejects_truncating_dimensions);
     RUN(test_motion_sink_rejects_malformed_input);
+    RUN(test_motion_accepts_a_frame_at_the_ceiling);
     RUN(test_audio_roundtrip_and_timestamps);
     RUN(test_audio_reports_gaps);
     RUN(test_audio_drops_rather_than_buffers);

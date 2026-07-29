@@ -59,13 +59,30 @@
  * short enough to paste. */
 #define KMX_TOKEN_HEX 32
 
+/* How long a new connection has to complete its TLS handshake and send HELLO.
+ * Generous for any real client on any real link, and finite, which is the
+ * point. */
+#define KMX_SETTLE_MS 10000u
+
 typedef struct {
     kmx_term *term;
     int master;
     pid_t child;
     bool alive;
     const char *command;
+    /* Typed bytes the pty has not accepted yet.  A pty master holds only a few
+     * kilobytes, so a program that stops reading its input fills it quickly -
+     * and a blocking write there would stall this loop, freezing every pane and
+     * every client on behalf of one wedged program.  So input is queued and
+     * drained on POLLOUT, exactly like a client's outbound queue. */
+    kmx_buffer input;
+    size_t input_offset;
 } pane;
+
+/* Typing ahead of a program that is not reading is worth a little tolerance and
+ * no more.  Past this the oldest keystrokes are already meaningless, so the new
+ * ones are dropped rather than the buffer grown. */
+#define KMX_PANE_INPUT_LIMIT (256u * 1024u)
 
 /* KMX_CLIENT_QUEUE_LIMIT bounds what is held for one client.  A client that
  * stops reading must not be able to stall the panes or the other clients, so
@@ -85,6 +102,13 @@ typedef struct {
     kmx_tls_session *tls;
     bool control;
     bool greeted;
+    bool handshaking;
+    bool wants_write;   /* the handshake is waiting for the socket, not the peer */
+    /* When this connection must have finished introducing itself.  A peer that
+     * connects and then goes quiet - mid-handshake or before HELLO - holds one
+     * of a small number of slots, so silence is given a limit rather than
+     * treated as patience.  Cleared once the peer has greeted. */
+    uint64_t settle_by;
     kmx_motion *motion;   /* per client: what IT has been shown */
     kmx_audio *audio;     /* per client: its own rate allowance */
     int rows;
@@ -111,6 +135,24 @@ client_send(client *item, const void *data, size_t size) {
     return send(item->fd, data, size, MSG_NOSIGNAL | MSG_DONTWAIT);
 }
 
+/* Drop what has already gone, so that a queue's limit bounds the buffer and not
+ * merely its unsent tail.
+ *
+ * Without this, a peer that drains steadily but never quite empties the queue
+ * keeps `size` growing for the life of the connection while the remainder -
+ * the only thing the limit looks at - stays comfortably small.  The memory is
+ * reclaimed at the halfway mark rather than on every write, which keeps the
+ * copying amortised while still bounding the buffer at a small multiple of the
+ * limit. */
+static void
+compact(kmx_buffer *buffer, size_t *offset) {
+    if (!*offset) return;
+    if (*offset < buffer->size / 2 && *offset < 64u * 1024u) return;
+    memmove(buffer->data, buffer->data + *offset, buffer->size - *offset);
+    buffer->size -= *offset;
+    *offset = 0;
+}
+
 /* Queue a message.  Returns -1 when the client has fallen too far behind to
  * be worth keeping. */
 static int
@@ -122,6 +164,7 @@ client_queue(client *item, kmx_message_type type, const void *payload, size_t si
         kmx_buffer_free(&framed);
         return -1;
     }
+    compact(&item->out, &item->out_offset);
     if (item->out.size - item->out_offset + framed.size > KMX_CLIENT_QUEUE_LIMIT) {
         result = -1;
     } else if (kmx_buffer_append(&item->out, framed.data, framed.size) != KMX_OK) {
@@ -172,20 +215,38 @@ now_millis(void) {
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
 }
 
+/* Push queued keystrokes at the pty, without blocking on it. */
 static int
-write_all(int fd, const void *data, size_t size) {
-    const unsigned char *cursor = data;
-    size_t done = 0;
-    while (done < size) {
-        ssize_t count = write(fd, cursor + done, size - done);
+pane_input_flush(pane *item) {
+    while (item->input_offset < item->input.size) {
+        ssize_t count = write(
+            item->master,
+            item->input.data + item->input_offset,
+            item->input.size - item->input_offset);
         if (count < 0) {
             if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
             return -1;
         }
-        if (count == 0) return -1;
-        done += (size_t)count;
+        if (count == 0) return 0;
+        item->input_offset += (size_t)count;
     }
+    item->input_offset = 0;
+    item->input.size = 0;
     return 0;
+}
+
+static void
+pane_input_queue(pane *item, const void *data, size_t size) {
+    compact(&item->input, &item->input_offset);
+    if (item->input.size - item->input_offset + size > KMX_PANE_INPUT_LIMIT) return;
+    if (kmx_buffer_append(&item->input, data, size) != KMX_OK) return;
+    (void)pane_input_flush(item);
+}
+
+static bool
+pane_input_pending(const pane *item) {
+    return item->input_offset < item->input.size;
 }
 
 /* Compared in constant time: a token check that returns early on the first
@@ -417,15 +478,15 @@ main(int argc, char **argv) {
         fprintf(stderr, "kmx-serve: cannot make sense of '%s'\n", socket_path);
         return 2;
     }
-    /* A token is mandatory once the socket is genuinely reachable from a
-     * network, and there is no way to turn it off: the alternative is handing
-     * a shell to whoever can route to the port.
+    /* Every TCP bind needs a token, loopback included.
      *
-     * The requirement follows the address, not the flag.  --lan on a loopback
-     * address reaches nobody new, and demanding a token there would be a
-     * requirement the operator never asked for. */
-    if (endpoint.kind == KMX_ENDPOINT_TCP &&
-        !kmx_endpoint_is_loopback(&endpoint) && !require_token) {
+     * An earlier version tied this to reachability, on the reasoning that
+     * loopback reaches nobody new.  That was wrong: SO_PEERCRED exists only on
+     * a Unix socket, so a loopback TCP port has no peer check at all and any
+     * local user could attach as a control client.  Reachability decides
+     * whether the traffic needs encrypting; it does not decide whether the
+     * peer needs identifying. */
+    if (endpoint.kind == KMX_ENDPOINT_TCP && !require_token) {
         if (!mint_token(token, sizeof token)) {
             fprintf(stderr, "kmx-serve: could not generate a token\n");
             return 1;
@@ -479,8 +540,14 @@ main(int argc, char **argv) {
             endpoint.host, endpoint.port, endpoint.host, endpoint.port, token,
             use_tls ? " \\\n                  --tls-fingerprint " : "",
             use_tls ? fingerprint : "");
+        /* Only when it really is in the clear.  This warning used to print on
+         * every reachable bind, including the ones that had just printed a
+         * certificate fingerprint two lines above - so the common case told the
+         * operator their encrypted session was readable by anyone on the
+         * segment.  A warning that is wrong where it is loudest teaches people
+         * to ignore the ones that are right. */
         if (endpoint.kind == KMX_ENDPOINT_TCP &&
-            !kmx_endpoint_is_loopback(&endpoint)) {
+            !kmx_endpoint_is_loopback(&endpoint) && !use_tls) {
             fprintf(stderr,
                 "  Reachable from the network, and carried in the clear:\n"
                 "  anyone who can watch the segment can read this session.\n"
@@ -515,6 +582,12 @@ main(int argc, char **argv) {
                 execl("/bin/sh", "sh", "-c", item->command, (char *)NULL);
             }
             _exit(127);
+        }
+        {
+            /* Non-blocking from here: every write to this descriptor goes
+             * through pane_input_queue, which never waits on it. */
+            int flags = fcntl(item->master, F_GETFL, 0);
+            if (flags >= 0) fcntl(item->master, F_SETFL, flags | O_NONBLOCK);
         }
         item->alive = true;
     }
@@ -579,7 +652,10 @@ main(int argc, char **argv) {
     signal(SIGTERM, handle_stop);
 
     while (!stop_requested) {
-        struct pollfd descriptors[1 + KMX_MAX_CLIENTS + KMX_MAX_PANES];
+        /* +2 for the pixel and audio pipes, which are appended after the
+         * panes.  Sizing this to listener + clients + panes alone wrote past
+         * the end whenever either was in use. */
+        struct pollfd descriptors[1 + KMX_MAX_CLIENTS + KMX_MAX_PANES + 2];
         nfds_t descriptor_count = 0;
         size_t client_at[KMX_MAX_CLIENTS];
         size_t pane_at[KMX_MAX_PANES];
@@ -599,7 +675,11 @@ main(int argc, char **argv) {
             client_at[descriptor_count - client_first] = which;
             descriptors[descriptor_count].fd = clients[which].fd;
             descriptors[descriptor_count].events =
-                (short)(POLLIN | (client_idle(&clients[which]) ? 0 : POLLOUT));
+                (short)(POLLIN |
+                        ((clients[which].handshaking
+                              ? clients[which].wants_write
+                              : !client_idle(&clients[which]))
+                             ? POLLOUT : 0));
             descriptors[descriptor_count].revents = 0;
             descriptor_count++;
         }
@@ -609,7 +689,8 @@ main(int argc, char **argv) {
             any_alive = true;
             pane_at[descriptor_count - pane_first] = slot;
             descriptors[descriptor_count].fd = panes[slot].master;
-            descriptors[descriptor_count].events = POLLIN;
+            descriptors[descriptor_count].events =
+                (short)(POLLIN | (pane_input_pending(&panes[slot]) ? POLLOUT : 0));
             descriptors[descriptor_count].revents = 0;
             descriptor_count++;
         }
@@ -687,28 +768,17 @@ main(int argc, char **argv) {
                     }
                     memset(item, 0, sizeof *item);
                     if (tls) {
-                        /* The handshake is blocking, so it is given a deadline:
-                         * a peer that opens a connection and then says nothing
-                         * must not be able to hold up the session. */
-                        struct timeval limit = {.tv_sec = 5, .tv_usec = 0};
-                        int blocking = fcntl(accepted, F_GETFL, 0);
-                        if (blocking >= 0) {
-                            fcntl(accepted, F_SETFL, blocking & ~O_NONBLOCK);
-                        }
-                        setsockopt(accepted, SOL_SOCKET, SO_RCVTIMEO,
-                                   &limit, sizeof limit);
-                        setsockopt(accepted, SOL_SOCKET, SO_SNDTIMEO,
-                                   &limit, sizeof limit);
-                        item->tls = kmx_tls_server_accept(tls, accepted);
+                        item->tls = kmx_tls_server_begin(tls, accepted);
                         if (!item->tls) {
                             close(accepted);
-                            memset(item, 0, sizeof *item);
                             item->fd = -1;
                             continue;
                         }
+                        item->handshaking = true;
                     }
                     item->fd = accepted;
                     item->control = true;
+                    item->settle_by = now_millis() + KMX_SETTLE_MS;
                     item->rows = rows;
                     item->cols = cols;
                     kmx_framer_init(&item->framer);
@@ -735,11 +805,43 @@ main(int argc, char **argv) {
             }
         }
 
+        /* Swept over every slot rather than only the readable ones: a peer that
+         * has gone quiet produces no events, which is precisely the case this
+         * is here to catch. */
+        {
+            uint64_t moment = now_millis();
+            for (slot = 0; slot < KMX_MAX_CLIENTS; slot++) {
+                if (clients[slot].fd < 0 || !clients[slot].settle_by) continue;
+                if (moment > clients[slot].settle_by) client_release(&clients[slot], count);
+            }
+        }
+
         for (which = 0; which + client_first < pane_first; which++) {
             size_t id = client_at[which];
             client *item = &clients[id];
             short revents = descriptors[client_first + which].revents;
             if (item->fd < 0 || descriptors[client_first + which].fd != item->fd) continue;
+            if (item->handshaking) {
+                /* One step per readiness, never a loop: this is a stranger's
+                 * message being parsed, and it gets a slice of the loop rather
+                 * than the loop. */
+                if (!(revents & (POLLIN | POLLOUT | POLLHUP | POLLERR))) continue;
+                switch (kmx_tls_server_step(item->tls)) {
+                case KMX_TLS_DONE:
+                    item->handshaking = false;
+                    item->wants_write = false;
+                    break;
+                case KMX_TLS_WANT_READ:
+                    item->wants_write = false;
+                    continue;
+                case KMX_TLS_WANT_WRITE:
+                    item->wants_write = true;
+                    continue;
+                default:
+                    client_release(item, count);
+                    continue;
+                }
+            }
             if (revents & POLLOUT) {
                 if (client_flush(item) != 0) {
                     client_release(item, count);
@@ -778,8 +880,17 @@ main(int argc, char **argv) {
                         break;
                     }
                     item->greeted = true;
+                    item->settle_by = 0;
+                    /* A peer's dimensions drive layout arithmetic and pane
+                     * sizing, so they are bounded here rather than trusted to
+                     * be sane. */
                     item->rows = (payload[0] << 8) | payload[1];
                     item->cols = (payload[2] << 8) | payload[3];
+                    if (item->rows < 1 || item->rows > KMX_MAX_DIMENSION ||
+                        item->cols < 1 || item->cols > KMX_MAX_DIMENSION) {
+                        client_release(item, count);
+                        break;
+                    }
                     /* A client that does not say is a control client, so an
                      * older client keeps working. */
                     if (size >= 5) item->control = payload[4] == KMX_ROLE_CONTROL;
@@ -791,7 +902,7 @@ main(int argc, char **argv) {
                     /* Enforced here, not in the client: a viewer that chose to
                      * send input still cannot reach the pane. */
                     if (item->control && focused < count && panes[focused].alive) {
-                        (void)write_all(panes[focused].master, payload, size);
+                        pane_input_queue(&panes[focused], payload, size);
                     }
                 } else if (type == KMX_MSG_FOCUS && size >= 1 && item->control) {
                     size_t wanted = payload[0];
@@ -803,8 +914,15 @@ main(int argc, char **argv) {
                         layout.generation++;
                     }
                 } else if (type == KMX_MSG_RESIZE && size == 4 && item->control) {
-                    item->rows = (payload[0] << 8) | payload[1];
-                    item->cols = (payload[2] << 8) | payload[3];
+                    int wanted_r = (payload[0] << 8) | payload[1];
+                    int wanted_c = (payload[2] << 8) | payload[3];
+                    if (wanted_r < 1 || wanted_r > KMX_MAX_DIMENSION ||
+                        wanted_c < 1 || wanted_c > KMX_MAX_DIMENSION) {
+                        client_release(item, count);
+                        break;
+                    }
+                    item->rows = wanted_r;
+                    item->cols = wanted_c;
                 } else if (type == KMX_MSG_ACK && size >= 9) {
                     uint64_t sequence = 0;
                     size_t position;
@@ -864,10 +982,9 @@ main(int argc, char **argv) {
 
         for (which = 0; which < pane_descriptors; which++) {
             size_t id = pane_at[which];
-            if (!(descriptors[pane_first + which].revents &
-                  (POLLIN | POLLHUP | POLLERR))) {
-                continue;
-            }
+            short revents = descriptors[pane_first + which].revents;
+            if (revents & POLLOUT) (void)pane_input_flush(&panes[id]);
+            if (!(revents & (POLLIN | POLLHUP | POLLERR))) continue;
             {
                 ssize_t received = read(panes[id].master, buffer, sizeof buffer);
                 if (received > 0) {
@@ -895,6 +1012,8 @@ main(int argc, char **argv) {
                     kmx_buffer message;
                     bool produced = false;
                     if (item->fd < 0 || !item->audio) continue;
+                    if (item->handshaking) continue;
+            if (require_token && !item->greeted) continue;
                     kmx_buffer_init(&message);
                     if (kmx_audio_offer(
                             item->audio, audio_block, audio_block_bytes,
@@ -934,6 +1053,8 @@ main(int argc, char **argv) {
                     kmx_buffer message;
                     bool produced = false;
                     if (item->fd < 0 || !item->motion) continue;
+                    if (item->handshaking) continue;
+            if (require_token && !item->greeted) continue;
                     kmx_buffer_init(&message);
                     if (kmx_buffer_append(
                             &message, &(unsigned char){0}, 1) == KMX_OK &&
@@ -958,6 +1079,17 @@ main(int argc, char **argv) {
         for (which = 0; which < KMX_MAX_CLIENTS; which++) {
             client *item = &clients[which];
             if (item->fd < 0) continue;
+            /* Nothing goes out before a valid greeting.
+             *
+             * The inbound side already refused everything from an un-greeted
+             * peer, and that was mistaken for the whole check: an independent
+             * review pointed out the server was still SENDING - layout, cell
+             * updates, images - to a peer that had presented no token at all.
+             * Refusing what a peer may say is not the same as refusing what it
+             * may hear, and for a terminal the second is the one that
+             * matters. */
+            if (item->handshaking) continue;
+            if (require_token && !item->greeted) continue;
 
             if (count && !kmx_layout_equal(&layout, &item->announced)) {
                 kmx_buffer wire;
@@ -1079,6 +1211,7 @@ main(int argc, char **argv) {
     }
     for (slot = 0; slot < count; slot++) {
         if (panes[slot].master >= 0) close(panes[slot].master);
+        kmx_buffer_free(&panes[slot].input);
         kmx_term_free(panes[slot].term);
     }
     if (pixel_running) kmx_pixel_stop(&pixel);

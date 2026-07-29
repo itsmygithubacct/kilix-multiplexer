@@ -81,33 +81,46 @@ static void
 fuzz_decompress(const uint8_t *data, size_t size) {
     kmx_buffer out;
     kmx_buffer_init(&out);
-    (void)kmx_decompress(data, size, &out);
+    (void)kmx_decompress(data, size, &out, KMX_CELLS_WIRE_MAX);
     kmx_buffer_free(&out);
 }
 
+/* The sink persists across inputs, as a real one does.
+ *
+ * An earlier version created a fresh sink per input, which made the entire
+ * delta path unreachable: a delta against a sink that has never seen a
+ * keyframe is rejected immediately, so the fuzzer could only ever exercise the
+ * keyframe branch.  That is why a long soak found the dimension bug in this
+ * file and missed a heap overflow twenty lines below it.
+ *
+ * State that accumulates between inputs is what lets a fuzzer reach the second
+ * message of a two-message sequence. */
+static kmx_motion_sink *motion_sink;
+
 static void
 fuzz_motion(const uint8_t *data, size_t size) {
-    kmx_motion_sink *sink = NULL;
-    if (kmx_motion_sink_create(&sink) != KMX_OK) return;
-    (void)kmx_motion_sink_apply(sink, data, size);
-    kmx_motion_sink_free(sink);
+    if (!motion_sink && kmx_motion_sink_create(&motion_sink) != KMX_OK) return;
+    (void)kmx_motion_sink_apply(motion_sink, data, size);
 }
+
+/* Persistent for the same reason: gap accounting only exists across blocks. */
+static kmx_audio_sink *audio_sink;
 
 static void
 fuzz_audio(const uint8_t *data, size_t size) {
-    kmx_audio_sink *sink = NULL;
-    if (kmx_audio_sink_create(&sink) != KMX_OK) return;
-    (void)kmx_audio_sink_apply(sink, data, size);
-    kmx_audio_sink_free(sink);
+    if (!audio_sink && kmx_audio_sink_create(&audio_sink) != KMX_OK) return;
+    (void)kmx_audio_sink_apply(audio_sink, data, size);
 }
+
+/* And here: a diff is only meaningful against a grid some earlier message
+ * established. */
+static kmx_receiver *receiver_sink;
 
 static void
 fuzz_receiver(const uint8_t *data, size_t size) {
-    kmx_receiver *receiver = NULL;
     uint64_t sequence = 0;
-    if (kmx_receiver_create(&receiver, 24, 80) != KMX_OK) return;
-    (void)kmx_receiver_apply(receiver, data, size, &sequence);
-    kmx_receiver_free(receiver);
+    if (!receiver_sink && kmx_receiver_create(&receiver_sink, 24, 80) != KMX_OK) return;
+    (void)kmx_receiver_apply(receiver_sink, data, size, &sequence);
 }
 
 int

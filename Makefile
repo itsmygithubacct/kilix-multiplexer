@@ -27,8 +27,9 @@ BENCH := $(BUILD_DIR)/kmx-bench
 SERVE := $(BUILD_DIR)/kmx-serve
 SHAPE := $(BUILD_DIR)/kmx-shape
 ATTACH := $(BUILD_DIR)/kmx-attach
+FLOOD := $(BUILD_DIR)/flood-input
 
-.PHONY: all clean test sanitize fuzz check-vendor install
+.PHONY: all clean test sanitize fuzz backpressure check-vendor install
 
 all: $(STATIC_LIB) $(BENCH) $(SERVE) $(ATTACH) $(SHAPE)
 
@@ -81,6 +82,18 @@ $(BUILD_DIR)/test_mux.o: tests/test_mux.c include/kilix_mux.h | $(BUILD_DIR)
 
 $(TEST): $(BUILD_DIR)/test_mux.o $(STATIC_LIB)
 	$(CC) $(LDFLAGS) -o "$@" $(BUILD_DIR)/test_mux.o $(STATIC_LIB) $(LDLIBS)
+
+$(BUILD_DIR)/flood_input.o: tests/flood_input.c include/kilix_mux.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c "$<" -o "$@"
+
+$(FLOOD): $(BUILD_DIR)/flood_input.o $(STATIC_LIB)
+	$(CC) $(LDFLAGS) -o "$@" $(BUILD_DIR)/flood_input.o $(STATIC_LIB) $(LDLIBS)
+
+# A pane that stops reading its input must not stop the server.  Separate from
+# `test` because it starts a real server and a real pty rather than exercising
+# the library.
+backpressure: $(SERVE) $(FLOOD)
+	tests/backpressure.sh
 
 test: $(TEST)
 	$(TEST_ENVIRONMENT) "$(TEST)"

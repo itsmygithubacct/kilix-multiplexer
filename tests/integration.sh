@@ -287,12 +287,29 @@ else
 fi
 
 # --- over TCP, which is what makes "remote" mean anything ------------------
+#
+# Every TCP bind mints a token, loopback included: a loopback port has no
+# SO_PEERCRED behind it, so without one any local user could attach as a
+# control client.  The server prints it, so these checks read it back rather
+# than assuming an open port.
+token_from() {
+    grep -oE -- '--token [0-9a-f]+' "$1" | awk '{print $2}' | head -1
+}
+wait_for_token() {
+    _waited=0
+    while [ "$_waited" -lt 40 ]; do
+        [ -n "$(token_from "$1")" ] && return 0
+        _waited=$((_waited + 1))
+        sleep 0.1
+    done
+    return 1
+}
 port=47$(( ($$ % 900) + 100 ))
 "$serve" --socket "127.0.0.1:$port" --rows 12 --cols 60 \
-    -- /bin/sh -c 'printf "OVER_TCP_MARKER\r\n"; sleep 10' >/dev/null 2>&1 &
-sleep 1
-timeout 8 "$attach" --socket "127.0.0.1:$port" --dump --seconds 3 \
-    > "$work/tcp.out" 2>&1
+    -- /bin/sh -c 'printf "OVER_TCP_MARKER\r\n"; sleep 10' >"$work/tcp.log" 2>&1 &
+wait_for_token "$work/tcp.log"
+timeout 8 "$attach" --socket "127.0.0.1:$port" --token "$(token_from "$work/tcp.log")" \
+    --dump --seconds 3 > "$work/tcp.out" 2>&1
 if visible "$work/tcp.out" | grep -q OVER_TCP_MARKER; then
     report pass "a session is reachable over TCP"
 else
@@ -320,13 +337,14 @@ fi
 stall_port=$(( port + 2 ))
 "$serve" --socket "127.0.0.1:$stall_port" --rows 12 --cols 60 \
     -- /bin/sh -c 'i=0; while [ $i -lt 400 ]; do printf "flood line %d padded out a bit\r\n" $i; i=$((i+1)); done; printf "FLOOD_DONE\r\n"; sleep 10' \
-    >/dev/null 2>&1 &
-sleep 0.8
+    >"$work/stall.log" 2>&1 &
+wait_for_token "$work/stall.log"
 # A peer that connects and then never reads a byte.
 ( exec 3<>"/dev/tcp/127.0.0.1/$stall_port" || exit 0; sleep 8 ) >/dev/null 2>&1 &
 staller=$!
 sleep 0.5
-timeout 10 "$attach" --socket "127.0.0.1:$stall_port" --dump --seconds 4 \
+timeout 10 "$attach" --socket "127.0.0.1:$stall_port" \
+    --token "$(token_from "$work/stall.log")" --dump --seconds 4 \
     > "$work/stall.out" 2>&1
 kill "$staller" 2>/dev/null
 wait "$staller" 2>/dev/null
@@ -343,19 +361,23 @@ fi
 # be reattached, not fatal.  Here the server process is replaced entirely,
 # which is a harsher test than a dropped connection.
 rc_port=$(( port + 3 ))
-"$serve" --socket "127.0.0.1:$rc_port" --rows 12 --cols 60 \
+# Given rather than minted, because the client has to present the same one to
+# the replacement server: two servers would otherwise mint two tokens and the
+# reattach would fail for a reason that has nothing to do with reconnection.
+rc_token=00112233445566778899aabbccddeeff
+"$serve" --socket "127.0.0.1:$rc_port" --token "$rc_token" --rows 12 --cols 60 \
     -- /bin/sh -c 'printf "BEFORE_DROP\r\n"; sleep 30' >/dev/null 2>&1 &
 first_server=$!
 sleep 0.8
-timeout 20 "$attach" --socket "127.0.0.1:$rc_port" --dump --seconds 12 \
-    --reconnect 10 > "$work/reconnect.out" 2>&1 &
+timeout 20 "$attach" --socket "127.0.0.1:$rc_port" --token "$rc_token" \
+    --dump --seconds 12 --reconnect 10 > "$work/reconnect.out" 2>&1 &
 reader=$!
 sleep 2
 kill "$first_server" 2>/dev/null
 wait "$first_server" 2>/dev/null
 sleep 1
 # A new session on the same address; the client should find its way back.
-"$serve" --socket "127.0.0.1:$rc_port" --rows 12 --cols 60 \
+"$serve" --socket "127.0.0.1:$rc_port" --token "$rc_token" --rows 12 --cols 60 \
     -- /bin/sh -c 'printf "AFTER_RECONNECT\r\n"; sleep 20' >/dev/null 2>&1 &
 second_server=$!
 wait "$reader" 2>/dev/null
@@ -379,9 +401,11 @@ if command -v Xvfb >/dev/null && command -v ffmpeg >/dev/null &&
     pix_port=$(( port + 4 ))
     "$serve" --socket "127.0.0.1:$pix_port" \
         --pixel-pane 'xclock -update 1' --pixel-size 320x240 --pixel-fps 4 \
-        >/dev/null 2>&1 &
-    sleep 3
-    timeout 12 "$attach" --socket "127.0.0.1:$pix_port" --dump --seconds 5 \
+        >"$work/pixel.log" 2>&1 &
+    wait_for_token "$work/pixel.log"
+    sleep 2
+    timeout 12 "$attach" --socket "127.0.0.1:$pix_port" \
+        --token "$(token_from "$work/pixel.log")" --dump --seconds 5 \
         > "$work/pixel.out" 2>&1
     frames=$(grep -c '^KMX_FRAME' "$work/pixel.out")
     if [ "$frames" -ge 2 ]; then
@@ -455,19 +479,39 @@ if [ -z "$host_ip" ]; then
 fi
 if [ -n "$host_ip" ]; then
 "$serve" --socket "$host_ip:$tok_port" --lan --rows 10 --cols 40 \
-    -- /bin/sh -c 'printf "TOKEN_PANE\r\n"; sleep 15' >"$work/token.log" 2>&1 &
-sleep 1.5
-minted=$(grep -oE -- '--token [0-9a-f]+' "$work/token.log" | awk '{print $2}' | head -1)
+    -- /bin/sh -c 'printf "TOKEN_PANE\r\n"; sleep 40' >"$work/token.log" 2>&1 &
+# Three sequential attaches, each now a TLS handshake, so the pane has to
+# outlast all of them - the original 15 seconds was cutting it fine.
+wait_for_token "$work/token.log"
+sleep 1
+minted=$(token_from "$work/token.log")
+# A reachable bind encrypts by default, so these attaches have to speak TLS as
+# well; without the fingerprint they would fail for the wrong reason.
+minted_fp=$(grep -oE -- '--tls-fingerprint [0-9a-f]{64}' "$work/token.log" |
+            awk '{print $2}' | head -1)
+if [ -z "$minted_fp" ]; then
+    minted_fp=$(grep -oE '^[[:space:]]*[0-9a-f]{64}$' "$work/token.log" |
+                tr -d '[:space:]' | head -1)
+fi
 if [ -n "$minted" ] && [ "${#minted}" -eq 32 ]; then
     report pass "a token is minted for a reachable socket"
 else
     report fail "a token is minted for a reachable socket"
 fi
-without=$(timeout 8 "$attach" --socket "$host_ip:$tok_port" --dump --seconds 2 2>&1 | visible /dev/stdin | grep -c TOKEN_PANE)
-wrong=$(timeout 8 "$attach" --socket "$host_ip:$tok_port" \
+# --reconnect 0 on both refusals: a refused client that retries for its whole
+# reconnect window spends the server's accept allowance, and the attach that
+# follows would then be turned away by the rate limiter rather than by the
+# token check - failing the test for a reason it is not about.
+without=$(timeout 8 "$attach" --socket "$host_ip:$tok_port" --reconnect 0 \
+    --tls-fingerprint "$minted_fp" --dump --seconds 2 2>&1 |
+    visible /dev/stdin | grep -c TOKEN_PANE)
+wrong=$(timeout 8 "$attach" --socket "$host_ip:$tok_port" --reconnect 0 \
+    --tls-fingerprint "$minted_fp" \
     --token 0000000000000000000000000000dead --dump --seconds 2 2>&1 |
     visible /dev/stdin | grep -c TOKEN_PANE)
-right=$(timeout 8 "$attach" --socket "$host_ip:$tok_port" \
+sleep 2   # let the accept allowance refill after the two refusals
+right=$(timeout 12 "$attach" --socket "$host_ip:$tok_port" \
+    --tls-fingerprint "$minted_fp" \
     --token "$minted" --dump --seconds 3 2>&1 | visible /dev/stdin | grep -c TOKEN_PANE)
 if [ "$without" -eq 0 ] && [ "$wrong" -eq 0 ] && [ "$right" -ge 1 ]; then
     report pass "the token is required and checked"
@@ -524,12 +568,13 @@ if [ -x "$shape" ]; then
     shp_port=$(( port + 8 ))
     "$serve" --socket "127.0.0.1:$hos_port" --rows 24 --cols 80 \
         -- /bin/sh -c 'stty -echo; printf "HOSTILE_READY\r\n"; while IFS= read -r l; do printf "GOT[%s]\r\n" "$l"; done' \
-        >/dev/null 2>&1 &
-    sleep 1
+        >"$work/hostile.log" 2>&1 &
+    wait_for_token "$work/hostile.log"
     "$shape" --listen "$shp_port" --to "127.0.0.1:$hos_port" \
         --delay 250 --jitter 50 --loss 5 --rate 32000 --seed 7 >/dev/null 2>&1 &
     sleep 1
-    timeout 40 "$attach" --socket "127.0.0.1:$shp_port" --dump --seconds 12 \
+    timeout 40 "$attach" --socket "127.0.0.1:$shp_port" \
+        --token "$(token_from "$work/hostile.log")" --dump --seconds 12 \
         --send 'HOSTILE
 ' > "$work/hostile.out" 2>&1
     text=$(visible "$work/hostile.out")
