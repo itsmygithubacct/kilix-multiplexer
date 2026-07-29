@@ -13,19 +13,52 @@ where there is actually video — rather than one undifferentiated stream.
 
 Design notes are maintained separately from this release tree.
 
-**Status: early. Phase 2 of eight.** What exists is the server-side terminal
-model and the cell-plane codec, with their tests. There is no transport, no
-layout plane, no graphics or audio plane, and no client yet.
-
-## What works today
+**Status: the text plane works end to end.** A pane can be served and attached
+over a socket, with predictive local echo. It is **one pane and one client**:
+there is no layout plane, no graphics or audio plane, and no network transport
+beyond a Unix socket yet.
 
 ```sh
-make          # build libkilix-mux.a
-make test     # the suite
-make sanitize # the suite under ASan + UBSan
-make fuzz     # libFuzzer against the decoder (needs clang)
-make check-vendor
+make               # library and tools
+make test          # unit suite
+make sanitize      # under ASan + UBSan
+make fuzz          # libFuzzer against the decoder (needs clang)
+make check-vendor  # the vendored tree is unmodified upstream
+tests/integration.sh   # real processes over a real socket
+tools/bench.sh         # what the cell plane actually costs
 ```
+
+## Try it
+
+```sh
+kmx-serve --socket /tmp/pane.sock -- bash     # in one terminal
+kmx-attach --socket /tmp/pane.sock            # in another; Ctrl-] detaches
+```
+
+The client renders the screen, forwards typing, follows resizes, and echoes
+keystrokes optimistically — underlined until the server confirms them.
+`--no-predict` turns that off; `--dump` renders without taking over the
+terminal, which is how the integration tests drive it.
+
+## What it costs
+
+Measured by `tools/bench.sh` at 24×80, against the raw PTY byte count a
+byte-forwarding tier would have carried. Every run asserts the receiver ended
+up holding the sender's exact screen and fails if it did not.
+
+| Workload | PTY bytes | Wire bytes | Reduction |
+|---|---|---|---|
+| Idle, 5 s | 0 | one screen, then nothing | — |
+| 200 keystrokes | 200 | 184 | 1.1× |
+| `vim`, 60 page-downs | 39,578 | 790 | **50×** |
+| 1 MB of base64 | 1,062,193 | 12,047 | **88×** |
+| 268 KB of text | 268,386 | 2,009 | **134×** |
+
+Typing is the one case with little to gain — 200 keystrokes really are about
+200 bytes of information. Its problem is latency, not size, which is what the
+predictor is for.
+
+## What works today
 
 - **`kmx_term`** — a server-side terminal model fed with a pane's raw output.
   It answers *what is on screen now*, which is what lets a peer that missed
@@ -41,7 +74,11 @@ make check-vendor
 - **Graphics capture** — Kitty graphics escapes are collected whole and *in
   wire order relative to the cells around them*, so an image placement and the
   text beside it cannot be reordered. Sequences split across reads are
-  reassembled.
+  reassembled. They are captured but not yet carried: that is the still and
+  motion planes, which come later.
+- **`kmx-serve` / `kmx-attach`** — a pane served over an owner-only socket and
+  a client that renders it, with an incremental framer, a diffing renderer,
+  and predictive local echo.
 
 ## Properties the tests assert
 
