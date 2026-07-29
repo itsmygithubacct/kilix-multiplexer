@@ -1360,6 +1360,144 @@ test_motion_sink_rejects_malformed_input(void) {
     kmx_motion_free(motion);
 }
 
+/* ---- audio plane ------------------------------------------------------- */
+
+static void
+test_audio_roundtrip_and_timestamps(void) {
+    static unsigned char pcm[4800];
+    kmx_audio *audio;
+    kmx_audio_sink *sink;
+    kmx_audio_info info;
+    kmx_buffer message;
+    bool produced = false;
+    size_t bytes = 0;
+    uint64_t timestamp = 0;
+    size_t index;
+
+    for (index = 0; index < sizeof pcm; index++) {
+        pcm[index] = (unsigned char)(index * 7);
+    }
+    CHECK(kmx_audio_create(&audio, 48000, 2, 0) == KMX_OK);
+    CHECK(kmx_audio_sink_create(&sink) == KMX_OK);
+
+    kmx_buffer_init(&message);
+    CHECK(kmx_audio_offer(
+        audio, pcm, sizeof pcm, 1000, &message, &produced, &info) == KMX_OK);
+    CHECK(produced);
+    CHECK(info.timestamp_millis == 1000);
+    CHECK(kmx_audio_sink_apply(sink, message.data, message.size) == KMX_OK);
+    CHECK(kmx_audio_sink_sample_rate(sink) == 48000);
+    CHECK(kmx_audio_sink_channels(sink) == 2);
+    CHECK(kmx_audio_sink_pcm(sink, &bytes, &timestamp) != NULL);
+    CHECK(bytes == sizeof pcm);
+    CHECK(timestamp == 1000);
+    CHECK(memcmp(kmx_audio_sink_pcm(sink, NULL, NULL), pcm, sizeof pcm) == 0);
+    /* One contiguous block so far, so nothing is missing. */
+    CHECK(kmx_audio_sink_gap_millis(sink) == 0);
+    kmx_buffer_free(&message);
+
+    kmx_audio_sink_free(sink);
+    kmx_audio_free(audio);
+}
+
+/* A gap is reported, not hidden: a consumer conceals a gap it knows about far
+ * better than one that surprises it. */
+static void
+test_audio_reports_gaps(void) {
+    /* 4800 bytes of 48 kHz stereo 16-bit is 1200 frames, or 25 ms. */
+    static unsigned char pcm[4800];
+    kmx_audio *audio;
+    kmx_audio_sink *sink;
+    kmx_buffer message;
+    bool produced = false;
+
+    CHECK(kmx_audio_create(&audio, 48000, 2, 0) == KMX_OK);
+    CHECK(kmx_audio_sink_create(&sink) == KMX_OK);
+
+    kmx_buffer_init(&message);
+    CHECK(kmx_audio_offer(audio, pcm, sizeof pcm, 0, &message, &produced, NULL) == KMX_OK);
+    CHECK(kmx_audio_sink_apply(sink, message.data, message.size) == KMX_OK);
+    CHECK(kmx_audio_sink_gap_millis(sink) == 0);
+
+    /* The next block follows on exactly: still no gap. */
+    kmx_buffer_reset(&message);
+    CHECK(kmx_audio_offer(audio, pcm, sizeof pcm, 25, &message, &produced, NULL) == KMX_OK);
+    CHECK(kmx_audio_sink_apply(sink, message.data, message.size) == KMX_OK);
+    CHECK(kmx_audio_sink_gap_millis(sink) == 0);
+
+    /* This one starts 100 ms after the last one ended. */
+    kmx_buffer_reset(&message);
+    CHECK(kmx_audio_offer(audio, pcm, sizeof pcm, 150, &message, &produced, NULL) == KMX_OK);
+    CHECK(kmx_audio_sink_apply(sink, message.data, message.size) == KMX_OK);
+    CHECK(kmx_audio_sink_gap_millis(sink) == 100);
+
+    kmx_buffer_free(&message);
+    kmx_audio_sink_free(sink);
+    kmx_audio_free(audio);
+}
+
+/* Audio drops rather than buffering.  Holding a block would delay everything
+ * behind it and still arrive too late to play. */
+static void
+test_audio_drops_rather_than_buffers(void) {
+    static unsigned char pcm[4800];
+    kmx_audio *audio;
+    kmx_buffer message;
+    bool produced = false;
+    int index;
+    int sent = 0;
+
+    /* Noise, so the wire size is realistic: silence compresses to almost
+     * nothing and would fit any budget. */
+    reset_random();
+    for (index = 0; index < (int)sizeof pcm; index++) {
+        pcm[index] = (unsigned char)next_random();
+    }
+    CHECK(kmx_audio_create(&audio, 48000, 2, 2048) == KMX_OK);
+    for (index = 0; index < 20; index++) {
+        kmx_buffer_init(&message);
+        CHECK(kmx_audio_offer(
+            audio, pcm, sizeof pcm, 10, &message, &produced, NULL) == KMX_OK);
+        if (produced) sent++;
+        kmx_buffer_free(&message);
+    }
+    CHECK(sent >= 1);
+    CHECK(sent < 20);
+    CHECK(kmx_audio_dropped(audio) > 0);
+    kmx_audio_free(audio);
+}
+
+static void
+test_audio_sink_rejects_malformed_input(void) {
+    static unsigned char pcm[512];
+    kmx_audio *audio;
+    kmx_buffer message;
+    bool produced = false;
+    size_t index;
+
+    CHECK(kmx_audio_create(&audio, 44100, 1, 0) == KMX_OK);
+    kmx_buffer_init(&message);
+    CHECK(kmx_audio_offer(
+        audio, pcm, sizeof pcm, 5, &message, &produced, NULL) == KMX_OK);
+    CHECK(produced);
+    for (index = 0; index < message.size; index++) {
+        kmx_audio_sink *scratch;
+        CHECK(kmx_audio_sink_create(&scratch) == KMX_OK);
+        CHECK(kmx_audio_sink_apply(scratch, message.data, index) != KMX_OK);
+        kmx_audio_sink_free(scratch);
+    }
+    kmx_audio_free(audio);
+
+    /* Absurd formats are refused rather than allocated for, so these leave
+     * `audio` untouched and there is nothing to free. */
+    audio = NULL;
+    CHECK(kmx_audio_create(&audio, 0, 2, 0) == KMX_ERR_INVALID);
+    CHECK(kmx_audio_create(&audio, 48000, 0, 0) == KMX_ERR_INVALID);
+    CHECK(kmx_audio_create(&audio, 48000, 99, 0) == KMX_ERR_INVALID);
+    CHECK(audio == NULL);
+    kmx_buffer_free(&message);
+}
+
 int
 main(void) {
     RUN(test_grid_basics);
@@ -1400,6 +1538,10 @@ main(void) {
     RUN(test_motion_resize_forces_a_keyframe);
     RUN(test_motion_drops_rather_than_queues);
     RUN(test_motion_sink_rejects_malformed_input);
+    RUN(test_audio_roundtrip_and_timestamps);
+    RUN(test_audio_reports_gaps);
+    RUN(test_audio_drops_rather_than_buffers);
+    RUN(test_audio_sink_rejects_malformed_input);
     puts("all kilix-multiplexer tests passed");
     return 0;
 }

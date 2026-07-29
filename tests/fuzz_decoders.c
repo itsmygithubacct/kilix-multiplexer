@@ -86,6 +86,22 @@ fuzz_decompress(const uint8_t *data, size_t size) {
 }
 
 static void
+fuzz_motion(const uint8_t *data, size_t size) {
+    kmx_motion_sink *sink = NULL;
+    if (kmx_motion_sink_create(&sink) != KMX_OK) return;
+    (void)kmx_motion_sink_apply(sink, data, size);
+    kmx_motion_sink_free(sink);
+}
+
+static void
+fuzz_audio(const uint8_t *data, size_t size) {
+    kmx_audio_sink *sink = NULL;
+    if (kmx_audio_sink_create(&sink) != KMX_OK) return;
+    (void)kmx_audio_sink_apply(sink, data, size);
+    kmx_audio_sink_free(sink);
+}
+
+static void
 fuzz_receiver(const uint8_t *data, size_t size) {
     kmx_receiver *receiver = NULL;
     uint64_t sequence = 0;
@@ -97,12 +113,14 @@ fuzz_receiver(const uint8_t *data, size_t size) {
 int
 LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     if (!size) return 0;
-    switch (data[0] % 6) {
+    switch (data[0] % 8) {
         case 0: fuzz_cells(data + 1, size - 1); break;
         case 1: fuzz_layout(data + 1, size - 1); break;
         case 2: fuzz_image(data + 1, size - 1); break;
         case 3: fuzz_framer(data + 1, size - 1); break;
         case 4: fuzz_decompress(data + 1, size - 1); break;
+        case 5: fuzz_motion(data + 1, size - 1); break;
+        case 6: fuzz_audio(data + 1, size - 1); break;
         default: fuzz_receiver(data + 1, size - 1); break;
     }
     return 0;

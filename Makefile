@@ -15,7 +15,7 @@ LDLIBS += -lzstd -lm
 # rather than ours, so our -Werror never depends on someone else's code.
 VTERM_CFLAGS := -O2 -std=c99 -fPIC -w
 
-LIB_SOURCES := src/grid.c src/codec.c src/term.c src/sync.c src/frame.c src/render.c src/predict.c src/layout.c src/graphics.c src/motion.c src/endpoint.c
+LIB_SOURCES := src/grid.c src/codec.c src/term.c src/sync.c src/frame.c src/render.c src/predict.c src/layout.c src/graphics.c src/motion.c src/audio.c src/endpoint.c
 LIB_OBJECTS := $(LIB_SOURCES:%.c=$(BUILD_DIR)/%.o)
 VTERM_SOURCES := $(wildcard $(VTERM_DIR)/src/*.c)
 VTERM_OBJECTS := $(VTERM_SOURCES:%.c=$(BUILD_DIR)/%.o)

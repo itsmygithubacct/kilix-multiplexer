@@ -466,6 +466,75 @@ const unsigned char *kmx_motion_sink_pixels(
     int *height
 );
 
+/* ---- audio plane ------------------------------------------------------- */
+
+/* Session-wide rather than per-pane: the host mixes one sink.  Per-pane audio
+ * routing is a much larger problem than this project should absorb, and
+ * Kilix's own pixel tiers do not attempt it either.
+ *
+ * Audio is small next to video and far less forgiving.  A dropped video frame
+ * goes unnoticed; a gap in sound does not.  So this plane gets its allowance
+ * first and effectively fixed, rate adaptation happens in the motion plane,
+ * and audio drops whole frames rather than buffering - it must never be able
+ * to stall the scheduler.
+ *
+ * Synchronisation is by presentation timestamp against one session clock, not
+ * by queue depth: when video falls behind its budget, video degrades and audio
+ * does not wait for it. */
+
+typedef struct kmx_audio kmx_audio;
+
+typedef struct {
+    uint64_t timestamp_millis;
+    size_t wire_bytes;
+    size_t pcm_bytes;
+} kmx_audio_info;
+
+/* `bytes_per_second` bounds what this plane may occupy.  Zero means no
+ * ceiling. */
+kmx_result kmx_audio_create(
+    kmx_audio **out,
+    uint32_t sample_rate,
+    uint8_t channels,
+    uint32_t bytes_per_second
+);
+void kmx_audio_free(kmx_audio *audio);
+
+/* Offer a block of interleaved 16-bit PCM.  `produced` is false when the
+ * allowance is spent, which is a drop: the block is gone, not queued. */
+kmx_result kmx_audio_offer(
+    kmx_audio *audio,
+    const void *pcm,
+    size_t bytes,
+    uint64_t timestamp_millis,
+    kmx_buffer *out,
+    bool *produced,
+    kmx_audio_info *info
+);
+size_t kmx_audio_dropped(const kmx_audio *audio);
+
+typedef struct kmx_audio_sink kmx_audio_sink;
+
+kmx_result kmx_audio_sink_create(kmx_audio_sink **out);
+void kmx_audio_sink_free(kmx_audio_sink *sink);
+kmx_result kmx_audio_sink_apply(
+    kmx_audio_sink *sink,
+    const void *data,
+    size_t size
+);
+/* The most recent block, and where it belongs on the session clock. */
+const unsigned char *kmx_audio_sink_pcm(
+    const kmx_audio_sink *sink,
+    size_t *bytes,
+    uint64_t *timestamp_millis
+);
+uint32_t kmx_audio_sink_sample_rate(const kmx_audio_sink *sink);
+uint8_t kmx_audio_sink_channels(const kmx_audio_sink *sink);
+/* Milliseconds of sound that never arrived, as judged by the timestamps.
+ * Reported rather than hidden, because a consumer conceals a known gap better
+ * than it conceals a surprise. */
+uint64_t kmx_audio_sink_gap_millis(const kmx_audio_sink *sink);
+
 /* ---- client-side rendering --------------------------------------------- */
 
 /* Turns a received grid into terminal output, emitting only what changed
