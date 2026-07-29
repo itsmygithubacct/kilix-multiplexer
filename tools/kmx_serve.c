@@ -17,6 +17,7 @@
 #define _GNU_SOURCE
 
 #include "kilix_mux.h"
+#include "endpoint.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -91,32 +92,6 @@ write_all(int fd, const void *data, size_t size) {
     return 0;
 }
 
-static int
-create_listener(const char *path) {
-    struct sockaddr_un address;
-    int fd;
-    if (strlen(path) >= sizeof address.sun_path) {
-        fprintf(stderr, "kmx-serve: socket path too long\n");
-        return -1;
-    }
-    fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (fd < 0) return -1;
-    memset(&address, 0, sizeof address);
-    address.sun_family = AF_UNIX;
-    memcpy(address.sun_path, path, strlen(path));
-    unlink(path);
-    if (bind(fd, (struct sockaddr *)&address, sizeof address) != 0 ||
-        chmod(path, 0600) != 0 ||
-        listen(fd, KMX_MAX_CLIENTS) != 0) {
-        int saved = errno;
-        close(fd);
-        unlink(path);
-        errno = saved;
-        return -1;
-    }
-    return fd;
-}
-
 static bool
 peer_is_owner(int fd) {
 #ifdef SO_PEERCRED
@@ -162,12 +137,18 @@ usage(void) {
     fputs("usage: kmx-serve --socket PATH [--split horizontal|vertical]\n"
           "                 [--rows N] [--cols N]\n"
           "                 --pane 'COMMAND' [--pane 'COMMAND' ...]\n"
-          "       kmx-serve --socket PATH [...] -- COMMAND [ARG...]\n", stderr);
+          "       kmx-serve --socket PATH [...] -- COMMAND [ARG...]\n"
+          "\n"
+          "  --socket accepts a path or HOST:PORT.  TCP binds loopback unless\n"
+          "  --lan is given; reach a session across a network over SSH.\n",
+          stderr);
 }
 
 int
 main(int argc, char **argv) {
     const char *socket_path = NULL;
+    kmx_endpoint endpoint;
+    bool allow_public = false;
     const char *commands[KMX_MAX_PANES];
     char *const *single = NULL;
     size_t command_count = 0;
@@ -196,6 +177,10 @@ main(int argc, char **argv) {
             rows = atoi(argv[++index]);
         } else if (strcmp(argv[index], "--cols") == 0 && index + 1 < argc) {
             cols = atoi(argv[++index]);
+        } else if (strcmp(argv[index], "--listen") == 0 && index + 1 < argc) {
+            socket_path = argv[++index];
+        } else if (strcmp(argv[index], "--lan") == 0) {
+            allow_public = true;
         } else if (strcmp(argv[index], "--split") == 0 && index + 1 < argc) {
             vertical = strcmp(argv[++index], "vertical") == 0;
         } else if (strcmp(argv[index], "--pane") == 0 && index + 1 < argc) {
@@ -226,10 +211,27 @@ main(int argc, char **argv) {
         return 1;
     }
 
-    listener = create_listener(socket_path);
+    if (!kmx_endpoint_parse(socket_path, &endpoint)) {
+        fprintf(stderr, "kmx-serve: cannot make sense of '%s'\n", socket_path);
+        return 2;
+    }
+    listener = kmx_endpoint_listen(&endpoint, allow_public);
     if (listener < 0) {
-        fprintf(stderr, "kmx-serve: listen: %s\n", strerror(errno));
+        if (errno == EPERM) {
+            fprintf(stderr,
+                "kmx-serve: %s is not a loopback address.  Reach a session "
+                "across a network through an SSH tunnel, or pass --lan to "
+                "bind it anyway.\n", endpoint.host);
+        } else {
+            fprintf(stderr, "kmx-serve: listen: %s\n", strerror(errno));
+        }
         return 1;
+    }
+    if (endpoint.kind == KMX_ENDPOINT_TCP && !kmx_endpoint_is_loopback(&endpoint)) {
+        fprintf(stderr,
+            "kmx-serve: listening on %s:%d, which is reachable from the "
+            "network.  Anyone who can connect gets this session.\n",
+            endpoint.host, endpoint.port);
     }
 
     for (slot = 0; slot < count; slot++) {
@@ -317,7 +319,12 @@ main(int argc, char **argv) {
                         break;
                     }
                 }
-                if (!peer_is_owner(accepted) || free_slot == KMX_MAX_CLIENTS) {
+                kmx_endpoint_tune(accepted, &endpoint);
+                /* Peer credentials exist only on a Unix socket; over TCP the
+                 * transport is expected to be an SSH tunnel, which is what
+                 * establishes who is on the other end. */
+                if ((endpoint.kind == KMX_ENDPOINT_UNIX && !peer_is_owner(accepted)) ||
+                    free_slot == KMX_MAX_CLIENTS) {
                     close(accepted);
                 } else {
                     client *item = &clients[free_slot];
@@ -578,6 +585,6 @@ main(int argc, char **argv) {
         kmx_term_free(panes[slot].term);
     }
     if (listener >= 0) close(listener);
-    unlink(socket_path);
+    kmx_endpoint_cleanup(&endpoint);
     return 0;
 }

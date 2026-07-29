@@ -282,6 +282,32 @@ else
     report fail "could not start the viewer session"
 fi
 
+# --- over TCP, which is what makes "remote" mean anything ------------------
+port=47$(( ($$ % 900) + 100 ))
+"$serve" --socket "127.0.0.1:$port" --rows 12 --cols 60 \
+    -- /bin/sh -c 'printf "OVER_TCP_MARKER\r\n"; sleep 10' >/dev/null 2>&1 &
+sleep 1
+timeout 8 "$attach" --socket "127.0.0.1:$port" --dump --seconds 3 \
+    > "$work/tcp.out" 2>&1
+if visible "$work/tcp.out" | grep -q OVER_TCP_MARKER; then
+    report pass "a session is reachable over TCP"
+else
+    report fail "a session is reachable over TCP"
+fi
+
+# --- a public bind has to be asked for -------------------------------------
+#
+# The default is loopback, so an ordinary `--socket host:port` cannot put a
+# shell on the network by accident.  Refused rather than quietly narrowed: a
+# caller that asked for a public address and silently got loopback would
+# believe it was reachable when it was not.
+out=$("$serve" --socket "0.0.0.0:$((port + 1))" -- /bin/sh -c 'sleep 1' 2>&1)
+if printf '%s' "$out" | grep -q 'not a loopback address'; then
+    report pass "a non-loopback bind is refused unless asked for"
+else
+    report fail "a non-loopback bind is refused unless asked for"
+fi
+
 echo
 if [ "$failures" -eq 0 ]; then
     echo "all integration checks passed"

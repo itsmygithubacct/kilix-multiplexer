@@ -14,6 +14,7 @@
 #define _GNU_SOURCE
 
 #include "kilix_mux.h"
+#include "endpoint.h"
 
 #include <errno.h>
 #include <poll.h>
@@ -122,7 +123,7 @@ main(int argc, char **argv) {
     bool sent_once = false;
     int index = 1;
     int fd;
-    struct sockaddr_un address;
+    kmx_endpoint endpoint;
     struct termios saved;
     struct termios raw;
     bool have_termios = false;
@@ -172,23 +173,16 @@ main(int argc, char **argv) {
     }
 
     get_size(&rows, &cols);
-    if (strlen(socket_path) >= sizeof address.sun_path) {
-        fprintf(stderr, "kmx-attach: socket path too long\n");
-        return 1;
+    if (!kmx_endpoint_parse(socket_path, &endpoint)) {
+        fprintf(stderr, "kmx-attach: cannot make sense of '%s'\n", socket_path);
+        return 2;
     }
-    fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    fd = kmx_endpoint_connect(&endpoint);
     if (fd < 0) {
-        fprintf(stderr, "kmx-attach: socket: %s\n", strerror(errno));
-        return 1;
-    }
-    memset(&address, 0, sizeof address);
-    address.sun_family = AF_UNIX;
-    memcpy(address.sun_path, socket_path, strlen(socket_path));
-    if (connect(fd, (struct sockaddr *)&address, sizeof address) != 0) {
         fprintf(stderr, "kmx-attach: connect: %s\n", strerror(errno));
-        close(fd);
         return 1;
     }
+    kmx_endpoint_tune(fd, &endpoint);
 
     kmx_layout_init(&layout, rows, cols);
     if (kmx_render_create(&render) != KMX_OK ||
