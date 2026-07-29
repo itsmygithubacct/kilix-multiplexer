@@ -133,6 +133,63 @@ else
     report fail "could not start the quick pane"
 fi
 
+# --- several panes on one screen, with chrome the client draws itself ------
+"$serve" --socket "$work/multi.sock" --rows 20 --cols 100 --split horizontal \
+    --pane 'printf "PANE_ALPHA\r\n"; sleep 10' \
+    --pane 'printf "PANE_BETA\r\n"; sleep 10' \
+    >/dev/null 2>&1 &
+for attempt in $(seq 1 40); do [ -S "$work/multi.sock" ] && break; sleep 0.1; done
+if [ -S "$work/multi.sock" ]; then
+    sleep 0.6
+    timeout 8 "$attach" --socket "$work/multi.sock" --dump --seconds 3 \
+        > "$work/multi.out" 2>&1
+    text=$(visible "$work/multi.out")
+    if printf '%s' "$text" | grep -q PANE_ALPHA &&
+       printf '%s' "$text" | grep -q PANE_BETA; then
+        report pass "two panes both reach the client"
+    else
+        report fail "two panes both reach the client"
+    fi
+    # The divider and the pane titles are drawn locally from the layout; they
+    # are never sent as content, so finding them proves the layout plane
+    # arrived and was used.
+    if printf '%s' "$text" | grep -q '│'; then
+        report pass "the client draws its own divider from the layout"
+    else
+        report fail "the client draws its own divider from the layout"
+    fi
+    if printf '%s' "$text" | grep -q '1: printf' &&
+       printf '%s' "$text" | grep -q '2: printf'; then
+        report pass "the client draws its own pane titles"
+    else
+        report fail "the client draws its own pane titles"
+    fi
+else
+    report fail "could not start the multi-pane session"
+fi
+
+# --- input goes to the focused pane, and only to it ------------------------
+"$serve" --socket "$work/focus.sock" --rows 20 --cols 100 --split horizontal \
+    --pane 'stty -echo; while IFS= read -r l; do printf "ONE<%s>\r\n" "$l"; done' \
+    --pane 'stty -echo; while IFS= read -r l; do printf "TWO<%s>\r\n" "$l"; done' \
+    >/dev/null 2>&1 &
+for attempt in $(seq 1 40); do [ -S "$work/focus.sock" ] && break; sleep 0.1; done
+if [ -S "$work/focus.sock" ]; then
+    sleep 0.6
+    timeout 8 "$attach" --socket "$work/focus.sock" --dump --seconds 3 \
+        --send 'TYPED
+' > "$work/focus.out" 2>&1
+    text=$(visible "$work/focus.out")
+    if printf '%s' "$text" | grep -q 'ONE<TYPED>' &&
+       ! printf '%s' "$text" | grep -q 'TWO<TYPED>'; then
+        report pass "input reaches the focused pane and not the other"
+    else
+        report fail "input reaches the focused pane and not the other"
+    fi
+else
+    report fail "could not start the focus session"
+fi
+
 echo
 if [ "$failures" -eq 0 ]; then
     echo "all integration checks passed"

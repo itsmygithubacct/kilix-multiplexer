@@ -1,9 +1,17 @@
-/* kmx-serve — run a command under a PTY and serve its screen over a socket.
+/* kmx-serve — run one or more panes and serve the session over a socket.
  *
- * The first cut of the session server: one pane, one client at a time, no
- * layout plane and no graphics plane yet.  What it does have is the property
- * the whole design is for - what goes over the socket is the screen the client
- * should be showing, not the bytes the pane produced. */
+ * Each pane has its own PTY and its own synchroniser, and the server owns the
+ * geometry, so every client agrees about the arrangement without negotiating.
+ * What crosses the socket is the screen each pane should be showing plus a few
+ * dozen bytes saying where the panes are - never a picture of the chrome
+ * around them.
+ *
+ *   kmx-serve --socket PATH [--split horizontal|vertical]
+ *             [--rows N] [--cols N]
+ *             --pane 'COMMAND' [--pane 'COMMAND' ...]
+ *   kmx-serve --socket PATH [...] -- COMMAND [ARG...]      (one pane)
+ *
+ * One client at a time; multi-client attach is not implemented yet. */
 #define _GNU_SOURCE
 
 #include "kilix_mux.h"
@@ -17,12 +25,21 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+
+typedef struct {
+    kmx_sync *sync;
+    int master;
+    pid_t child;
+    bool alive;
+    const char *command;
+} pane;
 
 static volatile sig_atomic_t stop_requested;
 
@@ -55,8 +72,6 @@ write_all(int fd, const void *data, size_t size) {
     return 0;
 }
 
-/* Owner-only, in a directory the caller chose.  Matches the posture the rest
- * of this stack already uses for local sockets. */
 static int
 create_listener(const char *path) {
     struct sockaddr_un address;
@@ -96,22 +111,50 @@ peer_is_owner(int fd) {
 #endif
 }
 
+static int
+send_framed(int fd, kmx_message_type type, const void *payload, size_t size) {
+    kmx_buffer framed;
+    int result;
+    kmx_buffer_init(&framed);
+    if (kmx_frame_encode(type, payload, size, &framed) != KMX_OK) {
+        kmx_buffer_free(&framed);
+        return -1;
+    }
+    result = write_all(fd, framed.data, framed.size);
+    kmx_buffer_free(&framed);
+    return result;
+}
+
+static void
+usage(void) {
+    fputs("usage: kmx-serve --socket PATH [--split horizontal|vertical]\n"
+          "                 [--rows N] [--cols N]\n"
+          "                 --pane 'COMMAND' [--pane 'COMMAND' ...]\n"
+          "       kmx-serve --socket PATH [...] -- COMMAND [ARG...]\n", stderr);
+}
+
 int
 main(int argc, char **argv) {
     const char *socket_path = NULL;
+    const char *commands[KMX_MAX_PANES];
+    char *const *single = NULL;
+    size_t command_count = 0;
+    bool vertical = false;
     int rows = 24;
     int cols = 80;
     int index = 1;
     int listener = -1;
     int client = -1;
-    int master = -1;
-    pid_t child;
-    kmx_sync *sync = NULL;
+    pane panes[KMX_MAX_PANES];
+    kmx_layout layout;
+    kmx_layout announced;
     kmx_framer framer;
     unsigned char buffer[65536];
-    int exit_code = 0;
-    bool child_alive = true;
+    size_t focused = 0;
+    size_t count;
+    size_t slot;
 
+    memset(panes, 0, sizeof panes);
     while (index < argc && strcmp(argv[index], "--") != 0) {
         if (strcmp(argv[index], "--socket") == 0 && index + 1 < argc) {
             socket_path = argv[++index];
@@ -119,25 +162,37 @@ main(int argc, char **argv) {
             rows = atoi(argv[++index]);
         } else if (strcmp(argv[index], "--cols") == 0 && index + 1 < argc) {
             cols = atoi(argv[++index]);
+        } else if (strcmp(argv[index], "--split") == 0 && index + 1 < argc) {
+            vertical = strcmp(argv[++index], "vertical") == 0;
+        } else if (strcmp(argv[index], "--pane") == 0 && index + 1 < argc) {
+            if (command_count >= KMX_MAX_PANES) {
+                fprintf(stderr, "kmx-serve: too many panes\n");
+                return 2;
+            }
+            commands[command_count++] = argv[++index];
         } else {
-            fprintf(stderr, "usage: kmx-serve --socket PATH [--rows N] [--cols N]"
-                            " -- COMMAND [ARG...]\n");
+            usage();
             return 2;
         }
         index++;
     }
-    if (!socket_path || index >= argc || strcmp(argv[index], "--") != 0 ||
-        index + 1 >= argc || rows <= 0 || cols <= 0) {
-        fprintf(stderr, "usage: kmx-serve --socket PATH [--rows N] [--cols N]"
-                        " -- COMMAND [ARG...]\n");
+    if (index < argc && strcmp(argv[index], "--") == 0 && index + 1 < argc) {
+        single = &argv[index + 1];
+    }
+    if (!socket_path || rows <= 0 || cols <= 0 ||
+        (command_count == 0 && !single)) {
+        usage();
         return 2;
     }
-    index++;
+    count = single ? 1 : command_count;
 
-    if (kmx_sync_create(&sync, rows, cols) != KMX_OK) {
-        fprintf(stderr, "kmx-serve: out of memory\n");
+    kmx_layout_init(&layout, rows, cols);
+    if (kmx_layout_arrange(&layout, count, vertical) != KMX_OK) {
+        fprintf(stderr, "kmx-serve: %d by %d is too small for %zu panes\n",
+                rows, cols, count);
         return 1;
     }
+    memset(&announced, 0, sizeof announced);
     kmx_framer_init(&framer);
 
     listener = create_listener(socket_path);
@@ -146,21 +201,36 @@ main(int argc, char **argv) {
         return 1;
     }
 
-    {
+    for (slot = 0; slot < count; slot++) {
+        const kmx_pane_info *info = &layout.panes[slot];
         struct winsize size;
+        pane *item = &panes[slot];
+        item->command = single ? single[0] : commands[slot];
+        snprintf(
+            layout.panes[slot].title, KMX_TITLE_MAX, "%zu: %s",
+            slot + 1, item->command);
+        if (kmx_sync_create(&item->sync, info->rows, info->cols) != KMX_OK) {
+            fprintf(stderr, "kmx-serve: out of memory\n");
+            return 1;
+        }
         memset(&size, 0, sizeof size);
-        size.ws_row = (unsigned short)rows;
-        size.ws_col = (unsigned short)cols;
-        child = forkpty(&master, NULL, NULL, &size);
-    }
-    if (child < 0) {
-        fprintf(stderr, "kmx-serve: forkpty: %s\n", strerror(errno));
-        return 1;
-    }
-    if (child == 0) {
-        setenv("TERM", "xterm-256color", 1);
-        execvp(argv[index], &argv[index]);
-        _exit(127);
+        size.ws_row = (unsigned short)info->rows;
+        size.ws_col = (unsigned short)info->cols;
+        item->child = forkpty(&item->master, NULL, NULL, &size);
+        if (item->child < 0) {
+            fprintf(stderr, "kmx-serve: forkpty: %s\n", strerror(errno));
+            return 1;
+        }
+        if (item->child == 0) {
+            setenv("TERM", "xterm-256color", 1);
+            if (single) {
+                execvp(single[0], single);
+            } else {
+                execl("/bin/sh", "sh", "-c", item->command, (char *)NULL);
+            }
+            _exit(127);
+        }
+        item->alive = true;
     }
 
     signal(SIGPIPE, SIG_IGN);
@@ -168,23 +238,31 @@ main(int argc, char **argv) {
     signal(SIGTERM, handle_stop);
 
     while (!stop_requested) {
-        struct pollfd descriptors[3];
-        kmx_buffer message;
-        kmx_sync_info info;
-        bool produced = false;
+        struct pollfd descriptors[2 + KMX_MAX_PANES];
+        nfds_t descriptor_count = 0;
+        size_t pane_index[KMX_MAX_PANES];
+        bool any_alive = false;
         int ready;
 
-        descriptors[0].fd = listener;
-        descriptors[0].events = client < 0 ? POLLIN : 0;
-        descriptors[0].revents = 0;
-        descriptors[1].fd = master;
-        descriptors[1].events = child_alive ? POLLIN : 0;
-        descriptors[1].revents = 0;
-        descriptors[2].fd = client;
-        descriptors[2].events = client >= 0 ? POLLIN : 0;
-        descriptors[2].revents = 0;
+        descriptors[descriptor_count].fd = listener;
+        descriptors[descriptor_count].events = client < 0 ? POLLIN : 0;
+        descriptors[descriptor_count].revents = 0;
+        descriptor_count++;
+        descriptors[descriptor_count].fd = client;
+        descriptors[descriptor_count].events = client >= 0 ? POLLIN : 0;
+        descriptors[descriptor_count].revents = 0;
+        descriptor_count++;
+        for (slot = 0; slot < count; slot++) {
+            if (!panes[slot].alive) continue;
+            any_alive = true;
+            pane_index[descriptor_count - 2] = slot;
+            descriptors[descriptor_count].fd = panes[slot].master;
+            descriptors[descriptor_count].events = POLLIN;
+            descriptors[descriptor_count].revents = 0;
+            descriptor_count++;
+        }
 
-        ready = poll(descriptors, 3, KMX_SEND_INTERVAL_MIN_MS);
+        ready = poll(descriptors, descriptor_count, KMX_SEND_INTERVAL_MIN_MS);
         if (ready < 0) {
             if (errno == EINTR) continue;
             break;
@@ -199,126 +277,156 @@ main(int argc, char **argv) {
                     client = accepted;
                     kmx_framer_free(&framer);
                     kmx_framer_init(&framer);
-                    /* A newly attached client holds nothing, so the next
-                     * message must be a full screen.  Only the baseline is
-                     * reset: the pane's history lives in the terminal model
-                     * and recreating it would throw away everything printed
-                     * before the client arrived. */
-                    kmx_sync_reset_baseline(sync);
+                    /* A new client holds nothing.  Only the baselines reset:
+                     * each pane's history lives in its terminal model and must
+                     * survive a client coming and going. */
+                    for (slot = 0; slot < count; slot++) {
+                        kmx_sync_reset_baseline(panes[slot].sync);
+                    }
+                    memset(&announced, 0, sizeof announced);
                 }
             }
         }
 
-        if (child_alive && (descriptors[1].revents & (POLLIN | POLLHUP | POLLERR))) {
-            ssize_t count = read(master, buffer, sizeof buffer);
-            if (count > 0) {
-                kmx_sync_feed(sync, buffer, (size_t)count);
-            } else if (count == 0 || (errno != EINTR && errno != EAGAIN)) {
-                child_alive = false;
+        if (client >= 0 && (descriptors[1].revents & (POLLIN | POLLHUP | POLLERR))) {
+            ssize_t received = read(client, buffer, sizeof buffer);
+            if (received <= 0 ||
+                kmx_framer_push(&framer, buffer, (size_t)received) != KMX_OK) {
+                close(client);
+                client = -1;
             }
-        }
-
-        if (client >= 0 && (descriptors[2].revents & (POLLIN | POLLHUP | POLLERR))) {
-            ssize_t count = read(client, buffer, sizeof buffer);
-            if (count <= 0) {
-                close(client);
-                client = -1;
-            } else if (kmx_framer_push(&framer, buffer, (size_t)count) != KMX_OK) {
-                close(client);
-                client = -1;
-            } else {
-                while (client >= 0) {
-                    kmx_message_type type;
-                    const unsigned char *payload;
-                    size_t size;
-                    bool available = false;
-                    if (kmx_framer_next(
-                            &framer, &available, &type, &payload, &size) != KMX_OK) {
-                        close(client);
-                        client = -1;
-                        break;
+            while (client >= 0) {
+                kmx_message_type type;
+                const unsigned char *payload;
+                size_t size;
+                bool available = false;
+                if (kmx_framer_next(
+                        &framer, &available, &type, &payload, &size) != KMX_OK) {
+                    close(client);
+                    client = -1;
+                    break;
+                }
+                if (!available) break;
+                if (type == KMX_MSG_INPUT) {
+                    if (focused < count && panes[focused].alive) {
+                        (void)write_all(panes[focused].master, payload, size);
                     }
-                    if (!available) break;
-                    switch (type) {
-                        case KMX_MSG_INPUT:
-                            if (child_alive) (void)write_all(master, payload, size);
-                            break;
-                        case KMX_MSG_RESIZE:
-                            if (size == 4) {
+                } else if (type == KMX_MSG_FOCUS && size >= 1) {
+                    size_t wanted = payload[0];
+                    if (wanted < count) {
+                        focused = wanted;
+                        for (slot = 0; slot < count; slot++) {
+                            layout.panes[slot].focused = slot == focused;
+                        }
+                        layout.generation++;
+                    }
+                } else if (type == KMX_MSG_RESIZE && size == 4) {
+                    int new_rows = (payload[0] << 8) | payload[1];
+                    int new_cols = (payload[2] << 8) | payload[3];
+                    if (new_rows > 0 && new_cols > 0 &&
+                        new_rows <= KMX_MAX_DIMENSION &&
+                        new_cols <= KMX_MAX_DIMENSION) {
+                        kmx_layout candidate = layout;
+                        candidate.rows = new_rows;
+                        candidate.cols = new_cols;
+                        if (kmx_layout_arrange(&candidate, count, vertical) == KMX_OK) {
+                            rows = new_rows;
+                            cols = new_cols;
+                            layout = candidate;
+                            for (slot = 0; slot < count; slot++) {
                                 struct winsize size_request;
-                                int new_rows = (payload[0] << 8) | payload[1];
-                                int new_cols = (payload[2] << 8) | payload[3];
-                                if (new_rows > 0 && new_cols > 0 &&
-                                    new_rows <= KMX_MAX_DIMENSION &&
-                                    new_cols <= KMX_MAX_DIMENSION) {
-                                    rows = new_rows;
-                                    cols = new_cols;
-                                    memset(&size_request, 0, sizeof size_request);
-                                    size_request.ws_row = (unsigned short)rows;
-                                    size_request.ws_col = (unsigned short)cols;
-                                    ioctl(master, TIOCSWINSZ, &size_request);
-                                    kmx_sync_resize(sync, rows, cols);
-                                }
+                                layout.panes[slot].focused = slot == focused;
+                                memset(&size_request, 0, sizeof size_request);
+                                size_request.ws_row =
+                                    (unsigned short)layout.panes[slot].rows;
+                                size_request.ws_col =
+                                    (unsigned short)layout.panes[slot].cols;
+                                ioctl(panes[slot].master, TIOCSWINSZ, &size_request);
+                                kmx_sync_resize(
+                                    panes[slot].sync,
+                                    layout.panes[slot].rows,
+                                    layout.panes[slot].cols);
                             }
-                            break;
-                        case KMX_MSG_ACK:
-                            if (size >= 1) {
-                                uint64_t sequence = 0;
-                                size_t position;
-                                for (position = 0; position < size && position < 8;
-                                     position++) {
-                                    sequence = (sequence << 8) | payload[position];
-                                }
-                                kmx_sync_ack(sync, sequence);
-                            }
-                            break;
-                        case KMX_MSG_HELLO:
-                            break;
-                        default:
-                            break;
+                        }
                     }
-                    kmx_framer_consume(&framer);
+                } else if (type == KMX_MSG_ACK && size >= 9) {
+                    uint64_t sequence = 0;
+                    size_t position;
+                    size_t which = payload[0];
+                    for (position = 1; position < 9; position++) {
+                        sequence = (sequence << 8) | payload[position];
+                    }
+                    if (which < count) kmx_sync_ack(panes[which].sync, sequence);
+                }
+                kmx_framer_consume(&framer);
+            }
+        }
+
+        for (slot = 0; slot + 2 < (size_t)descriptor_count; slot++) {
+            size_t which = pane_index[slot];
+            if (!(descriptors[slot + 2].revents & (POLLIN | POLLHUP | POLLERR))) continue;
+            {
+                ssize_t received = read(panes[which].master, buffer, sizeof buffer);
+                if (received > 0) {
+                    kmx_sync_feed(panes[which].sync, buffer, (size_t)received);
+                } else if (received == 0 || (errno != EINTR && errno != EAGAIN)) {
+                    panes[which].alive = false;
                 }
             }
         }
 
-        kmx_buffer_init(&message);
-        if (kmx_sync_poll(sync, now_millis(), &message, &produced, &info) == KMX_OK &&
-            produced && client >= 0) {
-            kmx_buffer framed;
-            kmx_buffer_init(&framed);
-            if (kmx_frame_encode(
-                    KMX_MSG_CELLS, message.data, message.size, &framed) == KMX_OK) {
-                if (write_all(client, framed.data, framed.size) != 0) {
+        if (client >= 0 && !kmx_layout_equal(&layout, &announced)) {
+            kmx_buffer wire;
+            kmx_buffer_init(&wire);
+            if (kmx_layout_encode(&layout, &wire) == KMX_OK) {
+                if (send_framed(client, KMX_MSG_LAYOUT, wire.data, wire.size) != 0) {
+                    close(client);
+                    client = -1;
+                } else {
+                    announced = layout;
+                }
+            }
+            kmx_buffer_free(&wire);
+        }
+
+        for (slot = 0; slot < count && client >= 0; slot++) {
+            kmx_buffer message;
+            kmx_sync_info info;
+            bool produced = false;
+            kmx_buffer_init(&message);
+            /* The pane index precedes its cell message, so the client can
+             * route it without inspecting the contents. */
+            if (kmx_buffer_append(&message, &(unsigned char){(unsigned char)slot}, 1)
+                    == KMX_OK &&
+                kmx_sync_poll(
+                    panes[slot].sync, now_millis(), &message, &produced, &info) == KMX_OK &&
+                produced) {
+                if (send_framed(
+                        client, KMX_MSG_CELLS, message.data, message.size) != 0) {
                     close(client);
                     client = -1;
                 }
             }
-            kmx_buffer_free(&framed);
+            kmx_buffer_free(&message);
         }
-        kmx_buffer_free(&message);
 
-        if (!child_alive) {
-            int status;
-            if (waitpid(child, &status, WNOHANG) == child || errno == ECHILD) {
-                if (client >= 0) {
-                    kmx_buffer framed;
-                    kmx_buffer_init(&framed);
-                    if (kmx_frame_encode(KMX_MSG_EXIT, NULL, 0, &framed) == KMX_OK) {
-                        (void)write_all(client, framed.data, framed.size);
-                    }
-                    kmx_buffer_free(&framed);
-                }
-                break;
+        if (!any_alive) {
+            for (slot = 0; slot < count; slot++) {
+                int status;
+                if (panes[slot].child > 0) waitpid(panes[slot].child, &status, WNOHANG);
             }
+            if (client >= 0) (void)send_framed(client, KMX_MSG_EXIT, NULL, 0);
+            break;
         }
     }
 
+    for (slot = 0; slot < count; slot++) {
+        if (panes[slot].master >= 0) close(panes[slot].master);
+        kmx_sync_free(panes[slot].sync);
+    }
     if (client >= 0) close(client);
     if (listener >= 0) close(listener);
-    if (master >= 0) close(master);
     unlink(socket_path);
     kmx_framer_free(&framer);
-    kmx_sync_free(sync);
-    return exit_code;
+    return 0;
 }

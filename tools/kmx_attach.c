@@ -1,15 +1,16 @@
-/* kmx-attach — render a remote pane locally and type into it.
+/* kmx-attach — render a remote session locally and type into it.
  *
- * Received frames describe the screen, so the client draws the difference
- * against what it already shows.  Typed characters are echoed immediately
- * where they are expected to land and withdrawn when the server's own frame
- * disagrees, because on a slow link the alternative is typing that feels
- * broken.
+ * The client receives each pane's screen plus a few dozen bytes saying where
+ * the panes are, and draws the dividers and title bars itself.  That chrome
+ * costs nothing on the wire, which is the whole argument for a layout plane:
+ * a pixel protocol would re-encode those borders every frame.
  *
- *   kmx-attach --socket PATH [--no-predict] [--dump]
+ *   kmx-attach --socket PATH [--no-predict] [--dump] [--send TEXT]
+ *              [--seconds N]
  *
- * Ctrl-] detaches.  --dump renders to stdout without taking over the terminal,
- * which is what makes the client testable without a TTY. */
+ * Ctrl-] detaches, Ctrl-O moves focus to the next pane.  --dump renders to
+ * stdout without taking over the terminal, which is what makes the client
+ * testable without a TTY. */
 #define _GNU_SOURCE
 
 #include "kilix_mux.h"
@@ -86,6 +87,16 @@ get_size(int *rows, int *cols) {
     *cols = 80;
 }
 
+static int
+send_dimensions(int fd, kmx_message_type type, int rows, int cols) {
+    unsigned char payload[4];
+    payload[0] = (unsigned char)(rows >> 8);
+    payload[1] = (unsigned char)rows;
+    payload[2] = (unsigned char)(cols >> 8);
+    payload[3] = (unsigned char)cols;
+    return send_message(fd, type, payload, sizeof payload);
+}
+
 int
 main(int argc, char **argv) {
     const char *socket_path = NULL;
@@ -101,15 +112,21 @@ main(int argc, char **argv) {
     struct termios saved;
     struct termios raw;
     bool have_termios = false;
-    kmx_receiver *receiver = NULL;
+    kmx_receiver *receivers[KMX_MAX_PANES];
+    kmx_grid panes[KMX_MAX_PANES];
+    kmx_layout layout;
     kmx_render *render = NULL;
     kmx_predictor *predictor = NULL;
     kmx_framer framer;
-    kmx_grid display;
+    kmx_grid screen;
     unsigned char buffer[65536];
+    size_t focus_hint = 0;
     int rows;
     int cols;
     int exit_code = 0;
+
+    memset(receivers, 0, sizeof receivers);
+    memset(panes, 0, sizeof panes);
 
     while (index < argc) {
         if (strcmp(argv[index], "--socket") == 0 && index + 1 < argc) {
@@ -123,13 +140,15 @@ main(int argc, char **argv) {
         } else if (strcmp(argv[index], "--seconds") == 0 && index + 1 < argc) {
             run_seconds = atoi(argv[++index]);
         } else {
-            fprintf(stderr, "usage: kmx-attach --socket PATH [--no-predict] [--dump]\n");
+            fprintf(stderr, "usage: kmx-attach --socket PATH [--no-predict]"
+                            " [--dump] [--send TEXT] [--seconds N]\n");
             return 2;
         }
         index++;
     }
     if (!socket_path) {
-        fprintf(stderr, "usage: kmx-attach --socket PATH [--no-predict] [--dump]\n");
+        fprintf(stderr, "usage: kmx-attach --socket PATH [--no-predict]"
+                        " [--dump] [--send TEXT] [--seconds N]\n");
         return 2;
     }
 
@@ -152,24 +171,17 @@ main(int argc, char **argv) {
         return 1;
     }
 
-    if (kmx_receiver_create(&receiver, rows, cols) != KMX_OK ||
-        kmx_render_create(&render) != KMX_OK ||
+    kmx_layout_init(&layout, rows, cols);
+    if (kmx_render_create(&render) != KMX_OK ||
         kmx_predictor_create(&predictor) != KMX_OK ||
-        kmx_grid_init(&display, rows, cols) != KMX_OK) {
+        kmx_grid_init(&screen, rows, cols) != KMX_OK) {
         fprintf(stderr, "kmx-attach: out of memory\n");
         return 1;
     }
     kmx_framer_init(&framer);
 
-    {
-        unsigned char hello[4];
-        hello[0] = (unsigned char)(rows >> 8);
-        hello[1] = (unsigned char)rows;
-        hello[2] = (unsigned char)(cols >> 8);
-        hello[3] = (unsigned char)cols;
-        send_message(fd, KMX_MSG_HELLO, hello, sizeof hello);
-        send_message(fd, KMX_MSG_RESIZE, hello, sizeof hello);
-    }
+    send_dimensions(fd, KMX_MSG_HELLO, rows, cols);
+    send_dimensions(fd, KMX_MSG_RESIZE, rows, cols);
 
     if (!dump && isatty(STDIN_FILENO) && tcgetattr(STDIN_FILENO, &saved) == 0) {
         raw = saved;
@@ -188,15 +200,10 @@ main(int argc, char **argv) {
         bool redraw = false;
 
         if (resize_pending && !dump) {
-            unsigned char payload[4];
             resize_pending = 0;
             get_size(&rows, &cols);
-            payload[0] = (unsigned char)(rows >> 8);
-            payload[1] = (unsigned char)rows;
-            payload[2] = (unsigned char)(cols >> 8);
-            payload[3] = (unsigned char)cols;
-            send_message(fd, KMX_MSG_RESIZE, payload, sizeof payload);
-            /* The screen is about to be described differently; anything
+            send_dimensions(fd, KMX_MSG_RESIZE, rows, cols);
+            /* The screen is about to be described differently, so anything
              * predicted about the old one is void. */
             kmx_predictor_reset(predictor);
             kmx_render_invalidate(render);
@@ -206,8 +213,6 @@ main(int argc, char **argv) {
         descriptors[0].events = POLLIN;
         descriptors[0].revents = 0;
         descriptors[1].fd = STDIN_FILENO;
-        /* In dump mode the local terminal is not the point, so stdin is left
-         * alone entirely: this exists to be driven by a test, not a person. */
         descriptors[1].events = dump ? 0 : POLLIN;
         descriptors[1].revents = 0;
         ready = poll(descriptors, 2, 50);
@@ -218,12 +223,8 @@ main(int argc, char **argv) {
         if (run_seconds > 0 && time(NULL) - started_at >= run_seconds) break;
         if (send_text && !sent_once) {
             sent_once = true;
-            if (send_message(
-                    fd, KMX_MSG_INPUT, send_text, strlen(send_text)) != 0) {
-                break;
-            }
-            if (predict &&
-                kmx_predictor_type(predictor, send_text, strlen(send_text))) {
+            if (send_message(fd, KMX_MSG_INPUT, send_text, strlen(send_text)) != 0) break;
+            if (predict && kmx_predictor_type(predictor, send_text, strlen(send_text))) {
                 redraw = true;
             }
         }
@@ -243,21 +244,44 @@ main(int argc, char **argv) {
                     break;
                 }
                 if (!available) break;
-                if (type == KMX_MSG_CELLS) {
-                    uint64_t sequence = 0;
-                    if (kmx_receiver_apply(receiver, payload, size, &sequence) == KMX_OK) {
-                        unsigned char ack[8];
-                        size_t position;
-                        for (position = 0; position < 8; position++) {
-                            ack[position] =
-                                (unsigned char)(sequence >> (8 * (7 - position)));
+                if (type == KMX_MSG_LAYOUT) {
+                    kmx_layout received;
+                    if (kmx_layout_apply(&received, payload, size) == KMX_OK) {
+                        size_t slot;
+                        layout = received;
+                        for (slot = 0; slot < layout.pane_count; slot++) {
+                            const kmx_pane_info *info = &layout.panes[slot];
+                            if (!receivers[slot] &&
+                                kmx_receiver_create(
+                                    &receivers[slot], info->rows, info->cols) != KMX_OK) {
+                                stop_pending = 1;
+                                break;
+                            }
+                            if (info->focused) focus_hint = slot;
                         }
-                        send_message(fd, KMX_MSG_ACK, ack, sizeof ack);
-                        if (predict) {
-                            kmx_predictor_reconcile(
-                                predictor, kmx_receiver_grid(receiver));
-                        }
+                        /* The arrangement moved, so what is on screen is no
+                         * longer a guide to what to draw next. */
+                        kmx_render_invalidate(render);
+                        kmx_predictor_reset(predictor);
                         redraw = true;
+                    }
+                } else if (type == KMX_MSG_CELLS && size >= 1) {
+                    size_t which = payload[0];
+                    if (which < KMX_MAX_PANES && receivers[which]) {
+                        uint64_t sequence = 0;
+                        if (kmx_receiver_apply(
+                                receivers[which], payload + 1, size - 1,
+                                &sequence) == KMX_OK) {
+                            unsigned char ack[9];
+                            size_t position;
+                            ack[0] = (unsigned char)which;
+                            for (position = 0; position < 8; position++) {
+                                ack[position + 1] =
+                                    (unsigned char)(sequence >> (8 * (7 - position)));
+                            }
+                            send_message(fd, KMX_MSG_ACK, ack, sizeof ack);
+                            redraw = true;
+                        }
                     }
                 } else if (type == KMX_MSG_EXIT) {
                     stop_pending = 1;
@@ -270,22 +294,48 @@ main(int argc, char **argv) {
             ssize_t count = read(STDIN_FILENO, buffer, sizeof buffer);
             if (count > 0) {
                 if (memchr(buffer, 0x1d, (size_t)count)) break; /* Ctrl-] */
-                if (send_message(fd, KMX_MSG_INPUT, buffer, (size_t)count) != 0) break;
-                if (predict &&
-                    kmx_predictor_type(predictor, buffer, (size_t)count)) {
-                    redraw = true;
+                if (memchr(buffer, 0x0f, (size_t)count) && layout.pane_count > 1) {
+                    /* Ctrl-O: move focus on.  The server owns focus, so this
+                     * asks rather than assumes. */
+                    unsigned char wanted =
+                        (unsigned char)((focus_hint + 1) % layout.pane_count);
+                    send_message(fd, KMX_MSG_FOCUS, &wanted, 1);
+                    kmx_predictor_reset(predictor);
+                } else {
+                    if (send_message(fd, KMX_MSG_INPUT, buffer, (size_t)count) != 0) break;
+                    if (predict &&
+                        kmx_predictor_type(predictor, buffer, (size_t)count)) {
+                        redraw = true;
+                    }
                 }
-            } else if (count == 0) {
-                if (dump) break;
+            } else if (count == 0 && dump) {
+                break;
             }
         }
 
-        if (redraw) {
+        if (redraw && layout.pane_count) {
+            const kmx_grid *sources[KMX_MAX_PANES];
             kmx_buffer painted;
-            if (kmx_grid_copy(&display, kmx_receiver_grid(receiver)) != KMX_OK) break;
-            if (predict) kmx_predictor_overlay(predictor, &display);
+            size_t slot;
+            bool ready_to_draw = true;
+            for (slot = 0; slot < layout.pane_count; slot++) {
+                if (!receivers[slot]) {
+                    ready_to_draw = false;
+                    break;
+                }
+                sources[slot] = kmx_receiver_grid(receivers[slot]);
+            }
+            if (!ready_to_draw) continue;
+            if (kmx_layout_composite(
+                    &layout, sources, layout.pane_count, &screen) != KMX_OK) {
+                break;
+            }
+            if (predict) {
+                kmx_predictor_reconcile(predictor, &screen);
+                kmx_predictor_overlay(predictor, &screen);
+            }
             kmx_buffer_init(&painted);
-            if (kmx_render_frame(render, &display, &painted) == KMX_OK) {
+            if (kmx_render_frame(render, &screen, &painted) == KMX_OK) {
                 if (write_all(STDOUT_FILENO, painted.data, painted.size) != 0) {
                     exit_code = 1;
                     kmx_buffer_free(&painted);
@@ -298,11 +348,17 @@ main(int argc, char **argv) {
 
     if (have_termios) (void)tcsetattr(STDIN_FILENO, TCSANOW, &saved);
     if (!dump) (void)write_all(STDOUT_FILENO, "\033[0m\r\n", 6);
+    {
+        size_t slot;
+        for (slot = 0; slot < KMX_MAX_PANES; slot++) {
+            if (receivers[slot]) kmx_receiver_free(receivers[slot]);
+            kmx_grid_free(&panes[slot]);
+        }
+    }
     kmx_framer_free(&framer);
-    kmx_grid_free(&display);
+    kmx_grid_free(&screen);
     kmx_predictor_free(predictor);
     kmx_render_free(render);
-    kmx_receiver_free(receiver);
     close(fd);
     return exit_code;
 }

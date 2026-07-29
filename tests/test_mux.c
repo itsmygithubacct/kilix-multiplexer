@@ -808,6 +808,149 @@ test_predictor_echoes_and_withdraws(void) {
     kmx_predictor_free(predictor);
 }
 
+/* ---- layout plane ------------------------------------------------------ */
+
+static void
+test_layout_arrange_fills_the_screen(void) {
+    kmx_layout layout;
+    size_t index;
+
+    /* Side by side: every column is either a pane or a divider, none twice. */
+    kmx_layout_init(&layout, 24, 80);
+    CHECK(kmx_layout_arrange(&layout, 3, false) == KMX_OK);
+    CHECK(layout.pane_count == 3);
+    for (index = 0; index < layout.pane_count; index++) {
+        const kmx_pane_info *pane = &layout.panes[index];
+        CHECK(pane->cols > 0 && pane->rows > 0);
+        CHECK(pane->x >= 0 && pane->x + pane->cols <= layout.cols);
+        CHECK(pane->y >= 0 && pane->y + pane->rows <= layout.rows);
+        if (index) {
+            const kmx_pane_info *before = &layout.panes[index - 1];
+            /* Exactly one divider column between neighbours. */
+            CHECK(pane->x == before->x + before->cols + 1);
+        }
+    }
+    CHECK(layout.panes[0].focused);
+    CHECK(!layout.panes[1].focused);
+
+    /* Stacked. */
+    kmx_layout_init(&layout, 24, 80);
+    CHECK(kmx_layout_arrange(&layout, 2, true) == KMX_OK);
+    CHECK(layout.panes[0].cols == 80);
+    CHECK(layout.panes[1].y > layout.panes[0].y + layout.panes[0].rows);
+
+    /* A screen too small to hold the panes is refused rather than producing
+     * something degenerate. */
+    kmx_layout_init(&layout, 4, 10);
+    CHECK(kmx_layout_arrange(&layout, 8, true) == KMX_ERR_LIMIT);
+    CHECK(kmx_layout_arrange(&layout, 0, false) == KMX_ERR_INVALID);
+    CHECK(kmx_layout_arrange(&layout, KMX_MAX_PANES + 1, false) == KMX_ERR_INVALID);
+}
+
+static void
+test_layout_roundtrip(void) {
+    kmx_layout layout;
+    kmx_layout decoded;
+    kmx_buffer wire;
+    size_t index;
+
+    kmx_layout_init(&layout, 30, 100);
+    CHECK(kmx_layout_arrange(&layout, 4, false) == KMX_OK);
+    for (index = 0; index < layout.pane_count; index++) {
+        snprintf(layout.panes[index].title, KMX_TITLE_MAX, "pane-%zu", index);
+    }
+    kmx_buffer_init(&wire);
+    CHECK(kmx_layout_encode(&layout, &wire) == KMX_OK);
+    /* The whole arrangement costs less than a single line of text. */
+    CHECK(wire.size < 120);
+    CHECK(kmx_layout_apply(&decoded, wire.data, wire.size) == KMX_OK);
+    CHECK(kmx_layout_equal(&layout, &decoded));
+    CHECK(kmx_layout_find(&decoded, layout.panes[2].id) != NULL);
+    CHECK(kmx_layout_find(&decoded, 9999) == NULL);
+
+    /* Every proper prefix is incomplete, and trailing bytes are a
+     * disagreement about the format. */
+    for (index = 0; index < wire.size; index++) {
+        kmx_layout scratch;
+        CHECK(kmx_layout_apply(&scratch, wire.data, index) != KMX_OK);
+    }
+    CHECK(kmx_buffer_append(&wire, "\0", 1) == KMX_OK);
+    CHECK(kmx_layout_apply(&decoded, wire.data, wire.size) != KMX_OK);
+    kmx_buffer_free(&wire);
+}
+
+/* A pane that claims to extend past the screen is rejected: geometry from a
+ * peer is an instruction to write into a buffer. */
+static void
+test_layout_rejects_impossible_geometry(void) {
+    kmx_layout layout;
+    kmx_layout decoded;
+    kmx_buffer wire;
+
+    kmx_layout_init(&layout, 10, 20);
+    layout.pane_count = 1;
+    layout.panes[0].id = 1;
+    layout.panes[0].x = 15;
+    layout.panes[0].y = 0;
+    layout.panes[0].rows = 10;
+    layout.panes[0].cols = 10; /* 15 + 10 > 20 */
+    kmx_buffer_init(&wire);
+    CHECK(kmx_layout_encode(&layout, &wire) == KMX_OK);
+    CHECK(kmx_layout_apply(&decoded, wire.data, wire.size) == KMX_ERR_PROTOCOL);
+    kmx_buffer_free(&wire);
+}
+
+/* Compositing is where the client earns its chrome for free: dividers and
+ * title bars are drawn from the layout, not received as content. */
+static void
+test_layout_composites_panes_and_chrome(void) {
+    kmx_layout layout;
+    kmx_grid first;
+    kmx_grid second;
+    kmx_grid screen;
+    const kmx_grid *panes[2];
+    const kmx_pane_info *left;
+    const kmx_pane_info *right;
+
+    kmx_layout_init(&layout, 12, 40);
+    CHECK(kmx_layout_arrange(&layout, 2, false) == KMX_OK);
+    snprintf(layout.panes[0].title, KMX_TITLE_MAX, "left");
+    snprintf(layout.panes[1].title, KMX_TITLE_MAX, "right");
+    left = &layout.panes[0];
+    right = &layout.panes[1];
+
+    CHECK(kmx_grid_init(&first, left->rows, left->cols) == KMX_OK);
+    CHECK(kmx_grid_init(&second, right->rows, right->cols) == KMX_OK);
+    kmx_grid_cell(&first, 0, 0)->chars[0] = 'L';
+    kmx_grid_cell(&first, 0, 0)->width = 1;
+    kmx_grid_cell(&second, 0, 0)->chars[0] = 'R';
+    kmx_grid_cell(&second, 0, 0)->width = 1;
+    first.cursor_row = 0;
+    first.cursor_col = 0;
+    panes[0] = &first;
+    panes[1] = &second;
+
+    memset(&screen, 0, sizeof screen);
+    CHECK(kmx_layout_composite(&layout, panes, 2, &screen) == KMX_OK);
+    CHECK(screen.rows == 12 && screen.cols == 40);
+
+    /* Each pane's content lands at its own origin. */
+    CHECK(kmx_grid_cell(&screen, left->y, left->x)->chars[0] == 'L');
+    CHECK(kmx_grid_cell(&screen, right->y, right->x)->chars[0] == 'R');
+    /* A divider between them, drawn locally. */
+    CHECK(kmx_grid_cell(&screen, 5, left->x + left->cols)->chars[0] == 0x2502);
+    /* Title bars, with the focused pane's reversed. */
+    CHECK(kmx_grid_cell(&screen, left->y - 1, left->x)->chars[0] == 'l');
+    CHECK((kmx_grid_cell(&screen, left->y - 1, left->x)->attrs & KMX_ATTR_REVERSE) != 0);
+    CHECK((kmx_grid_cell(&screen, right->y - 1, right->x)->attrs & KMX_ATTR_REVERSE) == 0);
+    /* The cursor follows the focused pane. */
+    CHECK(screen.cursor_row == left->y && screen.cursor_col == left->x);
+
+    kmx_grid_free(&first);
+    kmx_grid_free(&second);
+    kmx_grid_free(&screen);
+}
+
 int
 main(void) {
     RUN(test_grid_basics);
@@ -834,6 +977,10 @@ main(void) {
     RUN(test_framer_rejects_absurd_lengths);
     RUN(test_render_reproduces_the_grid);
     RUN(test_predictor_echoes_and_withdraws);
+    RUN(test_layout_arrange_fills_the_screen);
+    RUN(test_layout_roundtrip);
+    RUN(test_layout_rejects_impossible_geometry);
+    RUN(test_layout_composites_panes_and_chrome);
     puts("all kilix-multiplexer tests passed");
     return 0;
 }

@@ -240,7 +240,9 @@ typedef enum {
     KMX_MSG_INPUT = 3,   /* client -> server: keystrokes                   */
     KMX_MSG_RESIZE = 4,  /* client -> server: new dimensions               */
     KMX_MSG_ACK = 5,     /* client -> server: sequence received            */
-    KMX_MSG_EXIT = 6     /* server -> client: the pane ended                */
+    KMX_MSG_EXIT = 6,    /* server -> client: the session ended            */
+    KMX_MSG_LAYOUT = 7,  /* server -> client: the layout plane             */
+    KMX_MSG_FOCUS = 8    /* client -> server: focus a pane                 */
 } kmx_message_type;
 
 /* The largest single message accepted from a peer.  A length prefix is an
@@ -272,6 +274,53 @@ kmx_result kmx_framer_next(
 );
 /* Discard the message most recently returned by kmx_framer_next. */
 void kmx_framer_consume(kmx_framer *framer);
+
+/* ---- layout plane ------------------------------------------------------ */
+
+/* Where the panes are.  This is the plane that costs almost nothing and saves
+ * the most: the client draws its own chrome from these few numbers instead of
+ * being sent pictures of borders and titles. */
+
+#define KMX_MAX_PANES 32
+#define KMX_TITLE_MAX 64
+
+typedef struct {
+    uint32_t id;
+    int32_t x;       /* column of the pane's left edge in the session screen */
+    int32_t y;       /* row of the pane's top edge                           */
+    int32_t rows;
+    int32_t cols;
+    bool focused;
+    char title[KMX_TITLE_MAX];
+} kmx_pane_info;
+
+typedef struct {
+    int32_t rows;    /* the whole session screen */
+    int32_t cols;
+    uint32_t generation; /* bumped whenever the arrangement changes */
+    size_t pane_count;
+    kmx_pane_info panes[KMX_MAX_PANES];
+} kmx_layout;
+
+void kmx_layout_init(kmx_layout *layout, int rows, int cols);
+kmx_result kmx_layout_encode(const kmx_layout *layout, kmx_buffer *out);
+kmx_result kmx_layout_apply(kmx_layout *layout, const void *data, size_t size);
+bool kmx_layout_equal(const kmx_layout *a, const kmx_layout *b);
+const kmx_pane_info *kmx_layout_find(const kmx_layout *layout, uint32_t id);
+
+/* Arrange `count` panes in a simple split, filling the session screen.  The
+ * server owns geometry so every client agrees about it without negotiating. */
+kmx_result kmx_layout_arrange(kmx_layout *layout, size_t count, bool vertical);
+
+/* Draw the panes into one screen, with a one-cell divider between them and a
+ * title row per pane when there is more than one.  This is the chrome the
+ * client draws for itself rather than receiving as pixels. */
+kmx_result kmx_layout_composite(
+    const kmx_layout *layout,
+    const kmx_grid *const *panes,
+    size_t pane_count,
+    kmx_grid *out
+);
 
 /* ---- client-side rendering --------------------------------------------- */
 
