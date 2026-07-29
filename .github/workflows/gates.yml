@@ -89,6 +89,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libzstd-dev libssl-dev xvfb ffmpeg x11-apps
+      - name: build
+        # integration.sh refuses to run against a tree that has not been built,
+        # which is how this job failed the first time it ran.
+        run: make
       - name: real processes over real sockets
         run: tests/integration.sh
       - name: a pane that stops reading must not stop the server
