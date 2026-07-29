@@ -99,12 +99,26 @@ sanitize:
 	@# link error rather than as leftovers from this target.
 	$(MAKE) clean
 
+SEED := $(BUILD_DIR)/seed-corpus
+CORPUS := $(BUILD_DIR)/corpus
+
+$(BUILD_DIR)/seed_corpus.o: tests/seed_corpus.c include/kilix_mux.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c "$<" -o "$@"
+
+$(SEED): $(BUILD_DIR)/seed_corpus.o $(STATIC_LIB)
+	$(CC) $(LDFLAGS) -o "$@" $(BUILD_DIR)/seed_corpus.o $(STATIC_LIB) $(LDLIBS)
+
 # Every decoder a remote peer can reach is fuzzed, not merely tested.
 # Requires a clang with libFuzzer.
-fuzz: $(BUILD_DIR)
+#
+# Seeded with real messages, each also truncated and bit-flipped.  Worth about
+# 120 coverage points at a ten-second budget and almost nothing at sixty, so it
+# earns its place here and in CI rather than in a long soak.
+fuzz: $(BUILD_DIR) $(SEED)
+	"$(SEED)" "$(CORPUS)"
 	clang -std=c11 $(CPPFLAGS) -O1 -g -fsanitize=fuzzer,address,undefined \
 		-o "$(FUZZ)" tests/fuzz_decoders.c $(LIB_SOURCES) $(VTERM_SOURCES) $(LDLIBS)
-	"$(FUZZ)" -max_total_time=$${FUZZ_SECONDS:-30} -print_final_stats=1
+	"$(FUZZ)" "$(CORPUS)" -max_total_time=$${FUZZ_SECONDS:-30} -print_final_stats=1
 
 # The vendored tree is unmodified upstream; prove it rather than assume it.
 check-vendor:

@@ -156,4 +156,5 @@ Stated plainly rather than left to be discovered.
 - [x] TLS with fingerprint pinning — done 2026-07-28
 - [ ] Consider making `--lan` imply `--tls`
 - [ ] Independent review of the LAN path
-- [ ] Extended fuzzing run against a seeded corpus, not just the default 30s
+- [x] Seeded corpus — `make fuzz` builds it from real messages (2026-07-29)
+- [ ] A long soak, hours rather than seconds, before anything is published
