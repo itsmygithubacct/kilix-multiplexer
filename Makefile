@@ -15,7 +15,7 @@ LDLIBS += -lzstd -lm
 # rather than ours, so our -Werror never depends on someone else's code.
 VTERM_CFLAGS := -O2 -std=c99 -fPIC -w
 
-LIB_SOURCES := src/grid.c src/codec.c src/term.c src/sync.c
+LIB_SOURCES := src/grid.c src/codec.c src/term.c src/sync.c src/frame.c src/render.c src/predict.c
 LIB_OBJECTS := $(LIB_SOURCES:%.c=$(BUILD_DIR)/%.o)
 VTERM_SOURCES := $(wildcard $(VTERM_DIR)/src/*.c)
 VTERM_OBJECTS := $(VTERM_SOURCES:%.c=$(BUILD_DIR)/%.o)
@@ -24,10 +24,12 @@ STATIC_LIB := $(BUILD_DIR)/libkilix-mux.a
 TEST := $(BUILD_DIR)/test-mux
 FUZZ_CELLS := $(BUILD_DIR)/fuzz-cells
 BENCH := $(BUILD_DIR)/kmx-bench
+SERVE := $(BUILD_DIR)/kmx-serve
+ATTACH := $(BUILD_DIR)/kmx-attach
 
 .PHONY: all clean test sanitize fuzz check-vendor install
 
-all: $(STATIC_LIB) $(BENCH)
+all: $(STATIC_LIB) $(BENCH) $(SERVE) $(ATTACH)
 
 $(BUILD_DIR):
 	mkdir -p "$@"
@@ -48,6 +50,18 @@ $(BUILD_DIR)/kmx_bench.o: tools/kmx_bench.c include/kilix_mux.h | $(BUILD_DIR)
 
 $(BENCH): $(BUILD_DIR)/kmx_bench.o $(STATIC_LIB)
 	$(CC) $(LDFLAGS) -o "$@" $(BUILD_DIR)/kmx_bench.o $(STATIC_LIB) $(LDLIBS) -lutil
+
+$(BUILD_DIR)/kmx_serve.o: tools/kmx_serve.c include/kilix_mux.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c "$<" -o "$@"
+
+$(SERVE): $(BUILD_DIR)/kmx_serve.o $(STATIC_LIB)
+	$(CC) $(LDFLAGS) -o "$@" $(BUILD_DIR)/kmx_serve.o $(STATIC_LIB) $(LDLIBS) -lutil
+
+$(BUILD_DIR)/kmx_attach.o: tools/kmx_attach.c include/kilix_mux.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c "$<" -o "$@"
+
+$(ATTACH): $(BUILD_DIR)/kmx_attach.o $(STATIC_LIB)
+	$(CC) $(LDFLAGS) -o "$@" $(BUILD_DIR)/kmx_attach.o $(STATIC_LIB) $(LDLIBS)
 
 $(BUILD_DIR)/test_mux.o: tests/test_mux.c include/kilix_mux.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c "$<" -o "$@"

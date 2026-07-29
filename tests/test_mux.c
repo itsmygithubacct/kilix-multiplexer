@@ -621,6 +621,193 @@ test_receiver_rejects_malformed_messages(void) {
     kmx_receiver_free(receiver);
 }
 
+/* ---- framing, rendering, prediction ------------------------------------ */
+
+static void
+test_framer_reassembles_messages(void) {
+    kmx_framer framer;
+    kmx_buffer stream;
+    size_t index;
+    int seen = 0;
+
+    kmx_buffer_init(&stream);
+    CHECK(kmx_frame_encode(KMX_MSG_HELLO, "abcd", 4, &stream) == KMX_OK);
+    CHECK(kmx_frame_encode(KMX_MSG_INPUT, "hello", 5, &stream) == KMX_OK);
+    CHECK(kmx_frame_encode(KMX_MSG_EXIT, NULL, 0, &stream) == KMX_OK);
+
+    /* One byte at a time: a socket delivers whatever it feels like. */
+    kmx_framer_init(&framer);
+    for (index = 0; index < stream.size; index++) {
+        bool ready = false;
+        kmx_message_type type;
+        const unsigned char *payload;
+        size_t size;
+        CHECK(kmx_framer_push(&framer, stream.data + index, 1) == KMX_OK);
+        while (true) {
+            CHECK(kmx_framer_next(&framer, &ready, &type, &payload, &size) == KMX_OK);
+            if (!ready) break;
+            seen++;
+            if (seen == 1) {
+                CHECK(type == KMX_MSG_HELLO && size == 4);
+                CHECK(memcmp(payload, "abcd", 4) == 0);
+            } else if (seen == 2) {
+                CHECK(type == KMX_MSG_INPUT && size == 5);
+                CHECK(memcmp(payload, "hello", 5) == 0);
+            } else {
+                CHECK(type == KMX_MSG_EXIT && size == 0);
+            }
+            kmx_framer_consume(&framer);
+        }
+    }
+    CHECK(seen == 3);
+    kmx_framer_free(&framer);
+    kmx_buffer_free(&stream);
+}
+
+static void
+test_framer_rejects_absurd_lengths(void) {
+    kmx_framer framer;
+    /* A varint claiming a gigabyte: a length prefix is an instruction to
+     * allocate, so it is bounded before it is believed. */
+    static const unsigned char huge[] = {0x80, 0x80, 0x80, 0x80, 0x08};
+    bool ready = false;
+    kmx_message_type type;
+    const unsigned char *payload;
+    size_t size;
+    kmx_framer_init(&framer);
+    CHECK(kmx_framer_push(&framer, huge, sizeof huge) == KMX_OK);
+    CHECK(kmx_framer_next(&framer, &ready, &type, &payload, &size) == KMX_ERR_LIMIT);
+    kmx_framer_free(&framer);
+}
+
+/* A cell that was never written and a cell holding a space are indistinguish-
+ * able on a screen, and the renderer has to emit something for both.  So the
+ * comparison here is "would look the same", not "has the same representation".
+ * Everything else - attributes, colours, width - must match exactly. */
+static bool
+cells_look_the_same(const kmx_cell *a, const kmx_cell *b) {
+    uint32_t left = a->chars[0] ? a->chars[0] : (uint32_t)' ';
+    uint32_t right = b->chars[0] ? b->chars[0] : (uint32_t)' ';
+    if (left != right) return false;
+    if (memcmp(a->chars + 1, b->chars + 1, sizeof a->chars - sizeof a->chars[0]) != 0) {
+        return false;
+    }
+    if (a->attrs != b->attrs || a->width != b->width) return false;
+    if (memcmp(&a->fg, &b->fg, sizeof a->fg) != 0) return false;
+    return memcmp(&a->bg, &b->bg, sizeof a->bg) == 0;
+}
+
+/* The renderer's output, fed to a terminal, must reproduce the grid it was
+ * given.  Checking it against a real terminal model rather than against an
+ * expected byte string means the assertion is about behaviour, not spelling. */
+static void
+test_render_reproduces_the_grid(void) {
+    harness h;
+    kmx_render *render;
+    kmx_term *replica;
+    kmx_grid drawn;
+    kmx_buffer painted;
+    int step;
+
+    harness_init(&h, 12, 40);
+    CHECK(kmx_render_create(&render) == KMX_OK);
+    CHECK(kmx_term_create(&replica, 12, 40) == KMX_OK);
+    CHECK(kmx_grid_init(&drawn, 12, 40) == KMX_OK);
+
+    reset_random();
+    for (step = 0; step < 40; step++) {
+        char text[64];
+        snprintf(text, sizeof text, "\033[%u;%uH\033[3%um%c%c%c",
+                 next_random() % 12 + 1, next_random() % 38 + 1,
+                 next_random() % 8,
+                 (char)('A' + next_random() % 26),
+                 (char)('a' + next_random() % 26),
+                 (char)('0' + next_random() % 10));
+        harness_step(&h, text);
+
+        kmx_buffer_init(&painted);
+        CHECK(kmx_render_frame(render, &h.current, &painted) == KMX_OK);
+        CHECK(kmx_term_feed(replica, painted.data, painted.size) == KMX_OK);
+        CHECK(kmx_term_snapshot(replica, &drawn) == KMX_OK);
+        kmx_buffer_free(&painted);
+
+        /* The cursor is positioned separately by the client, so compare the
+         * cells: those are what the renderer is responsible for. */
+        {
+            int row;
+            int col;
+            for (row = 0; row < 12; row++) {
+                for (col = 0; col < 40; col++) {
+                    CHECK(cells_look_the_same(
+                        kmx_grid_cell_const(&drawn, row, col),
+                        kmx_grid_cell_const(&h.current, row, col)));
+                }
+            }
+        }
+    }
+    kmx_grid_free(&drawn);
+    kmx_term_free(replica);
+    kmx_render_free(render);
+    harness_free(&h);
+}
+
+static void
+test_predictor_echoes_and_withdraws(void) {
+    kmx_predictor *predictor;
+    kmx_grid server;
+    kmx_grid display;
+
+    CHECK(kmx_predictor_create(&predictor) == KMX_OK);
+    CHECK(kmx_grid_init(&server, 5, 20) == KMX_OK);
+    CHECK(kmx_grid_init(&display, 5, 20) == KMX_OK);
+
+    /* Nothing is predicted until a server frame says where the cursor is:
+     * guessing without an anchor is how predictions drift. */
+    CHECK(!kmx_predictor_type(predictor, "abc", 3));
+    CHECK(kmx_predictor_outstanding(predictor) == 0);
+
+    server.cursor_row = 1;
+    server.cursor_col = 3;
+    kmx_predictor_reconcile(predictor, &server);
+    CHECK(kmx_predictor_type(predictor, "abc", 3));
+    CHECK(kmx_predictor_outstanding(predictor) == 3);
+
+    CHECK(kmx_grid_copy(&display, &server) == KMX_OK);
+    kmx_predictor_overlay(predictor, &display);
+    CHECK(kmx_grid_cell(&display, 1, 3)->chars[0] == 'a');
+    CHECK(kmx_grid_cell(&display, 1, 5)->chars[0] == 'c');
+    /* Shown as provisional rather than as fact. */
+    CHECK((kmx_grid_cell(&display, 1, 3)->attrs & KMX_ATTR_UNDERLINE) != 0);
+
+    /* The server agrees about the first two: those predictions retire. */
+    kmx_grid_cell(&server, 1, 3)->chars[0] = 'a';
+    kmx_grid_cell(&server, 1, 3)->width = 1;
+    kmx_grid_cell(&server, 1, 4)->chars[0] = 'b';
+    kmx_grid_cell(&server, 1, 4)->width = 1;
+    server.cursor_col = 5;
+    kmx_predictor_reconcile(predictor, &server);
+    CHECK(kmx_predictor_outstanding(predictor) == 1);
+
+    /* The server puts something else where 'c' was expected: that guess and
+     * everything built on it is withdrawn rather than left on screen. */
+    kmx_grid_cell(&server, 1, 5)->chars[0] = 'Z';
+    kmx_grid_cell(&server, 1, 5)->width = 1;
+    kmx_predictor_reconcile(predictor, &server);
+    CHECK(kmx_predictor_outstanding(predictor) == 0);
+
+    /* A control character means the next byte could do anything, so
+     * prediction stops rather than guesses. */
+    kmx_predictor_reconcile(predictor, &server);
+    CHECK(kmx_predictor_type(predictor, "xy", 2));
+    CHECK(kmx_predictor_outstanding(predictor) == 2);
+    CHECK(kmx_predictor_type(predictor, "\r", 1));
+    CHECK(kmx_predictor_outstanding(predictor) == 0);
+
+    kmx_grid_free(&display);
+    kmx_grid_free(&server);
+    kmx_predictor_free(predictor);
+}
+
 int
 main(void) {
     RUN(test_grid_basics);
@@ -643,6 +830,10 @@ main(void) {
     RUN(test_sync_coalesces_bursts);
     RUN(test_sync_resize);
     RUN(test_receiver_rejects_malformed_messages);
+    RUN(test_framer_reassembles_messages);
+    RUN(test_framer_rejects_absurd_lengths);
+    RUN(test_render_reproduces_the_grid);
+    RUN(test_predictor_echoes_and_withdraws);
     puts("all kilix-multiplexer tests passed");
     return 0;
 }

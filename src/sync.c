@@ -210,6 +210,17 @@ kmx_sync_set_interval(kmx_sync *sync, unsigned millis) {
     sync->interval_millis = millis;
 }
 
+void
+kmx_sync_reset_baseline(kmx_sync *sync) {
+    size_t index;
+    if (!sync) return;
+    sync->acked_valid = false;
+    sync->last_send_millis = 0;
+    for (index = 0; index < KMX_SENT_HISTORY; index++) {
+        sync->history[index].used = false;
+    }
+}
+
 const kmx_grid *
 kmx_sync_current(const kmx_sync *sync) {
     return sync ? &sync->current : NULL;

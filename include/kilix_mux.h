@@ -207,6 +207,12 @@ kmx_result kmx_sync_ack(kmx_sync *sync, uint64_t sequence);
 /* Set the interval between messages, clamped to the bounds above. */
 void kmx_sync_set_interval(kmx_sync *sync, unsigned millis);
 
+/* Forget what the receiver is believed to hold, so the next message is a full
+ * screen.  This is what a newly attached client needs: it holds nothing, but
+ * the pane's history is in the terminal model and must not be discarded with
+ * it. */
+void kmx_sync_reset_baseline(kmx_sync *sync);
+
 const kmx_grid *kmx_sync_current(const kmx_sync *sync);
 kmx_term *kmx_sync_term(kmx_sync *sync);
 
@@ -222,6 +228,88 @@ kmx_result kmx_receiver_apply(
     uint64_t *sequence
 );
 const kmx_grid *kmx_receiver_grid(const kmx_receiver *receiver);
+
+/* ---- message framing --------------------------------------------------- */
+
+/* One connection carries several kinds of message.  They are framed with an
+ * explicit length so a reader never has to guess where one ends, and typed so
+ * the planes can be told apart without inspecting their contents. */
+typedef enum {
+    KMX_MSG_HELLO = 1,   /* client -> server: dimensions and capabilities */
+    KMX_MSG_CELLS = 2,   /* server -> client: a cell-plane message         */
+    KMX_MSG_INPUT = 3,   /* client -> server: keystrokes                   */
+    KMX_MSG_RESIZE = 4,  /* client -> server: new dimensions               */
+    KMX_MSG_ACK = 5,     /* client -> server: sequence received            */
+    KMX_MSG_EXIT = 6     /* server -> client: the pane ended                */
+} kmx_message_type;
+
+/* The largest single message accepted from a peer.  A length prefix is an
+ * instruction to allocate, so it is bounded rather than trusted. */
+#define KMX_MESSAGE_MAX (8u * 1024u * 1024u)
+
+kmx_result kmx_frame_encode(
+    kmx_message_type type,
+    const void *payload,
+    size_t size,
+    kmx_buffer *out
+);
+
+/* Incremental reader: append bytes as they arrive, take whole messages out.
+ * Returns KMX_OK with `ready` false when more bytes are needed. */
+typedef struct {
+    kmx_buffer pending;
+} kmx_framer;
+
+void kmx_framer_init(kmx_framer *framer);
+void kmx_framer_free(kmx_framer *framer);
+kmx_result kmx_framer_push(kmx_framer *framer, const void *data, size_t size);
+kmx_result kmx_framer_next(
+    kmx_framer *framer,
+    bool *ready,
+    kmx_message_type *type,
+    const unsigned char **payload,
+    size_t *size
+);
+/* Discard the message most recently returned by kmx_framer_next. */
+void kmx_framer_consume(kmx_framer *framer);
+
+/* ---- client-side rendering --------------------------------------------- */
+
+/* Turns a received grid into terminal output, emitting only what changed
+ * since the last frame it drew.  The client holds this so a repaint costs a
+ * few cells rather than a screen. */
+typedef struct kmx_render kmx_render;
+
+kmx_result kmx_render_create(kmx_render **out);
+void kmx_render_free(kmx_render *render);
+/* Append the escape sequences that bring a terminal showing the previously
+ * rendered frame to `grid`. */
+kmx_result kmx_render_frame(kmx_render *render, const kmx_grid *grid, kmx_buffer *out);
+/* Forget what is on screen, so the next frame is drawn in full. */
+void kmx_render_invalidate(kmx_render *render);
+
+/* ---- predictive local echo --------------------------------------------- */
+
+/* Typing feels local only if it is shown before the round trip completes.
+ * This predicts where typed characters will appear and withdraws the
+ * prediction when the server's own version of the screen arrives.
+ *
+ * Predictions are epoch-gated: anything that invalidates the assumption that
+ * typing appends at the cursor - a resize, a control character, a server frame
+ * that disagrees - clears them rather than letting them drift. */
+typedef struct kmx_predictor kmx_predictor;
+
+kmx_result kmx_predictor_create(kmx_predictor **out);
+void kmx_predictor_free(kmx_predictor *predictor);
+/* Note locally typed bytes.  Returns true when the prediction changed what
+ * should be on screen, so the caller knows to redraw. */
+bool kmx_predictor_type(kmx_predictor *predictor, const void *data, size_t size);
+/* Overlay outstanding predictions onto a server frame. */
+void kmx_predictor_overlay(kmx_predictor *predictor, kmx_grid *grid);
+/* A server frame arrived: confirm or withdraw predictions against it. */
+void kmx_predictor_reconcile(kmx_predictor *predictor, const kmx_grid *grid);
+void kmx_predictor_reset(kmx_predictor *predictor);
+size_t kmx_predictor_outstanding(const kmx_predictor *predictor);
 
 #ifdef __cplusplus
 }
