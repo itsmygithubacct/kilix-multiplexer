@@ -22,7 +22,7 @@ VTERM_OBJECTS := $(VTERM_SOURCES:%.c=$(BUILD_DIR)/%.o)
 
 STATIC_LIB := $(BUILD_DIR)/libkilix-mux.a
 TEST := $(BUILD_DIR)/test-mux
-FUZZ_CELLS := $(BUILD_DIR)/fuzz-cells
+FUZZ := $(BUILD_DIR)/fuzz-decoders
 BENCH := $(BUILD_DIR)/kmx-bench
 SERVE := $(BUILD_DIR)/kmx-serve
 ATTACH := $(BUILD_DIR)/kmx-attach
@@ -82,12 +82,12 @@ sanitize:
 		TEST_ENVIRONMENT="UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1" \
 		test
 
-# The cell decoder is the parser that faces the network. It is fuzzed rather
-# than merely tested; requires a clang with libFuzzer.
+# Every decoder a remote peer can reach is fuzzed, not merely tested.
+# Requires a clang with libFuzzer.
 fuzz: $(BUILD_DIR)
 	clang -std=c11 $(CPPFLAGS) -O1 -g -fsanitize=fuzzer,address,undefined \
-		-o "$(FUZZ_CELLS)" tests/fuzz_cells.c $(LIB_SOURCES) $(VTERM_SOURCES) $(LDLIBS)
-	"$(FUZZ_CELLS)" -max_total_time=$${FUZZ_SECONDS:-30} -print_final_stats=1
+		-o "$(FUZZ)" tests/fuzz_decoders.c $(LIB_SOURCES) $(VTERM_SOURCES) $(LDLIBS)
+	"$(FUZZ)" -max_total_time=$${FUZZ_SECONDS:-30} -print_final_stats=1
 
 # The vendored tree is unmodified upstream; prove it rather than assume it.
 check-vendor:

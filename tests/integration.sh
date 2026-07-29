@@ -308,6 +308,30 @@ else
     report fail "a non-loopback bind is refused unless asked for"
 fi
 
+# --- a client that stops reading cannot stall anyone else ------------------
+#
+# The highest-risk failure mode of a fan-out: one peer that never reads must
+# not be able to hold up the panes or the other clients.  A client socket that
+# was written to blocking would freeze the whole server here.
+stall_port=$(( port + 2 ))
+"$serve" --socket "127.0.0.1:$stall_port" --rows 12 --cols 60 \
+    -- /bin/sh -c 'i=0; while [ $i -lt 400 ]; do printf "flood line %d padded out a bit\r\n" $i; i=$((i+1)); done; printf "FLOOD_DONE\r\n"; sleep 10' \
+    >/dev/null 2>&1 &
+sleep 0.8
+# A peer that connects and then never reads a byte.
+( exec 3<>"/dev/tcp/127.0.0.1/$stall_port" || exit 0; sleep 8 ) >/dev/null 2>&1 &
+staller=$!
+sleep 0.5
+timeout 10 "$attach" --socket "127.0.0.1:$stall_port" --dump --seconds 4 \
+    > "$work/stall.out" 2>&1
+kill "$staller" 2>/dev/null
+wait "$staller" 2>/dev/null
+if visible "$work/stall.out" | grep -q FLOOD_DONE; then
+    report pass "a client that stops reading does not stall the others"
+else
+    report fail "a client that stops reading does not stall the others"
+fi
+
 echo
 if [ "$failures" -eq 0 ]; then
     echo "all integration checks passed"

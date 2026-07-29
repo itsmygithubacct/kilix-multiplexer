@@ -50,6 +50,19 @@ typedef struct {
     const char *command;
 } pane;
 
+/* KMX_CLIENT_QUEUE_LIMIT bounds what is held for one client.  A client that
+ * stops reading must not be able to stall the panes or the other clients, so
+ * its socket is non-blocking and its backlog is bounded; past the limit it is
+ * disconnected rather than buffered.
+ *
+ * The cell plane needs no queue at all beyond one message.  Because every
+ * message is a diff against what the client last acknowledged, a client that
+ * is behind is better served by the NEXT diff than by the one it missed - so
+ * a new cell message is only produced once the previous one has actually
+ * gone. That is the same "never queue, always diff" property the
+ * synchroniser has, applied to the socket. */
+#define KMX_CLIENT_QUEUE_LIMIT (4u * 1024u * 1024u)
+
 typedef struct {
     int fd;
     bool control;
@@ -59,7 +72,56 @@ typedef struct {
     kmx_image_cache *holds;
     kmx_layout announced;
     kmx_framer framer;
+    kmx_buffer out;
+    size_t out_offset;
 } client;
+
+/* Queue a message.  Returns -1 when the client has fallen too far behind to
+ * be worth keeping. */
+static int
+client_queue(client *item, kmx_message_type type, const void *payload, size_t size) {
+    kmx_buffer framed;
+    int result = 0;
+    kmx_buffer_init(&framed);
+    if (kmx_frame_encode(type, payload, size, &framed) != KMX_OK) {
+        kmx_buffer_free(&framed);
+        return -1;
+    }
+    if (item->out.size - item->out_offset + framed.size > KMX_CLIENT_QUEUE_LIMIT) {
+        result = -1;
+    } else if (kmx_buffer_append(&item->out, framed.data, framed.size) != KMX_OK) {
+        result = -1;
+    }
+    kmx_buffer_free(&framed);
+    return result;
+}
+
+/* Push what will go without blocking.  Anything left waits for POLLOUT. */
+static int
+client_flush(client *item) {
+    while (item->out_offset < item->out.size) {
+        ssize_t count = send(
+            item->fd,
+            item->out.data + item->out_offset,
+            item->out.size - item->out_offset,
+            MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+            return -1;
+        }
+        if (count == 0) return -1;
+        item->out_offset += (size_t)count;
+    }
+    item->out_offset = 0;
+    item->out.size = 0;
+    return 0;
+}
+
+static bool
+client_idle(const client *item) {
+    return item->out.size == item->out_offset;
+}
 
 static volatile sig_atomic_t stop_requested;
 
@@ -105,20 +167,6 @@ peer_is_owner(int fd) {
 #endif
 }
 
-static int
-send_framed(int fd, kmx_message_type type, const void *payload, size_t size) {
-    kmx_buffer framed;
-    int result;
-    kmx_buffer_init(&framed);
-    if (kmx_frame_encode(type, payload, size, &framed) != KMX_OK) {
-        kmx_buffer_free(&framed);
-        return -1;
-    }
-    result = write_all(fd, framed.data, framed.size);
-    kmx_buffer_free(&framed);
-    return result;
-}
-
 static void
 client_release(client *item, size_t pane_count) {
     size_t slot;
@@ -128,6 +176,7 @@ client_release(client *item, size_t pane_count) {
     }
     kmx_image_cache_free(item->holds);
     kmx_framer_free(&item->framer);
+    kmx_buffer_free(&item->out);
     memset(item, 0, sizeof *item);
     item->fd = -1;
 }
@@ -288,7 +337,8 @@ main(int argc, char **argv) {
             if (clients[which].fd < 0) continue;
             client_at[descriptor_count - client_first] = which;
             descriptors[descriptor_count].fd = clients[which].fd;
-            descriptors[descriptor_count].events = POLLIN;
+            descriptors[descriptor_count].events =
+                (short)(POLLIN | (client_idle(&clients[which]) ? 0 : POLLOUT));
             descriptors[descriptor_count].revents = 0;
             descriptor_count++;
         }
@@ -329,6 +379,11 @@ main(int argc, char **argv) {
                 } else {
                     client *item = &clients[free_slot];
                     bool ok = true;
+                    int flags = fcntl(accepted, F_GETFL, 0);
+                    if (flags < 0 || fcntl(accepted, F_SETFL, flags | O_NONBLOCK) != 0) {
+                        close(accepted);
+                        continue;
+                    }
                     memset(item, 0, sizeof *item);
                     item->fd = accepted;
                     item->control = true;
@@ -353,6 +408,12 @@ main(int argc, char **argv) {
             client *item = &clients[id];
             short revents = descriptors[client_first + which].revents;
             if (item->fd < 0 || descriptors[client_first + which].fd != item->fd) continue;
+            if (revents & POLLOUT) {
+                if (client_flush(item) != 0) {
+                    client_release(item, count);
+                    continue;
+                }
+            }
             if (!(revents & (POLLIN | POLLHUP | POLLERR))) continue;
             {
                 ssize_t received = read(item->fd, buffer, sizeof buffer);
@@ -475,8 +536,8 @@ main(int argc, char **argv) {
                 kmx_buffer wire;
                 kmx_buffer_init(&wire);
                 if (kmx_layout_encode(&layout, &wire) == KMX_OK) {
-                    if (send_framed(
-                            item->fd, KMX_MSG_LAYOUT, wire.data, wire.size) != 0) {
+                    if (client_queue(
+                            item, KMX_MSG_LAYOUT, wire.data, wire.size) != 0) {
                         kmx_buffer_free(&wire);
                         client_release(item, count);
                         continue;
@@ -490,14 +551,17 @@ main(int argc, char **argv) {
                 kmx_buffer message;
                 kmx_sync_info info;
                 bool produced = false;
+                /* Nothing new until the last one is away: a client that is
+                 * behind wants the next diff, not a queue of stale ones. */
+                if (!client_idle(item)) break;
                 kmx_buffer_init(&message);
                 if (kmx_buffer_append(
                         &message, &(unsigned char){(unsigned char)slot}, 1) == KMX_OK &&
                     kmx_sync_poll(
                         item->sync[slot], now_millis(),
                         &message, &produced, &info) == KMX_OK && produced) {
-                    if (send_framed(
-                            item->fd, KMX_MSG_CELLS, message.data, message.size) != 0) {
+                    if (client_queue(
+                            item, KMX_MSG_CELLS, message.data, message.size) != 0) {
                         kmx_buffer_free(&message);
                         client_release(item, count);
                         break;
@@ -524,8 +588,8 @@ main(int argc, char **argv) {
                             (uint32_t)slot, &key,
                             known ? NULL : (const void *)graphic->payload.data,
                             known ? 0 : graphic->payload.size, &wire) == KMX_OK) {
-                        if (send_framed(
-                                item->fd, KMX_MSG_IMAGE, wire.data, wire.size) != 0) {
+                        if (client_queue(
+                                item, KMX_MSG_IMAGE, wire.data, wire.size) != 0) {
                             kmx_buffer_free(&wire);
                             client_release(item, count);
                             break;
@@ -539,6 +603,11 @@ main(int argc, char **argv) {
                     kmx_buffer_free(&wire);
                 }
             }
+        }
+
+        for (which = 0; which < KMX_MAX_CLIENTS; which++) {
+            if (clients[which].fd < 0 || client_idle(&clients[which])) continue;
+            if (client_flush(&clients[which]) != 0) client_release(&clients[which], count);
         }
 
         /* Cleared only once every client has had its look, since what one
@@ -571,7 +640,8 @@ main(int argc, char **argv) {
             }
             for (which = 0; which < KMX_MAX_CLIENTS; which++) {
                 if (clients[which].fd < 0) continue;
-                (void)send_framed(clients[which].fd, KMX_MSG_EXIT, NULL, 0);
+                (void)client_queue(&clients[which], KMX_MSG_EXIT, NULL, 0);
+                (void)client_flush(&clients[which]);
             }
             break;
         }
