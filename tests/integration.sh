@@ -513,6 +513,37 @@ if [ -n "$host_ip" ]; then
     fi
 fi
 
+# --- the hostile profile ---------------------------------------------------
+#
+# 256 kbit/s, half a second of round trip, 5% loss.  The plan's Gate 5 asks
+# that text stay usable here, and this is the check that decides it rather
+# than asserting it.
+shape="$root/build/kmx-shape"
+if [ -x "$shape" ]; then
+    hos_port=$(( port + 7 ))
+    shp_port=$(( port + 8 ))
+    "$serve" --socket "127.0.0.1:$hos_port" --rows 24 --cols 80 \
+        -- /bin/sh -c 'stty -echo; printf "HOSTILE_READY\r\n"; while IFS= read -r l; do printf "GOT[%s]\r\n" "$l"; done' \
+        >/dev/null 2>&1 &
+    sleep 1
+    "$shape" --listen "$shp_port" --to "127.0.0.1:$hos_port" \
+        --delay 250 --jitter 50 --loss 5 --rate 32000 --seed 7 >/dev/null 2>&1 &
+    sleep 1
+    timeout 40 "$attach" --socket "127.0.0.1:$shp_port" --dump --seconds 12 \
+        --send 'HOSTILE
+' > "$work/hostile.out" 2>&1
+    text=$(visible "$work/hostile.out")
+    if printf '%s' "$text" | grep -q HOSTILE_READY &&
+       printf '%s' "$text" | grep -q 'GOT\[HOSTILE\]'; then
+        report pass "text stays usable on the hostile profile"
+    else
+        report fail "text stays usable on the hostile profile"
+    fi
+    pkill -x kmx-shape 2>/dev/null
+else
+    echo "skip  hostile profile (build kmx-shape)"
+fi
+
 echo
 if [ "$failures" -eq 0 ]; then
     echo "all integration checks passed"

@@ -25,11 +25,12 @@ TEST := $(BUILD_DIR)/test-mux
 FUZZ := $(BUILD_DIR)/fuzz-decoders
 BENCH := $(BUILD_DIR)/kmx-bench
 SERVE := $(BUILD_DIR)/kmx-serve
+SHAPE := $(BUILD_DIR)/kmx-shape
 ATTACH := $(BUILD_DIR)/kmx-attach
 
 .PHONY: all clean test sanitize fuzz check-vendor install
 
-all: $(STATIC_LIB) $(BENCH) $(SERVE) $(ATTACH)
+all: $(STATIC_LIB) $(BENCH) $(SERVE) $(ATTACH) $(SHAPE)
 
 $(BUILD_DIR):
 	mkdir -p "$@"
@@ -56,6 +57,12 @@ $(BUILD_DIR)/kmx_serve.o: tools/kmx_serve.c tools/kmx_pixel.h include/kilix_mux.
 
 $(BUILD_DIR)/kmx_pixel.o: tools/kmx_pixel.c tools/kmx_pixel.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Itools -c "$<" -o "$@"
+
+$(BUILD_DIR)/kmx_shape.o: tools/kmx_shape.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c "$<" -o "$@"
+
+$(SHAPE): $(BUILD_DIR)/kmx_shape.o
+	$(CC) $(LDFLAGS) -o "$@" $(BUILD_DIR)/kmx_shape.o
 
 $(BUILD_DIR)/kmx_tls.o: tools/kmx_tls.c tools/kmx_tls.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Itools -c "$<" -o "$@"
