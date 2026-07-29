@@ -15,6 +15,7 @@
 
 #include "kilix_mux.h"
 #include "endpoint.h"
+#include "kmx_tls.h"
 
 #include <errno.h>
 #include <poll.h>
@@ -45,12 +46,21 @@ handle_stop(int signal_number) {
     stop_pending = 1;
 }
 
+/* The one place that knows whether this connection is wrapped. */
+static kmx_tls_session *active_tls;
+
 static int
 write_all(int fd, const void *data, size_t size) {
     const unsigned char *cursor = data;
     size_t done = 0;
     while (done < size) {
-        ssize_t count = write(fd, cursor + done, size - done);
+        ssize_t count;
+        if (active_tls && fd != STDOUT_FILENO && fd != STDERR_FILENO) {
+            count = kmx_tls_write(active_tls, cursor + done, size - done);
+            if (count < 0 && errno == EAGAIN) continue;
+        } else {
+            count = write(fd, cursor + done, size - done);
+        }
         if (count < 0) {
             if (errno == EINTR) continue;
             return -1;
@@ -147,6 +157,9 @@ main(int argc, char **argv) {
     bool dump = false;
     bool view_only = false;
     const char *token = NULL;
+    const char *fingerprint = NULL;
+    kmx_tls_client *tls_client = NULL;
+    kmx_tls_session *tls = NULL;
     int reconnect_seconds = 30;
     bool pane_ended = false;
     int run_seconds = 0;
@@ -188,6 +201,8 @@ main(int argc, char **argv) {
             reconnect_seconds = atoi(argv[++index]);
         } else if (strcmp(argv[index], "--token") == 0 && index + 1 < argc) {
             token = argv[++index];
+        } else if (strcmp(argv[index], "--tls-fingerprint") == 0 && index + 1 < argc) {
+            fingerprint = argv[++index];
         } else if (strcmp(argv[index], "--view") == 0) {
             view_only = true;
             predict = false;
@@ -199,7 +214,8 @@ main(int argc, char **argv) {
             run_seconds = atoi(argv[++index]);
         } else {
             fprintf(stderr, "usage: kmx-attach --socket PATH [--no-predict]"
-                            " [--view] [--token TOKEN]\n       [--reconnect N]"
+                            " [--view] [--token TOKEN]\n"
+                            "       [--tls-fingerprint HEX] [--reconnect N]"
                             "       [--dump] [--send TEXT] [--seconds N]\n");
             return 2;
         }
@@ -222,6 +238,26 @@ main(int argc, char **argv) {
         return 1;
     }
     kmx_endpoint_tune(fd, &endpoint);
+    if (fingerprint) {
+        tls_client = kmx_tls_client_create(fingerprint);
+        if (!tls_client) {
+            fprintf(stderr, "kmx-attach: a fingerprint is %d hex characters\n",
+                    KMX_TLS_FINGERPRINT_HEX);
+            close(fd);
+            return 2;
+        }
+        tls = kmx_tls_client_connect(tls_client, fd);
+        active_tls = tls;
+        if (!tls) {
+            /* Either the handshake failed or the certificate is not the one
+             * named.  Both mean: do not talk to this. */
+            fprintf(stderr,
+                "kmx-attach: the server did not present the expected "
+                "certificate\n");
+            close(fd);
+            return 1;
+        }
+    }
 
     kmx_layout_init(&layout, rows, cols);
     if (kmx_render_create(&render) != KMX_OK ||
@@ -287,7 +323,13 @@ main(int argc, char **argv) {
         }
 
         if (descriptors[0].revents & (POLLIN | POLLHUP | POLLERR)) {
-            ssize_t count = read(fd, buffer, sizeof buffer);
+            ssize_t count;
+            if (tls) {
+                count = kmx_tls_read(tls, buffer, sizeof buffer);
+                if (count < 0 && errno == EAGAIN) continue;
+            } else {
+                count = read(fd, buffer, sizeof buffer);
+            }
             if (count <= 0) {
                 int replacement;
                 /* A pane that ended is not a link that dropped; do not chase
@@ -300,6 +342,19 @@ main(int argc, char **argv) {
                     break;
                 }
                 fd = replacement;
+                if (tls_client) {
+                    /* A new connection is a new handshake, and the
+                     * fingerprint is checked again: a server that changed
+                     * identity while we were away is not the same server. */
+                    kmx_tls_session_free(tls);
+                    active_tls = NULL;
+                    tls = kmx_tls_client_connect(tls_client, fd);
+                    active_tls = tls;
+                    if (!tls) {
+                        fd = -1;
+                        break;
+                    }
+                }
                 /* Everything held about the old connection is now a guess:
                  * the panes may have been rearranged, and this client holds
                  * nothing the server knows about. */
@@ -510,6 +565,8 @@ main(int argc, char **argv) {
     kmx_grid_free(&screen);
     kmx_predictor_free(predictor);
     kmx_render_free(render);
+    kmx_tls_session_free(tls);
+    kmx_tls_client_free(tls_client);
     if (fd >= 0) close(fd);
     return exit_code;
 }

@@ -57,6 +57,24 @@ Asserted by `tests/integration.sh`: a token is minted, and attaching with
 none, with a wrong one, and with the right one give refusal, refusal, and a
 session. Verified across two machines over a real LAN with no tunnel.
 
+### What a peer can read
+
+`--tls` encrypts the connection. There is no certificate authority, and there
+should not be one for a personal session between two machines that already
+know each other: the server mints a key and a self-signed certificate at
+startup, holds both **in memory only**, and prints the certificate's SHA-256
+fingerprint. The client is given that fingerprint and refuses anything else.
+
+The client will not run without one. A client that would accept any
+certificate has no more assurance than no TLS at all — and a comforting one,
+which is worse. The comparison is constant-time, for the same reason the
+token's is.
+
+Asserted by `tests/integration.sh`: the right fingerprint attaches, a wrong
+one is refused, and a plaintext client against a TLS server gets nothing
+rather than falling back to something unencrypted. Verified between two
+machines over a real LAN with no tunnel.
+
 ### What a peer may do
 
 Roles are declared in `HELLO` and enforced by the server, not by the client.
@@ -105,13 +123,11 @@ is rejected and that trailing bytes are an error rather than ignored.
 
 Stated plainly rather than left to be discovered.
 
-1. **No transport encryption.** Content crosses the network in the clear
-   without a tunnel. Over loopback that is fine; over a reachable address it
-   is not, and the server says so when it binds one. A token establishes *who*
-   may attach; it does nothing about *who may watch*. Kilix's own tiers add
-   TLS for this (`config/stream.py`) and this project has not; until it does,
-   a reachable bind is only appropriate on a segment you would already trust
-   with the terminal's contents.
+1. **TLS is opt-in, not the default.** `--tls` encrypts and authenticates the
+   server; without it a reachable bind is still cleartext, and the server says
+   so when it binds one. The default is not TLS because the recommended route
+   remains an SSH tunnel to loopback, which already provides both. A future
+   revision should probably make `--lan` imply `--tls`.
 2. **No rate limit on connection attempts.** Eight client slots fill on a
    first-come basis, so a local process can occupy them.
 3. **The pixel pane runs a shell command** given on the server's own command
@@ -134,6 +150,7 @@ Stated plainly rather than left to be discovered.
 ## Before any public release
 
 - [x] Token authentication for reachable binds — done 2026-07-28
-- [ ] TLS, so a reachable bind is confidential as well as authenticated
+- [x] TLS with fingerprint pinning — done 2026-07-28
+- [ ] Consider making `--lan` imply `--tls`
 - [ ] Independent review of the LAN path
 - [ ] Extended fuzzing run against a seeded corpus, not just the default 30s

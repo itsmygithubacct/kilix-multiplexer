@@ -19,6 +19,7 @@
 #include "kilix_mux.h"
 #include "endpoint.h"
 #include "kmx_pixel.h"
+#include "kmx_tls.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -70,6 +71,7 @@ typedef struct {
 
 typedef struct {
     int fd;
+    kmx_tls_session *tls;
     bool control;
     bool greeted;
     kmx_motion *motion;   /* per client: what IT has been shown */
@@ -83,6 +85,20 @@ typedef struct {
     kmx_buffer out;
     size_t out_offset;
 } client;
+
+/* One place that knows whether this connection is wrapped, so every other
+ * call site reads and writes without caring. */
+static long
+client_recv(client *item, void *data, size_t size) {
+    if (item->tls) return kmx_tls_read(item->tls, data, size);
+    return recv(item->fd, data, size, MSG_DONTWAIT);
+}
+
+static long
+client_send(client *item, const void *data, size_t size) {
+    if (item->tls) return kmx_tls_write(item->tls, data, size);
+    return send(item->fd, data, size, MSG_NOSIGNAL | MSG_DONTWAIT);
+}
 
 /* Queue a message.  Returns -1 when the client has fallen too far behind to
  * be worth keeping. */
@@ -108,11 +124,10 @@ client_queue(client *item, kmx_message_type type, const void *payload, size_t si
 static int
 client_flush(client *item) {
     while (item->out_offset < item->out.size) {
-        ssize_t count = send(
-            item->fd,
+        long count = client_send(
+            item,
             item->out.data + item->out_offset,
-            item->out.size - item->out_offset,
-            MSG_NOSIGNAL | MSG_DONTWAIT);
+            item->out.size - item->out_offset);
         if (count < 0) {
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
@@ -222,6 +237,8 @@ peer_is_owner(int fd) {
 static void
 client_release(client *item, size_t pane_count) {
     size_t slot;
+    kmx_tls_session_free(item->tls);
+    item->tls = NULL;
     if (item->fd >= 0) close(item->fd);
     for (slot = 0; slot < pane_count; slot++) {
         kmx_sync_free(item->sync[slot]);
@@ -250,7 +267,9 @@ usage(void) {
           "  --pixel-pane runs an X client on a private display and streams its\n"
           "  frames; it never touches the display the operator is using.\n"
           "  --audio-source runs a command that writes raw 16-bit PCM to stdout.\n"
-          "  --lan requires a token; one is generated and printed if not given.\n",
+          "  --lan requires a token; one is generated and printed if not given.\n"
+          "  --tls adds confidentiality: the server prints a fingerprint the\n"
+          "  client must be given, which is the only thing identifying it.\n",
           stderr);
 }
 
@@ -261,6 +280,9 @@ main(int argc, char **argv) {
     bool allow_public = false;
     char token[KMX_TOKEN_HEX + 1];
     bool require_token = false;
+    bool use_tls = false;
+    kmx_tls_server *tls = NULL;
+    char fingerprint[KMX_TLS_FINGERPRINT_HEX + 1];
     const char *commands[KMX_MAX_PANES];
     const char *pixel_command = NULL;
     kmx_pixel_pane pixel;
@@ -329,6 +351,8 @@ main(int argc, char **argv) {
             audio_budget = (uint32_t)strtoul(argv[++index], NULL, 10);
         } else if (strcmp(argv[index], "--lan") == 0) {
             allow_public = true;
+        } else if (strcmp(argv[index], "--tls") == 0) {
+            use_tls = true;
         } else if (strcmp(argv[index], "--token") == 0 && index + 1 < argc) {
             const char *given = argv[++index];
             if (strlen(given) < 16 || strlen(given) > KMX_TOKEN_HEX) {
@@ -402,13 +426,27 @@ main(int argc, char **argv) {
         }
         return 1;
     }
+    if (use_tls) {
+        if (endpoint.kind != KMX_ENDPOINT_TCP) {
+            fprintf(stderr, "kmx-serve: --tls applies to a TCP socket\n");
+            return 2;
+        }
+        tls = kmx_tls_server_create(fingerprint, sizeof fingerprint);
+        if (!tls) {
+            fprintf(stderr, "kmx-serve: could not set up TLS\n");
+            return 1;
+        }
+    }
+
     /* Printed whenever a token is required, however it came to be required:
      * a token the operator is never told is a session nobody can attach to. */
     if (require_token) {
         fprintf(stderr,
             "kmx-serve: listening on %s:%d\n"
-            "  Attach with:  kmx-attach --socket %s:%d --token %s\n",
-            endpoint.host, endpoint.port, endpoint.host, endpoint.port, token);
+            "  Attach with:  kmx-attach --socket %s:%d --token %s%s%s\n",
+            endpoint.host, endpoint.port, endpoint.host, endpoint.port, token,
+            use_tls ? " \\\n                  --tls-fingerprint " : "",
+            use_tls ? fingerprint : "");
         if (endpoint.kind == KMX_ENDPOINT_TCP &&
             !kmx_endpoint_is_loopback(&endpoint)) {
             fprintf(stderr,
@@ -596,6 +634,27 @@ main(int argc, char **argv) {
                         continue;
                     }
                     memset(item, 0, sizeof *item);
+                    if (tls) {
+                        /* The handshake is blocking, so it is given a deadline:
+                         * a peer that opens a connection and then says nothing
+                         * must not be able to hold up the session. */
+                        struct timeval limit = {.tv_sec = 5, .tv_usec = 0};
+                        int blocking = fcntl(accepted, F_GETFL, 0);
+                        if (blocking >= 0) {
+                            fcntl(accepted, F_SETFL, blocking & ~O_NONBLOCK);
+                        }
+                        setsockopt(accepted, SOL_SOCKET, SO_RCVTIMEO,
+                                   &limit, sizeof limit);
+                        setsockopt(accepted, SOL_SOCKET, SO_SNDTIMEO,
+                                   &limit, sizeof limit);
+                        item->tls = kmx_tls_server_accept(tls, accepted);
+                        if (!item->tls) {
+                            close(accepted);
+                            memset(item, 0, sizeof *item);
+                            item->fd = -1;
+                            continue;
+                        }
+                    }
                     item->fd = accepted;
                     item->control = true;
                     item->rows = rows;
@@ -637,7 +696,8 @@ main(int argc, char **argv) {
             }
             if (!(revents & (POLLIN | POLLHUP | POLLERR))) continue;
             {
-                ssize_t received = read(item->fd, buffer, sizeof buffer);
+                long received = client_recv(item, buffer, sizeof buffer);
+                if (received == -1 && errno == EAGAIN) continue;
                 if (received <= 0 ||
                     kmx_framer_push(&item->framer, buffer, (size_t)received) != KMX_OK) {
                     client_release(item, count);
@@ -977,6 +1037,7 @@ main(int argc, char **argv) {
     }
     free(audio_block);
     if (listener >= 0) close(listener);
+    kmx_tls_server_free(tls);
     kmx_endpoint_cleanup(&endpoint);
     return 0;
 }

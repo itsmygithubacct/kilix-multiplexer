@@ -116,7 +116,11 @@ else
 fi
 
 # --- a pane that exits tells the client ------------------------------------
-if start_pane quick /bin/sh -c 'printf "DONE_MARKER\r\n"'; then
+# A brief life rather than an instant one: a pane that exits before the socket
+# has been noticed makes this a race about startup, when what is under test is
+# what happens at the END.  One second still exits long before the client's
+# own timeout.
+if start_pane quick /bin/sh -c 'printf "DONE_MARKER\r\n"; sleep 1'; then
     sleep 0.3
     start=$(date +%s)
     timeout 10 "$attach" --socket "$work/quick.sock" --dump --seconds 8 \
@@ -470,6 +474,43 @@ if [ "$without" -eq 0 ] && [ "$wrong" -eq 0 ] && [ "$right" -ge 1 ]; then
 else
     report fail "the token is required and checked (none=$without wrong=$wrong right=$right)"
 fi
+fi
+
+# --- TLS, pinned by fingerprint --------------------------------------------
+#
+# A token says who may attach; it says nothing about who may watch.  There is
+# no certificate authority here and should not be one for a personal session,
+# so the server's fingerprint is the identity and the client refuses anything
+# else - SSH's model.
+if [ -n "$host_ip" ]; then
+    tls_port=$(( port + 6 ))
+    "$serve" --socket "$host_ip:$tls_port" --lan --tls --rows 10 --cols 40 \
+        -- /bin/sh -c 'printf "TLS_PANE\r\n"; sleep 20' >"$work/tls.log" 2>&1 &
+    sleep 3
+    tls_token=$(grep -oE -- '--token [0-9a-f]+' "$work/tls.log" | awk '{print $2}' | head -1)
+    tls_fp=$(grep -oE -- '--tls-fingerprint [0-9a-f]+' "$work/tls.log" | awk '{print $2}' | head -1)
+    if [ "${#tls_fp}" -eq 64 ]; then
+        report pass "a certificate fingerprint is minted and printed"
+    else
+        report fail "a certificate fingerprint is minted and printed"
+    fi
+    good=$(timeout 12 "$attach" --socket "$host_ip:$tls_port" \
+        --token "$tls_token" --tls-fingerprint "$tls_fp" --dump --seconds 3 2>&1 |
+        visible /dev/stdin | grep -c TLS_PANE)
+    badfp=$(printf 'a%.0s' $(seq 1 64))
+    bad=$(timeout 12 "$attach" --socket "$host_ip:$tls_port" \
+        --token "$tls_token" --tls-fingerprint "$badfp" --dump --seconds 2 2>&1 |
+        visible /dev/stdin | grep -c TLS_PANE)
+    # A plaintext client against a TLS server must get nothing, rather than
+    # falling back to something unencrypted.
+    plain=$(timeout 12 "$attach" --socket "$host_ip:$tls_port" \
+        --token "$tls_token" --dump --seconds 2 2>&1 |
+        visible /dev/stdin | grep -c TLS_PANE)
+    if [ "$good" -ge 1 ] && [ "$bad" -eq 0 ] && [ "$plain" -eq 0 ]; then
+        report pass "TLS is pinned to the fingerprint and does not fall back"
+    else
+        report fail "TLS pinning (good=$good bad=$bad plain=$plain)"
+    fi
 fi
 
 echo

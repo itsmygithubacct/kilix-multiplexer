@@ -57,14 +57,17 @@ $(BUILD_DIR)/kmx_serve.o: tools/kmx_serve.c tools/kmx_pixel.h include/kilix_mux.
 $(BUILD_DIR)/kmx_pixel.o: tools/kmx_pixel.c tools/kmx_pixel.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Itools -c "$<" -o "$@"
 
-$(SERVE): $(BUILD_DIR)/kmx_serve.o $(BUILD_DIR)/kmx_pixel.o $(STATIC_LIB)
-	$(CC) $(LDFLAGS) -o "$@" $(BUILD_DIR)/kmx_serve.o $(BUILD_DIR)/kmx_pixel.o $(STATIC_LIB) $(LDLIBS) -lutil
+$(BUILD_DIR)/kmx_tls.o: tools/kmx_tls.c tools/kmx_tls.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Itools -c "$<" -o "$@"
 
-$(BUILD_DIR)/kmx_attach.o: tools/kmx_attach.c include/kilix_mux.h | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -c "$<" -o "$@"
+$(SERVE): $(BUILD_DIR)/kmx_serve.o $(BUILD_DIR)/kmx_pixel.o $(BUILD_DIR)/kmx_tls.o $(STATIC_LIB)
+	$(CC) $(LDFLAGS) -o "$@" $(BUILD_DIR)/kmx_serve.o $(BUILD_DIR)/kmx_pixel.o $(BUILD_DIR)/kmx_tls.o $(STATIC_LIB) $(LDLIBS) -lutil -lssl -lcrypto
 
-$(ATTACH): $(BUILD_DIR)/kmx_attach.o $(STATIC_LIB)
-	$(CC) $(LDFLAGS) -o "$@" $(BUILD_DIR)/kmx_attach.o $(STATIC_LIB) $(LDLIBS)
+$(BUILD_DIR)/kmx_attach.o: tools/kmx_attach.c tools/kmx_tls.h include/kilix_mux.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Itools -c "$<" -o "$@"
+
+$(ATTACH): $(BUILD_DIR)/kmx_attach.o $(BUILD_DIR)/kmx_tls.o $(STATIC_LIB)
+	$(CC) $(LDFLAGS) -o "$@" $(BUILD_DIR)/kmx_attach.o $(BUILD_DIR)/kmx_tls.o $(STATIC_LIB) $(LDLIBS) -lssl -lcrypto
 
 $(BUILD_DIR)/test_mux.o: tests/test_mux.c include/kilix_mux.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c "$<" -o "$@"
