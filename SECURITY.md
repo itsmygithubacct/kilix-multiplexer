@@ -298,7 +298,11 @@ Stated plainly rather than left to be discovered.
 - [x] TLS with fingerprint pinning — done 2026-07-28
 - [x] A reachable bind encrypts by default; `--no-tls` is explicit (2026-07-29)
 - [x] Accept rate limiting (2026-07-29)
-- [ ] Independent review of the LAN path
+- [ ] **Independent review of the LAN path — NOT DONE.** Published anyway, on
+      the operator's explicit decision (2026-07-29). This is the one item on
+      this list that was waived rather than met, and it is the most important
+      one, so it is stated here rather than left to be inferred from an
+      unticked box.
 - [x] Seeded corpus — `make fuzz` builds it from real messages (2026-07-29)
 - [x] A long soak — 25 minutes, 2 workers, **found a real bug** (2026-07-29):
       the motion decoder validated its dimensions after narrowing them to
@@ -307,4 +311,29 @@ Stated plainly rather than left to be discovered.
       the other decoders audited for the same shape (they bound the 64-bit
       value first, which is the correct order)
 - [x] Re-soaked against the fix — 47.9M executions in 15 minutes, clean
-- [ ] A longer soak still, hours rather than minutes, before publication
+- [ ] A longer soak still, hours rather than minutes. The longest run so far is
+      12.7M executions in three minutes on the current tree, plus the 47.9M
+      re-soak above; nothing has been run for hours.
+
+## If you are reviewing this
+
+Start with the four claims under "What is enforced, and where" and try to break
+them; the section above each fix records what the trigger was, because a
+concrete trigger is worth more than a description.
+
+Known-weak spots, so you do not have to rediscover them:
+
+- `KMX_SETTLE_MS` is ten seconds and there are eight client slots, so eight
+  peers can keep a session unattachable at low cost. There is no good answer to
+  this in the current design.
+- The self-signed certificate is regenerated per server start, so a pinned
+  fingerprint is per-session and has to be re-copied each time — a usability
+  cost that pushes people toward not checking it.
+- Every bug found so far in the connection handling has been of one of two
+  shapes: a bound checked after a narrowing conversion, or a check that counted
+  sockets where it meant clients that were actually being served. Both recurred
+  after being fixed once.
+
+A finding with a trigger is worth more than five without. A review that finds
+nothing and says so is a real result and the one thing that would let the box
+above be ticked.

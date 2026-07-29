@@ -118,3 +118,14 @@ yet — those arrive with the phases that need them.
 ## License
 
 MIT.
+
+## Status
+
+Published 2026-07-29. It works, it is tested, and it measures well — see
+`SECURITY.md` for what is enforced and, more usefully, for the list of things
+that have gone wrong and how they were found.
+
+One thing to be plain about before you point it at anything: **the network path
+has not received an independent review.** Treat a reachable bind accordingly —
+prefer an SSH tunnel to a loopback port over `--lan`, which is what the
+documentation recommends anyway.
