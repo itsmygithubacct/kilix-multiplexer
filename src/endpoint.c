@@ -62,6 +62,18 @@ kmx_endpoint_is_loopback(const kmx_endpoint *endpoint) {
     return false;
 }
 
+/* The listeners are non-blocking.
+ *
+ * accept(2) is explicit that a POLLIN on a listening socket does not guarantee
+ * a connection is still there to take - an asynchronous error can remove it in
+ * between - and that accept() on a blocking listener then waits for the next
+ * one to arrive.  In a single-threaded server with no other timeout that is a
+ * stall of everything: the settle sweep, the pane reads, every attached
+ * client, until some unrelated peer happens to connect.  `--lan` is exactly
+ * where asynchronous errors are ordinary.
+ *
+ * SOCK_CLOEXEC in accept4 applies to the accepted socket, not to this one, so
+ * it does not cover this. */
 int
 kmx_endpoint_listen(const kmx_endpoint *endpoint, bool allow_public) {
     int fd;
@@ -73,7 +85,7 @@ kmx_endpoint_listen(const kmx_endpoint *endpoint, bool allow_public) {
             errno = ENAMETOOLONG;
             return -1;
         }
-        fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
         if (fd < 0) return -1;
         memset(&address, 0, sizeof address);
         address.sun_family = AF_UNIX;
@@ -108,7 +120,7 @@ kmx_endpoint_listen(const kmx_endpoint *endpoint, bool allow_public) {
             errno = EINVAL;
             return -1;
         }
-        fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
         if (fd < 0) return -1;
         (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof reuse);
         if (bind(fd, (struct sockaddr *)&address, sizeof address) != 0 ||

@@ -119,6 +119,23 @@ kmx_tls_server_create(char *fingerprint, size_t size) {
     }
     /* Nothing before 1.2, and 1.3 in practice with any current library. */
     SSL_CTX_set_min_proto_version(server->context, TLS1_2_VERSION);
+    /* The outbound queue is a growable buffer: it is compacted when its sent
+     * prefix gets large, and appending to it can realloc.  So the pointer handed
+     * to SSL_write can legitimately move between a WANT_WRITE and the retry -
+     * and OpenSSL treats that as a caller bug (SSL_R_BAD_WRITE_RETRY) and kills
+     * the session, rather than as the ordinary thing it is here.
+     *
+     * Measured before this was set: a TLS client that stopped reading died at
+     * about 320 kB of backlog, against a 4 MiB limit, with the server silently
+     * losing the connection instead of dropping frames.  Over plain TCP the same
+     * client survived and the drop counters engaged as designed.
+     *
+     * The alternative is to promise OpenSSL a stable address by never compacting
+     * or reallocating while a write is pending, which means a second buffering
+     * discipline for the TLS case alone.  This flag is what the mode exists
+     * for. */
+    SSL_CTX_set_mode(server->context, SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+
     if (SSL_CTX_use_certificate(server->context, server->certificate) != 1 ||
         SSL_CTX_use_PrivateKey(server->context, server->key) != 1 ||
         !certificate_fingerprint(server->certificate, fingerprint, size)) {
@@ -190,6 +207,23 @@ kmx_tls_client_create(const char *fingerprint) {
         return NULL;
     }
     SSL_CTX_set_min_proto_version(client->context, TLS1_2_VERSION);
+    /* Same reason as the server side.  The outbound queue is a growable buffer: it is compacted when its sent
+     * prefix gets large, and appending to it can realloc.  So the pointer handed
+     * to SSL_write can legitimately move between a WANT_WRITE and the retry -
+     * and OpenSSL treats that as a caller bug (SSL_R_BAD_WRITE_RETRY) and kills
+     * the session, rather than as the ordinary thing it is here.
+     *
+     * Measured before this was set: a TLS client that stopped reading died at
+     * about 320 kB of backlog, against a 4 MiB limit, with the server silently
+     * losing the connection instead of dropping frames.  Over plain TCP the same
+     * client survived and the drop counters engaged as designed.
+     *
+     * The alternative is to promise OpenSSL a stable address by never compacting
+     * or reallocating while a write is pending, which means a second buffering
+     * discipline for the TLS case alone.  This flag is what the mode exists
+     * for. */
+    SSL_CTX_set_mode(client->context, SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+
     /* Chain verification is off because there is no chain; the fingerprint
      * below is the whole check, and it is stricter than a CA would be. */
     SSL_CTX_set_verify(client->context, SSL_VERIFY_NONE, NULL);
@@ -265,6 +299,12 @@ kmx_tls_read(kmx_tls_session *session, void *data, size_t size) {
         case SSL_ERROR_ZERO_RETURN:
             return 0;
         default:
+            /* Set explicitly.  SSL_ERROR_SSL and ZERO_RETURN do not touch
+             * errno, and this layer plants EAGAIN on the same connection on
+             * every ordinary would-block - so a caller reading a stale errno
+             * after a hard failure reliably sees EAGAIN and waits forever for a
+             * session that can never make progress. */
+            errno = EIO;
             return 0;
     }
 }
@@ -283,6 +323,9 @@ kmx_tls_write(kmx_tls_session *session, const void *data, size_t size) {
             errno = EAGAIN;
             return -1;
         default:
+            /* See kmx_tls_read: never leave errno holding this connection's own
+             * stale EAGAIN on a fatal error. */
+            errno = EIO;
             return -1;
     }
 }

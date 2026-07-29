@@ -18,6 +18,7 @@
 #include "kmx_tls.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -57,7 +58,16 @@ write_all(int fd, const void *data, size_t size) {
         ssize_t count;
         if (active_tls && fd != STDOUT_FILENO && fd != STDERR_FILENO) {
             count = kmx_tls_write(active_tls, cursor + done, size - done);
-            if (count < 0 && errno == EAGAIN) continue;
+            if (count < 0 && errno == EAGAIN) {
+                /* Waited on rather than spun on.  The descriptor is
+                 * non-blocking now, so retrying immediately is a hot loop. */
+                struct pollfd waiting;
+                waiting.fd = fd;
+                waiting.events = POLLOUT;
+                waiting.revents = 0;
+                if (poll(&waiting, 1, 5000) <= 0) return -1;
+                continue;
+            }
         } else {
             count = write(fd, cursor + done, size - done);
         }
@@ -126,6 +136,27 @@ send_hello(int fd, int rows, int cols, bool view_only, const char *token) {
         size += length;
     }
     return send_message(fd, KMX_MSG_HELLO, payload, size);
+}
+
+/* The loop polls this descriptor, so it has to be non-blocking.
+ *
+ * On the plain path a blocking socket is harmless - read() after POLLIN returns
+ * whatever arrived.  Under TLS it is not: POLLIN says some bytes arrived, while
+ * SSL_read cannot return until a whole record has, so it blocks inside a loop
+ * that assumes it will not.  Measured against a server that wrote three bytes
+ * of a five-byte record header and stopped: --seconds was ignored, Ctrl-] was
+ * ignored, and the process had to be SIGKILLed.
+ *
+ * Called AFTER the TLS handshake, never before.  SSL_connect on a non-blocking
+ * socket returns WANT_READ immediately and this client treats that as failure,
+ * so setting the flag first turns every TLS attach into an instant silent
+ * exit - which is what the first version of this fix did.  The handshake is
+ * left blocking under a receive timeout: the client has nothing else to do at
+ * that point, and a hang there is in front of whoever ran it. */
+static void
+make_non_blocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) (void)fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
 /* Reattach after the link drops.
@@ -246,6 +277,13 @@ main(int argc, char **argv) {
             close(fd);
             return 2;
         }
+        {
+            /* The handshake runs blocking, under a timeout so a server that
+             * accepts and then says nothing cannot hold this forever. */
+            struct timeval limit = {.tv_sec = 10, .tv_usec = 0};
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &limit, sizeof limit);
+            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &limit, sizeof limit);
+        }
         tls = kmx_tls_client_connect(tls_client, fd);
         active_tls = tls;
         if (!tls) {
@@ -257,7 +295,14 @@ main(int argc, char **argv) {
             close(fd);
             return 1;
         }
+        {
+            struct timeval none = {.tv_sec = 0, .tv_usec = 0};
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &none, sizeof none);
+            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &none, sizeof none);
+        }
     }
+    /* Only now: the loop from here on polls, and must never block in it. */
+    make_non_blocking(fd);
 
     kmx_layout_init(&layout, rows, cols);
     if (kmx_render_create(&render) != KMX_OK ||
@@ -279,9 +324,21 @@ main(int argc, char **argv) {
         cfmakeraw(&raw);
         if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) == 0) have_termios = true;
     }
-    signal(SIGWINCH, handle_resize);
-    signal(SIGINT, handle_stop);
-    signal(SIGTERM, handle_stop);
+    {
+        /* sigaction with no SA_RESTART, deliberately.  glibc's signal() sets
+         * SA_RESTART, so the handler ran, set its flag, and the interrupted
+         * call restarted - leaving a client that had been asked to stop
+         * carrying on regardless.  With the read no longer able to block that
+         * is less critical than it was, and it is still what was meant. */
+        struct sigaction action;
+        memset(&action, 0, sizeof action);
+        sigemptyset(&action.sa_mask);
+        action.sa_handler = handle_resize;
+        sigaction(SIGWINCH, &action, NULL);
+        action.sa_handler = handle_stop;
+        sigaction(SIGINT, &action, NULL);
+        sigaction(SIGTERM, &action, NULL);
+    }
     signal(SIGPIPE, SIG_IGN);
     started_at = time(NULL);
 
@@ -329,6 +386,10 @@ main(int argc, char **argv) {
                 if (count < 0 && errno == EAGAIN) continue;
             } else {
                 count = read(fd, buffer, sizeof buffer);
+                if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK ||
+                                  errno == EINTR)) {
+                    continue;
+                }
             }
             if (count <= 0) {
                 int replacement;
@@ -351,18 +412,34 @@ main(int argc, char **argv) {
                     fd = -1;
                     break;
                 }
+
                 fd = replacement;
                 if (tls_client) {
                     /* A new connection is a new handshake, and the
                      * fingerprint is checked again: a server that changed
                      * identity while we were away is not the same server. */
+                    {
+                        struct timeval limit = {.tv_sec = 10, .tv_usec = 0};
+                        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &limit, sizeof limit);
+                        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &limit, sizeof limit);
+                    }
                     tls = kmx_tls_client_connect(tls_client, fd);
                     active_tls = tls;
                     if (!tls) {
+                        /* Closed rather than abandoned: leaking it is harmless
+                         * only because the process is about to exit, which is
+                         * not a property worth relying on. */
+                        close(fd);
                         fd = -1;
                         break;
                     }
+                    {
+                        struct timeval none = {.tv_sec = 0, .tv_usec = 0};
+                        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &none, sizeof none);
+                        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &none, sizeof none);
+                    }
                 }
+                make_non_blocking(fd);
                 /* Everything held about the old connection is now a guess:
                  * the panes may have been rearranged, and this client holds
                  * nothing the server knows about. */

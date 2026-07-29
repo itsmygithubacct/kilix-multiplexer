@@ -141,6 +141,50 @@ had to be killed. Input is now queued per pane, bounded, and drained on POLLOUT
 like everything else; `tests/backpressure.sh` fails against the old binary and
 passes against the new one.
 
+**And over TLS none of that worked at all.** The outbound queue is compacted
+and reallocated as it drains, so the pointer handed to `SSL_write` could move
+between a `WANT_WRITE` and its retry — which OpenSSL treats as a caller bug
+(`SSL_R_BAD_WRITE_RETRY`) and answers by killing the session. Measured: a TLS
+client that stopped reading died at about 320 kB of backlog against a 4 MiB
+limit, with no drop counted, while the identical plain-TCP client survived and
+dropped 325,100 audio blocks as designed. So the fix below existed and TLS
+routed around it. `SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER` is what the mode is
+for; both planes now behave the same encrypted or not.
+
+Two smaller ones in the same layer: the fatal arms of `kmx_tls_read` and
+`kmx_tls_write` returned failure without setting `errno`, and since this layer
+plants `EAGAIN` on every ordinary would-block, a caller reading a stale `errno`
+after a hard failure reliably saw `EAGAIN` and waited forever on a dead session.
+And `kmx_tls_wants_write` — which exists precisely so a poll loop can learn that
+a *read* needs the socket writable — had no callers at all.
+
+**The client could be hung by a server.** `kmx-attach` polls its socket but
+never set `O_NONBLOCK`. On the plain path that is harmless; under TLS `SSL_read`
+cannot return until a whole record has arrived, so a server that sends three
+bytes of a five-byte record header stops the client's loop dead — `--seconds`
+ignored, Ctrl-] ignored, SIGTERM ignored, because `signal()` installs
+`SA_RESTART` and the interrupted read simply restarted. Measured: SIGKILL at 12
+seconds before, exit 0 at exactly `--seconds 3` after. The handshake is still
+blocking, under a timeout, because setting the flag before `SSL_connect` turns
+every TLS attach into an instant silent failure — which is what the first
+version of this fix did.
+
+**Two more places counted sockets instead of served clients.** The graphics
+retention guard treated a freshly accepted socket as "someone is attached" and
+discarded the queued images the retention exists to keep — so the documented
+behaviour, that a client arriving just after a pane drew something still
+receives it, was unreachable, and a rotation of silent peers made it permanent.
+The geometry loop let a peer that had neither authenticated nor finished a TLS
+handshake vote on the session's size: measured, one silent peer held a
+legitimate client's 40x100 at 24x80 for ten seconds, and a staggered handful
+held it indefinitely. Both now use one `client_is_served` predicate shared with
+the send loop, so the three cannot drift apart again.
+
+**And the listener was blocking**, so an accept-ready connection that
+evaporated before `accept4` would have stalled the whole server —
+documented in accept(2), not reproducible here, fixed by the missing
+`SOCK_NONBLOCK`.
+
 **And the backlog limit punished the wrong plane.** A client that overran the
 4 MiB backlog was disconnected, which is right for the cell plane — a client
 that far behind is better replaced than buffered — and wrong for motion and
