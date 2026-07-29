@@ -411,6 +411,216 @@ test_encode_rejects_bad_arguments(void) {
     kmx_grid_free(&grid);
 }
 
+/* ---- compression and synchronisation ---------------------------------- */
+
+static void
+test_compression_roundtrip(void) {
+    kmx_buffer wire;
+    kmx_buffer plain;
+    static unsigned char repetitive[4096];
+    unsigned char noise[512];
+    size_t index;
+
+    memset(repetitive, 'A', sizeof repetitive);
+    kmx_buffer_init(&wire);
+    kmx_buffer_init(&plain);
+    CHECK(kmx_compress(repetitive, sizeof repetitive, &wire) == KMX_OK);
+    CHECK(wire.size < sizeof repetitive / 4);
+    CHECK(kmx_decompress(wire.data, wire.size, &plain) == KMX_OK);
+    CHECK(plain.size == sizeof repetitive);
+    CHECK(memcmp(plain.data, repetitive, plain.size) == 0);
+
+    /* Incompressible input must cost framing, not growth. */
+    reset_random();
+    for (index = 0; index < sizeof noise; index++) {
+        noise[index] = (unsigned char)next_random();
+    }
+    kmx_buffer_reset(&wire);
+    kmx_buffer_reset(&plain);
+    CHECK(kmx_compress(noise, sizeof noise, &wire) == KMX_OK);
+    CHECK(wire.size <= sizeof noise + 8);
+    CHECK(kmx_decompress(wire.data, wire.size, &plain) == KMX_OK);
+    CHECK(plain.size == sizeof noise);
+    CHECK(memcmp(plain.data, noise, plain.size) == 0);
+
+    /* Every proper prefix of a framed message is incomplete. */
+    for (index = 0; index < wire.size; index++) {
+        kmx_buffer scratch;
+        kmx_buffer_init(&scratch);
+        CHECK(kmx_decompress(wire.data, index, &scratch) != KMX_OK);
+        kmx_buffer_free(&scratch);
+    }
+    kmx_buffer_free(&wire);
+    kmx_buffer_free(&plain);
+}
+
+typedef struct {
+    kmx_sync *sync;
+    kmx_receiver *receiver;
+    uint64_t clock;
+    size_t wire_bytes;
+    size_t messages;
+} link;
+
+static void
+link_init(link *l, int rows, int cols) {
+    memset(l, 0, sizeof *l);
+    CHECK(kmx_sync_create(&l->sync, rows, cols) == KMX_OK);
+    CHECK(kmx_receiver_create(&l->receiver, rows, cols) == KMX_OK);
+}
+
+static void
+link_free(link *l) {
+    kmx_sync_free(l->sync);
+    kmx_receiver_free(l->receiver);
+}
+
+/* Advance time past the send interval, poll, and optionally deliver. */
+static bool
+link_pump(link *l, bool deliver) {
+    kmx_buffer message;
+    kmx_sync_info info;
+    bool produced = false;
+    l->clock += KMX_SEND_INTERVAL_MAX_MS;
+    kmx_buffer_init(&message);
+    CHECK(kmx_sync_poll(l->sync, l->clock, &message, &produced, &info) == KMX_OK);
+    if (produced) {
+        l->messages++;
+        l->wire_bytes += message.size;
+        if (deliver) {
+            uint64_t sequence = 0;
+            CHECK(kmx_receiver_apply(
+                l->receiver, message.data, message.size, &sequence) == KMX_OK);
+            CHECK(sequence == info.sequence);
+            CHECK(kmx_sync_ack(l->sync, sequence) == KMX_OK);
+        }
+    }
+    kmx_buffer_free(&message);
+    return produced;
+}
+
+static void
+test_sync_roundtrip(void) {
+    link l;
+    link_init(&l, 12, 40);
+    CHECK(kmx_sync_feed(l.sync, "hello", 5) == KMX_OK);
+    CHECK(link_pump(&l, true));
+    CHECK(kmx_grid_equal(kmx_receiver_grid(l.receiver), kmx_sync_current(l.sync)));
+
+    CHECK(kmx_sync_feed(l.sync, "\r\n\033[1;33mmore\033[0m", 16) == KMX_OK);
+    CHECK(link_pump(&l, true));
+    CHECK(kmx_grid_equal(kmx_receiver_grid(l.receiver), kmx_sync_current(l.sync)));
+    link_free(&l);
+}
+
+/* An idle session must cost nothing at all: no state change, no message. */
+static void
+test_sync_idle_produces_nothing(void) {
+    link l;
+    int index;
+    link_init(&l, 12, 40);
+    CHECK(kmx_sync_feed(l.sync, "settled", 7) == KMX_OK);
+    CHECK(link_pump(&l, true));
+    l.wire_bytes = 0;
+    l.messages = 0;
+    for (index = 0; index < 100; index++) {
+        CHECK(!link_pump(&l, true));
+    }
+    CHECK(l.messages == 0);
+    CHECK(l.wire_bytes == 0);
+    link_free(&l);
+}
+
+/* Messages that never arrive are superseded, not retransmitted: the receiver
+ * that missed everything is brought current by the next message it does get. */
+static void
+test_sync_lost_messages_are_superseded(void) {
+    link l;
+    char line[64];
+    int index;
+    size_t dropped_bytes;
+
+    link_init(&l, 12, 40);
+    CHECK(kmx_sync_feed(l.sync, "start", 5) == KMX_OK);
+    CHECK(link_pump(&l, true));
+
+    /* Thirty messages produced and thrown away. */
+    for (index = 0; index < 30; index++) {
+        snprintf(line, sizeof line, "\r\nlost update %d", index);
+        CHECK(kmx_sync_feed(l.sync, line, strlen(line)) == KMX_OK);
+        link_pump(&l, false);
+    }
+    dropped_bytes = l.wire_bytes;
+    CHECK(dropped_bytes > 0);
+    CHECK(!kmx_grid_equal(kmx_receiver_grid(l.receiver), kmx_sync_current(l.sync)));
+
+    /* One delivered message converges the receiver exactly. */
+    l.wire_bytes = 0;
+    CHECK(kmx_sync_feed(l.sync, "\r\nFINAL", 7) == KMX_OK);
+    CHECK(link_pump(&l, true));
+    CHECK(kmx_grid_equal(kmx_receiver_grid(l.receiver), kmx_sync_current(l.sync)));
+    link_free(&l);
+}
+
+/* Bursty output coalesces into the send interval instead of one message per
+ * write, which is what keeps a flooding pane from flooding the link. */
+static void
+test_sync_coalesces_bursts(void) {
+    link l;
+    kmx_buffer message;
+    kmx_sync_info info;
+    bool produced = false;
+    int index;
+
+    link_init(&l, 12, 40);
+    l.clock = 1000;
+    kmx_buffer_init(&message);
+    CHECK(kmx_sync_poll(l.sync, l.clock, &message, &produced, &info) == KMX_OK);
+    kmx_buffer_reset(&message);
+
+    /* A hundred writes inside one interval produce at most one message. */
+    for (index = 0; index < 100; index++) {
+        char text[32];
+        snprintf(text, sizeof text, "burst %d ", index);
+        CHECK(kmx_sync_feed(l.sync, text, strlen(text)) == KMX_OK);
+        produced = false;
+        CHECK(kmx_sync_poll(l.sync, l.clock + 1, &message, &produced, &info) == KMX_OK);
+        CHECK(!produced);
+    }
+    produced = false;
+    CHECK(kmx_sync_poll(
+        l.sync, l.clock + KMX_SEND_INTERVAL_MAX_MS, &message, &produced, &info) == KMX_OK);
+    CHECK(produced);
+    kmx_buffer_free(&message);
+    link_free(&l);
+}
+
+static void
+test_sync_resize(void) {
+    link l;
+    link_init(&l, 10, 30);
+    CHECK(kmx_sync_feed(l.sync, "before", 6) == KMX_OK);
+    CHECK(link_pump(&l, true));
+    CHECK(kmx_sync_resize(l.sync, 18, 50) == KMX_OK);
+    CHECK(kmx_sync_feed(l.sync, " after", 6) == KMX_OK);
+    CHECK(link_pump(&l, true));
+    CHECK(kmx_receiver_grid(l.receiver)->rows == 18);
+    CHECK(kmx_receiver_grid(l.receiver)->cols == 50);
+    CHECK(kmx_grid_equal(kmx_receiver_grid(l.receiver), kmx_sync_current(l.sync)));
+    link_free(&l);
+}
+
+static void
+test_receiver_rejects_malformed_messages(void) {
+    kmx_receiver *receiver;
+    static const unsigned char garbage[] = {0x01, 0xff, 0xff, 0xff, 0xff};
+    CHECK(kmx_receiver_create(&receiver, 8, 20) == KMX_OK);
+    CHECK(kmx_receiver_apply(receiver, garbage, sizeof garbage, NULL) != KMX_OK);
+    CHECK(kmx_receiver_apply(receiver, "", 0, NULL) != KMX_OK);
+    CHECK(kmx_receiver_apply(receiver, "\x01", 1, NULL) != KMX_OK);
+    kmx_receiver_free(receiver);
+}
+
 int
 main(void) {
     RUN(test_grid_basics);
@@ -426,6 +636,13 @@ main(void) {
     RUN(test_graphics_split_across_feeds);
     RUN(test_decoder_rejects_malformed_input);
     RUN(test_encode_rejects_bad_arguments);
+    RUN(test_compression_roundtrip);
+    RUN(test_sync_roundtrip);
+    RUN(test_sync_idle_produces_nothing);
+    RUN(test_sync_lost_messages_are_superseded);
+    RUN(test_sync_coalesces_bursts);
+    RUN(test_sync_resize);
+    RUN(test_receiver_rejects_malformed_messages);
     puts("all kilix-multiplexer tests passed");
     return 0;
 }

@@ -151,6 +151,78 @@ kmx_result kmx_cells_encode(
  * called `previous`. */
 kmx_result kmx_cells_apply(kmx_grid *grid, const void *data, size_t size);
 
+/* ---- compression ------------------------------------------------------ */
+
+/* Wrap an encoded message for the wire, compressing when that is smaller.
+ * The framing records which it chose, so an incompressible message costs one
+ * byte rather than growing. */
+kmx_result kmx_compress(const void *data, size_t size, kmx_buffer *out);
+kmx_result kmx_decompress(const void *data, size_t size, kmx_buffer *out);
+
+/* ---- state synchronisation -------------------------------------------- */
+
+/* The sender never holds a queue of things to send.  It holds the current
+ * state and the last state the receiver acknowledged, and always transmits the
+ * difference between them.  Output produced while the link is down therefore
+ * costs nothing when it returns: only the final screen is sent.
+ *
+ * Borrowed in design from mosh's state synchronisation protocol; none of its
+ * code is used, and it is GPL where this is MIT. */
+
+/* Bounds on how often a message may be produced.  A busy pane coalesces into
+ * the slower bound rather than emitting a message per write. */
+#define KMX_SEND_INTERVAL_MIN_MS 20
+#define KMX_SEND_INTERVAL_MAX_MS 250
+
+typedef struct kmx_sync kmx_sync;
+
+typedef struct {
+    uint64_t sequence;      /* of the message just produced */
+    size_t raw_bytes;       /* encoded size before compression */
+    size_t wire_bytes;      /* what would go on the wire */
+    bool from_scratch;      /* a full repaint rather than a diff */
+} kmx_sync_info;
+
+kmx_result kmx_sync_create(kmx_sync **out, int rows, int cols);
+void kmx_sync_free(kmx_sync *sync);
+kmx_result kmx_sync_feed(kmx_sync *sync, const void *data, size_t size);
+kmx_result kmx_sync_resize(kmx_sync *sync, int rows, int cols);
+
+/* Produce a message if the state has moved on and the send interval permits.
+ * `produced` is false when there is nothing to say, which is what makes an
+ * idle session cost nothing. */
+kmx_result kmx_sync_poll(
+    kmx_sync *sync,
+    uint64_t now_millis,
+    kmx_buffer *out,
+    bool *produced,
+    kmx_sync_info *info
+);
+
+/* Acknowledge everything up to and including `sequence`.  Until an ack
+ * arrives the sender keeps diffing against the last acknowledged state, so a
+ * lost message is superseded by the next one rather than retransmitted. */
+kmx_result kmx_sync_ack(kmx_sync *sync, uint64_t sequence);
+
+/* Set the interval between messages, clamped to the bounds above. */
+void kmx_sync_set_interval(kmx_sync *sync, unsigned millis);
+
+const kmx_grid *kmx_sync_current(const kmx_sync *sync);
+kmx_term *kmx_sync_term(kmx_sync *sync);
+
+/* Receiver half: apply a wire message and expose the resulting screen. */
+typedef struct kmx_receiver kmx_receiver;
+
+kmx_result kmx_receiver_create(kmx_receiver **out, int rows, int cols);
+void kmx_receiver_free(kmx_receiver *receiver);
+kmx_result kmx_receiver_apply(
+    kmx_receiver *receiver,
+    const void *data,
+    size_t size,
+    uint64_t *sequence
+);
+const kmx_grid *kmx_receiver_grid(const kmx_receiver *receiver);
+
 #ifdef __cplusplus
 }
 #endif
