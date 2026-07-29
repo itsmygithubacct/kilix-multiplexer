@@ -13,10 +13,11 @@ where there is actually video — rather than one undifferentiated stream.
 
 Design notes are maintained separately from this release tree.
 
-**Status: the text and layout planes work end to end.** A multi-pane session
-can be served and attached over a socket, with predictive local echo and
-client-drawn chrome. Still missing: the graphics, motion and audio planes,
-multi-client attach, and any transport beyond a Unix socket.
+**Status: all six planes work end to end** — layout, cells, stills, motion,
+audio, and input. A multi-pane session can be served over a Unix socket or TCP,
+with TLS and token authentication, attached by several clients at once, with
+predictive local echo, client-drawn chrome, and reconnection. Verified between
+two machines in both directions.
 
 ```sh
 make               # library and tools
@@ -84,9 +85,40 @@ predictor is for.
   arrangement encodes in under 120 bytes, and because the client knows the
   geometry it draws the dividers and title bars itself rather than receiving
   pictures of them. Sent only when the arrangement changes.
+- **Still-graphics plane** — Kitty graphics carried under a content-addressed
+  cache, so an image that a client already holds costs a reference rather than
+  a retransmission.
+- **Motion plane** — a pane whose content is pixels, sent as lossless
+  rectangles under a rate allowance. The one plane allowed to drop: a frame
+  that does not fit is discarded rather than queued, because the next frame
+  supersedes it.
+- **Audio plane** — PCM blocks with presentation timestamps against one session
+  clock, taking their allowance first and fixed, so sound never waits on video.
 - **`kmx-serve` / `kmx-attach`** — a multi-pane session served over an
-  owner-only socket and a client that composites and renders it, with an
-  incremental framer, a diffing renderer, and predictive local echo.
+  owner-only Unix socket or a TCP port, and a client that composites and
+  renders it, with an incremental framer, a diffing renderer, predictive local
+  echo, and reconnection. TCP binds loopback unless `--lan` is given, always
+  requires a token, and encrypts by default with a pinned certificate.
+
+## Limitations worth knowing before you start
+
+- **A pixel pane is the whole session.** `--pixel-pane` and `--pane` are
+  mutually exclusive: you get a session of text panes, or one pixel pane, not a
+  layout mixing them. Mixing the two is a refinement the plane model allows and
+  the implementation does not do yet.
+- **The session lives and dies with the server.** If `kmx-serve` exits, the
+  session is gone. `--reconnect` reattaches a client to a *new* server, with no
+  history — there is no journal and no detach/resume of the session itself.
+  `kitty-pty-broker` is where that property lives; the multiplexer does not yet
+  build on it.
+- **The TLS certificate is generated per server start**, so a pinned
+  fingerprint is per-session and has to be re-copied each time you start one.
+  That is a real usability cost and it pushes people toward not checking the
+  fingerprint at all.
+- **Eight client slots, and a ten-second grace period for a new connection to
+  authenticate.** Eight peers that connect and stay silent can therefore keep a
+  session unattachable. On a loopback bind that is nothing; on `--lan` it is a
+  denial of service available to anyone who can reach the port.
 
 ## Properties the tests assert
 
@@ -112,8 +144,11 @@ still matches. Upstream already surfaces Kitty graphics APC sequences in wire
 order through `vterm_screen_set_unrecognised_fallbacks`, so this project
 carries no patches against it.
 
-Nothing else. No transport library, no compressor, and no terminal ownership
-yet — those arrive with the phases that need them.
+`libzstd` for the wire codec and `libssl`/`libcrypto` for TLS. Nothing else:
+no transport library, no video encoder, and no audio codec — the motion and
+audio planes carry lossless rectangles and PCM under zstd, which keeps an
+encoder dependency out of the plane model. Adding one later is a codec choice,
+not a change of shape.
 
 ## License
 

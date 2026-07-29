@@ -5,7 +5,11 @@ PREFIX ?= /usr/local
 
 VTERM_DIR := third_party/libvterm
 
+# One place the version comes from, so a tag and a binary cannot disagree.
+VERSION := $(shell cat $(dir $(lastword $(MAKEFILE_LIST)))VERSION 2>/dev/null || echo unknown)
+
 CPPFLAGS += -D_FORTIFY_SOURCE=2 -Iinclude -Isrc -I$(VTERM_DIR)/include
+CPPFLAGS += -DKMX_VERSION=\"$(VERSION)\"
 CFLAGS ?= -O2
 CFLAGS += -std=c11 -Wall -Wextra -Wpedantic -Werror -fPIC
 LDFLAGS ?=
@@ -147,7 +151,14 @@ check-vendor:
 clean:
 	rm -rf -- "$(BUILD_DIR)"
 
+# The library was the only thing installed for a while, which made `make
+# install` produce a header and an archive and none of the two programs the
+# project exists to provide.
 install: all
-	install -d "$(DESTDIR)$(PREFIX)/include" "$(DESTDIR)$(PREFIX)/lib"
+	install -d "$(DESTDIR)$(PREFIX)/bin" \
+	          "$(DESTDIR)$(PREFIX)/include" "$(DESTDIR)$(PREFIX)/lib"
+	install -m 0755 "$(SERVE)" "$(DESTDIR)$(PREFIX)/bin/"
+	install -m 0755 "$(ATTACH)" "$(DESTDIR)$(PREFIX)/bin/"
+	install -m 0755 "$(SHAPE)" "$(DESTDIR)$(PREFIX)/bin/"
 	install -m 0644 include/kilix_mux.h "$(DESTDIR)$(PREFIX)/include/"
 	install -m 0644 "$(STATIC_LIB)" "$(DESTDIR)$(PREFIX)/lib/"

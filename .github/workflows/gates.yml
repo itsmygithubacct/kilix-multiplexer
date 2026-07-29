@@ -1,0 +1,97 @@
+# The gates, enforced rather than remembered.
+#
+# Every one of these has caught something real in this repository. Keeping the
+# checks here makes the release invariants repeatable on every change.
+#
+# Not here, and deliberately: tests/network.sh needs two machines, and
+# tests/churn.sh builds a second sanitized tree and takes minutes. Both are
+# release-time checks, run by hand. Saying so is better than a job that quietly
+# skips them.
+name: gates
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libzstd-dev libssl-dev clang
+      - name: build
+        run: make
+      - name: unit suite
+        run: make test
+      - name: the vendored tree is unmodified upstream
+        run: make check-vendor
+      - name: the programs install, not just the library
+        run: |
+          make install PREFIX="$PWD/_stage"
+          test -x _stage/bin/kmx-serve
+          test -x _stage/bin/kmx-attach
+          test -f _stage/include/kilix_mux.h
+      - name: the version in the binary matches VERSION
+        run: |
+          test "$(./build/kmx-serve --version)" = "kmx-serve $(cat VERSION)"
+          test "$(./build/kmx-attach --version)" = "kmx-attach $(cat VERSION)"
+
+  sanitizers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libzstd-dev libssl-dev
+      - name: ASan and UBSan
+        run: make sanitize
+
+  analyzer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libzstd-dev libssl-dev clang
+      - name: clang --analyze must stay clean
+        run: |
+          # It has found three things the compiler did not: an uninitialised
+          # read, a zero-length memcpy from NULL, and a comparison that could
+          # read uninitialised bytes.
+          status=0
+          for f in src/*.c tools/*.c; do
+            out=$(clang --analyze -Iinclude -Isrc -Itools \
+                  -Ithird_party/libvterm/include -std=c11 "$f" 2>&1) || true
+            if printf '%s' "$out" | grep -q "warning:"; then
+              printf '%s\n' "$out"
+              status=1
+            fi
+          done
+          rm -f ./*.plist
+          exit $status
+
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libzstd-dev libssl-dev clang
+      - name: libFuzzer over every decoder a peer can reach
+        # Short, because this is the per-push gate. The long soaks are run by
+        # hand at release time; two bugs here surfaced only in those.
+        run: FUZZ_SECONDS=120 make fuzz
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libzstd-dev libssl-dev xvfb ffmpeg x11-apps
+      - name: real processes over real sockets
+        run: tests/integration.sh
+      - name: a pane that stops reading must not stop the server
+        run: |
+          make build/flood-input
+          tests/backpressure.sh

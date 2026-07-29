@@ -121,6 +121,13 @@ main(int argc, char **argv) {
     static direction forward;
     static direction backward;
 
+    /* Answered before anything else is parsed, so it works regardless of
+     * whether the rest of the command line is right. */
+    if (argc == 2 && strcmp(argv[1], "--version") == 0) {
+        printf("kmx-shape %s\n", KMX_VERSION);
+        return 0;
+    }
+
     while (index < argc) {
         if (!strcmp(argv[index], "--listen") && index + 1 < argc) {
             listen_port = atoi(argv[++index]);

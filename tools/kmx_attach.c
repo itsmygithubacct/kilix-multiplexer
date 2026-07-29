@@ -223,6 +223,13 @@ main(int argc, char **argv) {
     memset(receivers, 0, sizeof receivers);
     memset(panes, 0, sizeof panes);
 
+    /* Answered before anything else is parsed, so it works regardless of
+     * whether the rest of the command line is right. */
+    if (argc == 2 && strcmp(argv[1], "--version") == 0) {
+        printf("kmx-attach %s\n", KMX_VERSION);
+        return 0;
+    }
+
     while (index < argc) {
         if (strcmp(argv[index], "--socket") == 0 && index + 1 < argc) {
             socket_path = argv[++index];

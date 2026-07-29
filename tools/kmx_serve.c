@@ -436,6 +436,13 @@ main(int argc, char **argv) {
     memset(clients, 0, sizeof clients);
     for (which = 0; which < KMX_MAX_CLIENTS; which++) clients[which].fd = -1;
 
+    /* Answered before anything else is parsed, so it works regardless of
+     * whether the rest of the command line is right. */
+    if (argc == 2 && strcmp(argv[1], "--version") == 0) {
+        printf("kmx-serve %s\n", KMX_VERSION);
+        return 0;
+    }
+
     while (index < argc && strcmp(argv[index], "--") != 0) {
         if (strcmp(argv[index], "--socket") == 0 && index + 1 < argc) {
             socket_path = argv[++index];
