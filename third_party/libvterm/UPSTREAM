@@ -1,0 +1,11 @@
+name:    libvterm
+source:  https://github.com/neovim/libvterm
+commit:  934bc2fbf21800ac3458a499df8820ca5fb45fd3
+license: MIT (see LICENSE)
+status:  UNMODIFIED
+
+Vendored verbatim.  Upstream already surfaces Kitty graphics APC sequences
+through vterm_screen_set_unrecognised_fallbacks(), in wire order relative to
+screen damage, so this project carries no patches against it.  If that ever
+changes, add a numbered patch series beside this file and a make target that
+verifies it, rather than editing the vendored tree in place.
