@@ -16,10 +16,10 @@ Two different peers, with different powers:
 | A local process | the Unix socket | Possibly hostile, but running as some user on this machine |
 | A network peer | a TCP port | Anyone who can route to it |
 
-The design assumes the second is reached **through an SSH tunnel**, and that
-SSH is what establishes who they are. That assumption is load-bearing and is
-the reason for the loopback default; where it does not hold, see
-[Known gaps](#known-gaps).
+A network peer must present a token, and the recommended route is still an SSH
+tunnel to a loopback port - the token establishes *who may attach*, the tunnel
+establishes *who may watch*. Both matter, and only the first is implemented;
+see [Known gaps](#known-gaps).
 
 ## What is enforced, and where
 
@@ -28,8 +28,9 @@ the reason for the loopback default; where it does not hold, see
 TCP binds loopback unless `--lan` is given (`src/endpoint.c`,
 `kmx_endpoint_listen`). A non-loopback bind is **refused**, not narrowed: a
 caller that asked for a public address and silently got loopback would believe
-it was reachable when it was not. With `--lan` the server says on stderr that
-anyone who can connect gets the session.
+it was reachable when it was not. When the bound address is reachable the
+server prints the attach line including the token, and says plainly that the
+session crosses the network in the clear.
 
 Asserted by `tests/integration.sh`, "a non-loopback bind is refused unless
 asked for".
@@ -111,15 +112,14 @@ Stated plainly rather than left to be discovered.
    TLS for this (`config/stream.py`) and this project has not; until it does,
    a reachable bind is only appropriate on a segment you would already trust
    with the terminal's contents.
-3. **No rate limit on connection attempts.** Eight client slots fill on a
+2. **No rate limit on connection attempts.** Eight client slots fill on a
    first-come basis, so a local process can occupy them.
-4. **The pixel pane runs a shell command** given on the server's own command
+3. **The pixel pane runs a shell command** given on the server's own command
    line. That is the operator's own input, not a peer's, but it is worth
    naming: a peer cannot start a pane, and there is no message that does.
-5. **The audio and pixel sources are shell commands** with the same property.
-6. **Independent review has not been completed.** The tests and defect history
-   in this document are evidence about specific behavior, not a substitute for
-   an independent security review.
+4. **The audio and pixel sources are shell commands** with the same property.
+5. **Not reviewed by anyone else.** This is a self-review by the author of the
+   code, which is worth less than an independent one.
 
 ## Things deliberately not done
 
