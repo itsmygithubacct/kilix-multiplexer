@@ -190,6 +190,51 @@ else
     report fail "could not start the focus session"
 fi
 
+# --- a graphics escape survives the hop, and a repeat costs a reference ----
+#
+# The pane emits the same Kitty graphics sequence three times.  A byte
+# forwarder would carry it three times; this carries it once and then refers
+# to it, which is the whole point of addressing images by their content.
+payload=$(head -c 3000 /dev/zero | tr '\0' 'Q')
+if start_pane image /bin/sh -c "
+    i=0
+    while [ \$i -lt 3 ]; do
+        printf '\033_Gi=5,a=T;%s\033\\\\' '$payload'
+        printf 'IMAGE_ROUND_%d\r\n' \$i
+        i=\$((i+1))
+        sleep 0.4
+    done
+    sleep 6"; then
+    timeout 8 "$attach" --socket "$work/image.sock" --dump --seconds 4 \
+        > "$work/image.out" 2>&1
+    # The graphics escape must reach the client's terminal verbatim.
+    if grep -q 'Gi=5,a=T;QQQ' "$work/image.out"; then
+        report pass "a graphics escape reaches the client"
+    else
+        report fail "a graphics escape reaches the client"
+    fi
+    # Every round must reach the client's terminal, including the ones the
+    # server sent as a bare reference: the client is expected to replay them
+    # from its cache, so the escape appears in full here each time.
+    #
+    # Note what this does and does not show.  It measures the client's
+    # TERMINAL output, not the socket, so it proves the cache reconstructs a
+    # referenced image correctly - not that the wire got smaller.  The wire
+    # saving is measured where it can be: test_repeated_image_costs_a_reference
+    # in the unit suite.
+    # The pane emits exactly three rounds.  Counting rendered text instead
+    # would be wrong: a redraw repeats what is on screen, so the same marker
+    # legitimately appears more than once.
+    payload_hits=$(grep -o 'Gi=5,a=T;QQQ' "$work/image.out" | wc -l)
+    if [ "$payload_hits" -ge 3 ]; then
+        report pass "referenced images are replayed in full from the client cache"
+    else
+        report fail "referenced images are replayed in full from the client cache ($payload_hits of 3)"
+    fi
+else
+    report fail "could not start the image pane"
+fi
+
 echo
 if [ "$failures" -eq 0 ]; then
     echo "all integration checks passed"

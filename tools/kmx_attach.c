@@ -117,6 +117,7 @@ main(int argc, char **argv) {
     kmx_layout layout;
     kmx_render *render = NULL;
     kmx_predictor *predictor = NULL;
+    kmx_image_cache *images = NULL;
     kmx_framer framer;
     kmx_grid screen;
     unsigned char buffer[65536];
@@ -174,6 +175,7 @@ main(int argc, char **argv) {
     kmx_layout_init(&layout, rows, cols);
     if (kmx_render_create(&render) != KMX_OK ||
         kmx_predictor_create(&predictor) != KMX_OK ||
+        kmx_image_cache_create(&images, 256, 32u * 1024u * 1024u) != KMX_OK ||
         kmx_grid_init(&screen, rows, cols) != KMX_OK) {
         fprintf(stderr, "kmx-attach: out of memory\n");
         return 1;
@@ -283,6 +285,28 @@ main(int argc, char **argv) {
                             redraw = true;
                         }
                     }
+                } else if (type == KMX_MSG_IMAGE) {
+                    kmx_image_message image;
+                    if (kmx_image_decode(payload, size, &image) == KMX_OK) {
+                        const unsigned char *bytes = image.data;
+                        size_t length = image.size;
+                        if (image.has_data) {
+                            (void)kmx_image_cache_put(
+                                images, &image.key, image.data, image.size);
+                        } else {
+                            /* A reference to a picture already held: this is
+                             * what makes a repeat cost sixteen bytes. */
+                            bytes = kmx_image_cache_get(images, &image.key, &length);
+                        }
+                        if (bytes && length) {
+                            /* Replayed as the escape it originally was, so the
+                             * local terminal places it exactly as the remote
+                             * one would have. */
+                            (void)write_all(STDOUT_FILENO, "\033_", 2);
+                            (void)write_all(STDOUT_FILENO, bytes, length);
+                            (void)write_all(STDOUT_FILENO, "\033\\", 2);
+                        }
+                    }
                 } else if (type == KMX_MSG_EXIT) {
                     stop_pending = 1;
                 }
@@ -356,6 +380,7 @@ main(int argc, char **argv) {
         }
     }
     kmx_framer_free(&framer);
+    kmx_image_cache_free(images);
     kmx_grid_free(&screen);
     kmx_predictor_free(predictor);
     kmx_render_free(render);

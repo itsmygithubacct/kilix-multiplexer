@@ -148,6 +148,7 @@ main(int argc, char **argv) {
     pane panes[KMX_MAX_PANES];
     kmx_layout layout;
     kmx_layout announced;
+    kmx_image_cache *client_holds = NULL;
     kmx_framer framer;
     unsigned char buffer[65536];
     size_t focused = 0;
@@ -284,6 +285,16 @@ main(int argc, char **argv) {
                         kmx_sync_reset_baseline(panes[slot].sync);
                     }
                     memset(&announced, 0, sizeof announced);
+                    /* A fresh client holds no images either, so the record of
+                     * what it has starts empty and the first sighting of each
+                     * picture is a transfer again. */
+                    kmx_image_cache_free(client_holds);
+                    client_holds = NULL;
+                    if (kmx_image_cache_create(
+                            &client_holds, 256, 32u * 1024u * 1024u) != KMX_OK) {
+                        close(client);
+                        client = -1;
+                    }
                 }
             }
         }
@@ -410,6 +421,40 @@ main(int argc, char **argv) {
             kmx_buffer_free(&message);
         }
 
+        /* The still-graphics plane.  A picture the client already holds costs
+         * a reference; anything else is transferred once and then held. */
+        for (slot = 0; slot < count && client >= 0 && client_holds; slot++) {
+            kmx_term *term = kmx_sync_term(panes[slot].sync);
+            size_t events = kmx_term_graphics_count(term);
+            size_t event;
+            for (event = 0; event < events && client >= 0; event++) {
+                const kmx_graphics_event *item = kmx_term_graphics_at(term, event);
+                kmx_image_key key;
+                kmx_buffer wire;
+                bool known;
+                if (!item || !item->payload.size) continue;
+                key = kmx_image_key_of(item->payload.data, item->payload.size);
+                known = kmx_image_cache_has(client_holds, &key);
+                kmx_buffer_init(&wire);
+                if (kmx_image_encode(
+                        (uint32_t)slot, &key,
+                        known ? NULL : (const void *)item->payload.data,
+                        known ? 0 : item->payload.size, &wire) == KMX_OK) {
+                    if (send_framed(
+                            client, KMX_MSG_IMAGE, wire.data, wire.size) != 0) {
+                        close(client);
+                        client = -1;
+                    } else if (!known) {
+                        (void)kmx_image_cache_put(
+                            client_holds, &key,
+                            item->payload.data, item->payload.size);
+                    }
+                }
+                kmx_buffer_free(&wire);
+            }
+            if (events) kmx_term_graphics_clear(term);
+        }
+
         if (!any_alive) {
             for (slot = 0; slot < count; slot++) {
                 int status;
@@ -426,6 +471,7 @@ main(int argc, char **argv) {
     }
     if (client >= 0) close(client);
     if (listener >= 0) close(listener);
+    kmx_image_cache_free(client_holds);
     unlink(socket_path);
     kmx_framer_free(&framer);
     return 0;
