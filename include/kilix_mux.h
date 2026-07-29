@@ -184,6 +184,16 @@ typedef struct {
 } kmx_sync_info;
 
 kmx_result kmx_sync_create(kmx_sync **out, int rows, int cols);
+
+/* Synchronise over a terminal someone else owns.
+ *
+ * What the receiver holds is per receiver; what the pane shows is not.  Two
+ * clients watching one pane therefore share its terminal model and keep
+ * separate baselines, so each is sent the difference between the screen and
+ * what *it* has acknowledged - and neither pays for the other falling behind.
+ * The caller must keep `term` alive for the life of the sync and free it
+ * itself. */
+kmx_result kmx_sync_create_over(kmx_sync **out, kmx_term *term);
 void kmx_sync_free(kmx_sync *sync);
 kmx_result kmx_sync_feed(kmx_sync *sync, const void *data, size_t size);
 kmx_result kmx_sync_resize(kmx_sync *sync, int rows, int cols);

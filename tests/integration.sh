@@ -235,6 +235,53 @@ else
     report fail "could not start the image pane"
 fi
 
+# --- several clients on one session ---------------------------------------
+if start_pane shared /bin/sh -c 'printf "SHARED_MARKER\r\n"; sleep 10'; then
+    sleep 0.5
+    timeout 8 "$attach" --socket "$work/shared.sock" --dump --seconds 3 \
+        > "$work/shared.a" 2>&1 &
+    first=$!
+    timeout 8 "$attach" --socket "$work/shared.sock" --dump --seconds 3 \
+        > "$work/shared.b" 2>&1 &
+    second=$!
+    wait "$first" 2>/dev/null
+    wait "$second" 2>/dev/null
+    if visible "$work/shared.a" | grep -q SHARED_MARKER &&
+       visible "$work/shared.b" | grep -q SHARED_MARKER; then
+        report pass "two clients attached at once both see the session"
+    else
+        report fail "two clients attached at once both see the session"
+    fi
+else
+    report fail "could not start the shared session"
+fi
+
+# --- a viewer cannot type, and the server is what stops it -----------------
+#
+# The viewer sends input anyway; the point is that the server refuses it. A
+# client that merely chose not to send would prove nothing.
+if start_pane viewer /bin/sh -c 'stty -echo; while IFS= read -r l; do printf "SAW[%s]\r\n" "$l"; done'; then
+    sleep 0.5
+    timeout 8 "$attach" --socket "$work/viewer.sock" --dump --seconds 3 \
+        --view --send 'FROM_VIEWER
+' > "$work/viewer.out" 2>&1 &
+    watcher=$!
+    sleep 0.4
+    timeout 8 "$attach" --socket "$work/viewer.sock" --dump --seconds 3 \
+        --send 'FROM_CONTROL
+' > "$work/control.out" 2>&1
+    wait "$watcher" 2>/dev/null
+    text=$(visible "$work/control.out")
+    if printf '%s' "$text" | grep -q 'SAW\[FROM_CONTROL\]' &&
+       ! printf '%s' "$text" | grep -q 'SAW\[FROM_VIEWER\]'; then
+        report pass "the server refuses a viewer's input and accepts a controller's"
+    else
+        report fail "the server refuses a viewer's input and accepts a controller's"
+    fi
+else
+    report fail "could not start the viewer session"
+fi
+
 echo
 if [ "$failures" -eq 0 ]; then
     echo "all integration checks passed"

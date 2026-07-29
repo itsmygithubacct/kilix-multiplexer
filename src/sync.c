@@ -144,6 +144,7 @@ typedef struct {
 
 struct kmx_sync {
     kmx_term *term;
+    bool owns_term;
     kmx_grid current;
     kmx_grid acked;
     bool acked_valid;
@@ -153,15 +154,17 @@ struct kmx_sync {
     unsigned interval_millis;
 };
 
-kmx_result
-kmx_sync_create(kmx_sync **out, int rows, int cols) {
+static kmx_result
+sync_init(kmx_sync **out, kmx_term *term, bool owns, int rows, int cols) {
     kmx_sync *sync;
     kmx_result result;
     size_t index;
     if (!out) return KMX_ERR_INVALID;
     sync = calloc(1, sizeof *sync);
     if (!sync) return KMX_ERR_MEMORY;
-    result = kmx_term_create(&sync->term, rows, cols);
+    sync->owns_term = owns;
+    sync->term = term;
+    result = term ? KMX_OK : kmx_term_create(&sync->term, rows, cols);
     if (result == KMX_OK) result = kmx_grid_init(&sync->current, rows, cols);
     if (result == KMX_OK) result = kmx_grid_init(&sync->acked, rows, cols);
     for (index = 0; index < KMX_SENT_HISTORY && result == KMX_OK; index++) {
@@ -177,11 +180,31 @@ kmx_sync_create(kmx_sync **out, int rows, int cols) {
     return KMX_OK;
 }
 
+kmx_result
+kmx_sync_create(kmx_sync **out, int rows, int cols) {
+    return sync_init(out, NULL, true, rows, cols);
+}
+
+kmx_result
+kmx_sync_create_over(kmx_sync **out, kmx_term *term) {
+    kmx_grid probe;
+    kmx_result result;
+    if (!out || !term) return KMX_ERR_INVALID;
+    /* Take the dimensions from the terminal itself rather than asking the
+     * caller to repeat them, so the two cannot disagree. */
+    memset(&probe, 0, sizeof probe);
+    result = kmx_term_snapshot(term, &probe);
+    if (result != KMX_OK) return result;
+    result = sync_init(out, term, false, probe.rows, probe.cols);
+    kmx_grid_free(&probe);
+    return result;
+}
+
 void
 kmx_sync_free(kmx_sync *sync) {
     size_t index;
     if (!sync) return;
-    kmx_term_free(sync->term);
+    if (sync->owns_term) kmx_term_free(sync->term);
     kmx_grid_free(&sync->current);
     kmx_grid_free(&sync->acked);
     for (index = 0; index < KMX_SENT_HISTORY; index++) {

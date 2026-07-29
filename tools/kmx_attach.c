@@ -97,12 +97,26 @@ send_dimensions(int fd, kmx_message_type type, int rows, int cols) {
     return send_message(fd, type, payload, sizeof payload);
 }
 
+/* The role is declared in HELLO.  The server enforces it; this only says
+ * which one is being asked for. */
+static int
+send_hello(int fd, int rows, int cols, bool view_only) {
+    unsigned char payload[5];
+    payload[0] = (unsigned char)(rows >> 8);
+    payload[1] = (unsigned char)rows;
+    payload[2] = (unsigned char)(cols >> 8);
+    payload[3] = (unsigned char)cols;
+    payload[4] = view_only ? 1u : 0u;
+    return send_message(fd, KMX_MSG_HELLO, payload, sizeof payload);
+}
+
 int
 main(int argc, char **argv) {
     const char *socket_path = NULL;
     const char *send_text = NULL;
     bool predict = true;
     bool dump = false;
+    bool view_only = false;
     int run_seconds = 0;
     time_t started_at;
     bool sent_once = false;
@@ -134,6 +148,9 @@ main(int argc, char **argv) {
             socket_path = argv[++index];
         } else if (strcmp(argv[index], "--no-predict") == 0) {
             predict = false;
+        } else if (strcmp(argv[index], "--view") == 0) {
+            view_only = true;
+            predict = false;
         } else if (strcmp(argv[index], "--dump") == 0) {
             dump = true;
         } else if (strcmp(argv[index], "--send") == 0 && index + 1 < argc) {
@@ -142,7 +159,8 @@ main(int argc, char **argv) {
             run_seconds = atoi(argv[++index]);
         } else {
             fprintf(stderr, "usage: kmx-attach --socket PATH [--no-predict]"
-                            " [--dump] [--send TEXT] [--seconds N]\n");
+                            " [--view]\n       [--dump] [--send TEXT]"
+                            " [--seconds N]\n");
             return 2;
         }
         index++;
@@ -182,8 +200,8 @@ main(int argc, char **argv) {
     }
     kmx_framer_init(&framer);
 
-    send_dimensions(fd, KMX_MSG_HELLO, rows, cols);
-    send_dimensions(fd, KMX_MSG_RESIZE, rows, cols);
+    send_hello(fd, rows, cols, view_only);
+    if (!view_only) send_dimensions(fd, KMX_MSG_RESIZE, rows, cols);
 
     if (!dump && isatty(STDIN_FILENO) && tcgetattr(STDIN_FILENO, &saved) == 0) {
         raw = saved;
@@ -204,7 +222,7 @@ main(int argc, char **argv) {
         if (resize_pending && !dump) {
             resize_pending = 0;
             get_size(&rows, &cols);
-            send_dimensions(fd, KMX_MSG_RESIZE, rows, cols);
+            if (!view_only) send_dimensions(fd, KMX_MSG_RESIZE, rows, cols);
             /* The screen is about to be described differently, so anything
              * predicted about the old one is void. */
             kmx_predictor_reset(predictor);
@@ -225,6 +243,8 @@ main(int argc, char **argv) {
         if (run_seconds > 0 && time(NULL) - started_at >= run_seconds) break;
         if (send_text && !sent_once) {
             sent_once = true;
+            /* Sent even as a viewer, deliberately: the point of the test is
+             * that the server refuses it, not that the client withholds it. */
             if (send_message(fd, KMX_MSG_INPUT, send_text, strlen(send_text)) != 0) break;
             if (predict && kmx_predictor_type(predictor, send_text, strlen(send_text))) {
                 redraw = true;
