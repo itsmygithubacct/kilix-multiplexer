@@ -19,6 +19,7 @@
 #include "kilix_mux.h"
 #include "endpoint.h"
 #include "kmx_pixel.h"
+#include "kmx_tap.h"
 #include "kmx_tls.h"
 
 #include <errno.h>
@@ -67,8 +68,12 @@
 typedef struct {
     kmx_term *term;
     int master;
+    int input_fd;
+    int observer_hold;
     pid_t child;
+    pid_t input_child;
     bool alive;
+    bool fixed_size;
     const char *command;
     /* Typed bytes the pty has not accepted yet.  A pty master holds only a few
      * kilobytes, so a program that stops reading its input fills it quickly -
@@ -240,9 +245,10 @@ now_millis(void) {
 /* Push queued keystrokes at the pty, without blocking on it. */
 static int
 pane_input_flush(pane *item) {
+    if (item->input_fd < 0) return -1;
     while (item->input_offset < item->input.size) {
         ssize_t count = write(
-            item->master,
+            item->input_fd,
             item->input.data + item->input_offset,
             item->input.size - item->input_offset);
         if (count < 0) {
@@ -260,6 +266,7 @@ pane_input_flush(pane *item) {
 
 static void
 pane_input_queue(pane *item, const void *data, size_t size) {
+    if (item->input_fd < 0) return;
     compact(&item->input, &item->input_offset);
     /* The limit bounds what is ALREADY waiting, not what is arriving.
      *
@@ -279,7 +286,7 @@ pane_input_queue(pane *item, const void *data, size_t size) {
 
 static bool
 pane_input_pending(const pane *item) {
-    return item->input_offset < item->input.size;
+    return item->input_fd >= 0 && item->input_offset < item->input.size;
 }
 
 /* Compared in constant time: a token check that returns early on the first
@@ -294,6 +301,24 @@ token_matches(const char *expected, const char *offered, size_t offered_size) {
         difference |= (unsigned char)(expected[index] ^ offered[index]);
     }
     return difference == 0;
+}
+
+/*
+ * Shared-memory and file graphics name resources on the host.  Replaying that
+ * reference on another machine cannot work (and the local frontend may already
+ * have unlinked it).  A presenter tap supplies the pixels for those panes, so
+ * retain inline graphics while suppressing only host-local transfers.
+ */
+static bool
+graphics_is_host_local(const unsigned char *data, size_t size) {
+    const unsigned char *end;
+    size_t header_size;
+    if (!data || !size) return false;
+    end = memchr(data, ';', size);
+    header_size = end ? (size_t)(end - data) : size;
+    return memmem(data, header_size, "t=s", 3) != NULL ||
+           memmem(data, header_size, "t=f", 3) != NULL ||
+           memmem(data, header_size, "t=t", 3) != NULL;
 }
 
 static bool
@@ -340,6 +365,119 @@ peer_is_owner(int fd) {
 }
 
 static void
+make_non_blocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) (void)fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+/*
+ * Keep the broker library's blocking frame reader outside the scheduler.  Its
+ * public `observe` CLI is a protocol-v2 observer: stdout is only pane output,
+ * stdin is never forwarded, and the observer never claims the control slot.
+ * The scheduler reads the pipe non-blocking just as it reads a pty.
+ */
+static pid_t
+start_broker_observer(
+    const char *executable,
+    const char *runtime_dir,
+    const char *session_id,
+    int *output_fd,
+    int *hold_fd
+) {
+    int pipe_fds[2];
+    int idle_fds[2];
+    pid_t child;
+    if (!executable || !runtime_dir || !session_id || !output_fd || !hold_fd ||
+        pipe2(pipe_fds, O_CLOEXEC) != 0) {
+        return -1;
+    }
+    if (pipe2(idle_fds, O_CLOEXEC) != 0) {
+        close(pipe_fds[0]);
+        close(pipe_fds[1]);
+        return -1;
+    }
+    child = fork();
+    if (child < 0) {
+        close(pipe_fds[0]);
+        close(pipe_fds[1]);
+        close(idle_fds[0]);
+        close(idle_fds[1]);
+        return -1;
+    }
+    if (child == 0) {
+        close(pipe_fds[0]);
+        close(idle_fds[1]);
+        if (dup2(pipe_fds[1], STDOUT_FILENO) < 0) _exit(127);
+        if (dup2(idle_fds[0], STDIN_FILENO) < 0) _exit(127);
+        close(pipe_fds[1]);
+        close(idle_fds[0]);
+        if (strchr(executable, '/')) {
+            execl(
+                executable, executable,
+                "--runtime-dir", runtime_dir,
+                "observe", session_id, (char *)NULL);
+        } else {
+            execlp(
+                executable, executable,
+                "--runtime-dir", runtime_dir,
+                "observe", session_id, (char *)NULL);
+        }
+        _exit(127);
+    }
+    close(pipe_fds[1]);
+    close(idle_fds[0]);
+    *output_fd = pipe_fds[0];
+    *hold_fd = idle_fds[1];
+    make_non_blocking(*output_fd);
+    return child;
+}
+
+/*
+ * Live input is deliberately a different descriptor from broker observation.
+ * Kilix supplies a pane-scoped helper here; without one a live pane is
+ * view-only.  This preserves the broker's assertion that an observer can
+ * never inject bytes.
+ */
+static pid_t
+start_input_helper(const char *command, int *input_fd) {
+    int pipe_fds[2];
+    pid_t child;
+    if (!command || !input_fd || pipe2(pipe_fds, O_CLOEXEC) != 0) return -1;
+    child = fork();
+    if (child < 0) {
+        close(pipe_fds[0]);
+        close(pipe_fds[1]);
+        return -1;
+    }
+    if (child == 0) {
+        int null_fd = open("/dev/null", O_RDWR);
+        close(pipe_fds[1]);
+        if (dup2(pipe_fds[0], STDIN_FILENO) < 0) _exit(127);
+        close(pipe_fds[0]);
+        if (null_fd >= 0) {
+            (void)dup2(null_fd, STDOUT_FILENO);
+            if (null_fd > STDERR_FILENO) close(null_fd);
+        }
+        execl("/bin/sh", "sh", "-c", command, (char *)NULL);
+        _exit(127);
+    }
+    close(pipe_fds[0]);
+    *input_fd = pipe_fds[1];
+    make_non_blocking(*input_fd);
+    return child;
+}
+
+static void
+stop_helper(pid_t *child) {
+    if (!child || *child <= 0) return;
+    if (waitpid(*child, NULL, WNOHANG) == 0) {
+        kill(*child, SIGTERM);
+        (void)waitpid(*child, NULL, 0);
+    }
+    *child = -1;
+}
+
+static void
 client_release(client *item, size_t pane_count) {
     size_t slot;
     kmx_tls_session_free(item->tls);
@@ -367,10 +505,18 @@ usage(void) {
           "       kmx-serve --socket PATH --pixel-pane 'COMMAND'\n"
           "                 [--pixel-size WxH] [--pixel-fps N] [--pixel-budget BPS]\n"
           "\n"
+          "       kmx-serve --socket PATH --broker-session ID\n"
+          "                 --broker-runtime DIR [--broker-executable PATH]\n"
+          "                 [--input-command COMMAND] [--title TITLE]\n"
+          "                 [--tap-socket PATH [--tap-session ID]]\n"
+          "\n"
           "  --socket accepts a path or HOST:PORT.  TCP binds loopback unless\n"
           "  --lan is given; reach a session across a network over SSH.\n"
           "  --pixel-pane runs an X client on a private display and streams its\n"
           "  frames; it never touches the display the operator is using.\n"
+          "  --broker-session observes a live protocol-v2 broker session.  The\n"
+          "  observer stays read-only; input uses the separate helper command.\n"
+          "  --tap-socket receives presenter RGB frames for the named session.\n"
           "  --audio-source runs a command that writes raw 16-bit PCM to stdout.\n"
           "  --lan requires a token; one is generated and printed if not given.\n"
           "  A reachable bind encrypts by default and prints a fingerprint the\n"
@@ -391,6 +537,16 @@ main(int argc, char **argv) {
     kmx_tls_server *tls = NULL;
     char fingerprint[KMX_TLS_FINGERPRINT_HEX + 1];
     const char *commands[KMX_MAX_PANES];
+    const char *broker_session = NULL;
+    const char *broker_runtime = NULL;
+    const char *broker_executable = NULL;
+    const char *input_command = NULL;
+    const char *live_title = NULL;
+    const char *tap_path = NULL;
+    const char *tap_session = NULL;
+    bool tap_session_given = false;
+    kmx_tap tap;
+    bool tap_running = false;
     const char *pixel_command = NULL;
     kmx_pixel_pane pixel;
     bool pixel_running = false;
@@ -434,6 +590,16 @@ main(int argc, char **argv) {
 
     memset(panes, 0, sizeof panes);
     memset(clients, 0, sizeof clients);
+    memset(&tap, 0, sizeof tap);
+    tap.listener = -1;
+    tap.source = -1;
+    for (which = 0; which < KMX_MAX_PANES; which++) {
+        panes[which].master = -1;
+        panes[which].input_fd = -1;
+        panes[which].observer_hold = -1;
+        panes[which].child = -1;
+        panes[which].input_child = -1;
+    }
     for (which = 0; which < KMX_MAX_CLIENTS; which++) clients[which].fd = -1;
 
     /* Answered before anything else is parsed, so it works regardless of
@@ -452,6 +618,23 @@ main(int argc, char **argv) {
             cols = atoi(argv[++index]);
         } else if (strcmp(argv[index], "--listen") == 0 && index + 1 < argc) {
             socket_path = argv[++index];
+        } else if (strcmp(argv[index], "--broker-session") == 0 && index + 1 < argc) {
+            broker_session = argv[++index];
+        } else if (strcmp(argv[index], "--broker-runtime") == 0 && index + 1 < argc) {
+            broker_runtime = argv[++index];
+        } else if (strcmp(argv[index], "--broker-executable") == 0 &&
+                   index + 1 < argc) {
+            broker_executable = argv[++index];
+        } else if (strcmp(argv[index], "--input-command") == 0 &&
+                   index + 1 < argc) {
+            input_command = argv[++index];
+        } else if (strcmp(argv[index], "--title") == 0 && index + 1 < argc) {
+            live_title = argv[++index];
+        } else if (strcmp(argv[index], "--tap-socket") == 0 && index + 1 < argc) {
+            tap_path = argv[++index];
+        } else if (strcmp(argv[index], "--tap-session") == 0 && index + 1 < argc) {
+            tap_session = argv[++index];
+            tap_session_given = true;
         } else if (strcmp(argv[index], "--pixel-pane") == 0 && index + 1 < argc) {
             pixel_command = argv[++index];
         } else if (strcmp(argv[index], "--pixel-size") == 0 && index + 1 < argc) {
@@ -506,14 +689,28 @@ main(int argc, char **argv) {
     if (index < argc && strcmp(argv[index], "--") == 0 && index + 1 < argc) {
         single = &argv[index + 1];
     }
+    if (!broker_runtime) broker_runtime = getenv("KITTY_PTY_BROKER_RUNTIME");
+    if (!broker_executable) {
+        broker_executable = getenv("KITTY_PTY_BROKER_EXECUTABLE");
+        if (!broker_executable || !*broker_executable) {
+            broker_executable = "kitty-pty-broker";
+        }
+    }
+    if (!tap_session) tap_session = broker_session;
     if (!socket_path || rows <= 0 || cols <= 0 ||
-        (command_count == 0 && !single && !pixel_command)) {
+        (command_count == 0 && !single && !pixel_command && !broker_session) ||
+        (broker_session && (!broker_runtime || !*broker_runtime)) ||
+        (broker_session &&
+         (command_count != 0 || single || pixel_command)) ||
+        (input_command && !broker_session) ||
+        (tap_path && (!tap_session || !*tap_session)) ||
+        (tap_session_given && !tap_path)) {
         usage();
         return 2;
     }
     /* A pixel pane is the whole session for now: mixing pixel and text panes
      * in one layout is a later refinement, not part of proving the plane. */
-    count = pixel_command ? 0 : (single ? 1 : command_count);
+    count = pixel_command ? 0 : (broker_session ? 1 : (single ? 1 : command_count));
 
     kmx_layout_init(&layout, rows, cols);
     if (count && kmx_layout_arrange(&layout, count, vertical) != KMX_OK) {
@@ -607,12 +804,40 @@ main(int argc, char **argv) {
         const kmx_pane_info *info = &layout.panes[slot];
         struct winsize size;
         pane *item = &panes[slot];
-        item->command = single ? single[0] : commands[slot];
+        item->command = broker_session
+            ? (live_title ? live_title : "live pane")
+            : (single ? single[0] : commands[slot]);
         snprintf(layout.panes[slot].title, KMX_TITLE_MAX, "%zu: %s",
                  slot + 1, item->command);
         if (kmx_term_create(&item->term, info->rows, info->cols) != KMX_OK) {
             fprintf(stderr, "kmx-serve: out of memory\n");
             return 1;
+        }
+        if (broker_session) {
+            item->child = start_broker_observer(
+                broker_executable, broker_runtime, broker_session,
+                &item->master, &item->observer_hold);
+            if (item->child < 0) {
+                fprintf(stderr, "kmx-serve: could not start broker observer: %s\n",
+                        strerror(errno));
+                return 1;
+            }
+            item->fixed_size = true;
+            item->alive = true;
+            if (input_command) {
+                item->input_child = start_input_helper(input_command, &item->input_fd);
+                if (item->input_child < 0) {
+                    fprintf(stderr, "kmx-serve: could not start input helper: %s\n",
+                            strerror(errno));
+                    return 1;
+                }
+            } else {
+                fprintf(stderr,
+                    "kmx-serve: live pane is view-only (no input helper)\n");
+            }
+            fprintf(stderr, "kmx-serve: observing broker session %s\n",
+                    broker_session);
+            continue;
         }
         memset(&size, 0, sizeof size);
         size.ws_row = (unsigned short)info->rows;
@@ -631,13 +856,21 @@ main(int argc, char **argv) {
             }
             _exit(127);
         }
-        {
-            /* Non-blocking from here: every write to this descriptor goes
-             * through pane_input_queue, which never waits on it. */
-            int flags = fcntl(item->master, F_GETFL, 0);
-            if (flags >= 0) fcntl(item->master, F_SETFL, flags | O_NONBLOCK);
-        }
+        /* Non-blocking from here: every write to this descriptor goes through
+         * pane_input_queue, which never waits on it. */
+        make_non_blocking(item->master);
+        item->input_fd = item->master;
         item->alive = true;
+    }
+
+    if (tap_path) {
+        if (!kmx_tap_start(&tap, tap_path, tap_session)) {
+            fprintf(stderr, "kmx-serve: could not start frame tap: %s\n",
+                    strerror(errno));
+            return 1;
+        }
+        tap_running = true;
+        fprintf(stderr, "kmx-serve: frame tap %s\n", tap_path);
     }
 
     if (pixel_command) {
@@ -700,16 +933,17 @@ main(int argc, char **argv) {
     signal(SIGTERM, handle_stop);
 
     while (!stop_requested) {
-        /* +2 for the pixel and audio pipes, which are appended after the
-         * panes.  Sizing this to listener + clients + panes alone wrote past
-         * the end whenever either was in use. */
-        struct pollfd descriptors[1 + KMX_MAX_CLIENTS + KMX_MAX_PANES + 2];
+        /* +4 for audio, the private-display frame pipe, and both ends of the
+         * presenter tap. */
+        struct pollfd descriptors[1 + KMX_MAX_CLIENTS + KMX_MAX_PANES + 4];
         nfds_t descriptor_count = 0;
         size_t client_at[KMX_MAX_CLIENTS];
         size_t pane_at[KMX_MAX_PANES];
         nfds_t client_first;
         nfds_t pane_first;
         nfds_t pane_descriptors;
+        nfds_t tap_listener_index = (nfds_t)-1;
+        nfds_t tap_source_index = (nfds_t)-1;
         bool any_alive = false;
         int ready;
 
@@ -738,7 +972,10 @@ main(int argc, char **argv) {
             pane_at[descriptor_count - pane_first] = slot;
             descriptors[descriptor_count].fd = panes[slot].master;
             descriptors[descriptor_count].events =
-                (short)(POLLIN | (pane_input_pending(&panes[slot]) ? POLLOUT : 0));
+                (short)(POLLIN |
+                        (pane_input_pending(&panes[slot]) &&
+                         panes[slot].input_fd == panes[slot].master
+                             ? POLLOUT : 0));
             descriptors[descriptor_count].revents = 0;
             descriptor_count++;
         }
@@ -761,6 +998,21 @@ main(int argc, char **argv) {
             descriptors[descriptor_count].events = POLLIN;
             descriptors[descriptor_count].revents = 0;
             descriptor_count++;
+        }
+
+        if (tap_running) {
+            tap_listener_index = descriptor_count;
+            descriptors[descriptor_count].fd = kmx_tap_listener_fd(&tap);
+            descriptors[descriptor_count].events = POLLIN;
+            descriptors[descriptor_count].revents = 0;
+            descriptor_count++;
+            if (kmx_tap_source_fd(&tap) >= 0) {
+                tap_source_index = descriptor_count;
+                descriptors[descriptor_count].fd = kmx_tap_source_fd(&tap);
+                descriptors[descriptor_count].events = POLLIN;
+                descriptors[descriptor_count].revents = 0;
+                descriptor_count++;
+            }
         }
 
         ready = poll(descriptors, descriptor_count, KMX_SEND_INTERVAL_MIN_MS);
@@ -843,7 +1095,7 @@ main(int argc, char **argv) {
                             &item->audio, (uint32_t)audio_rate,
                             (uint8_t)audio_channels, audio_budget) == KMX_OK;
                     }
-                    if (ok && pixel_running) {
+                    if (ok && (pixel_running || tap_running)) {
                         /* Per client, like the cell baseline: what one client
                          * has been shown says nothing about another. */
                         ok = kmx_motion_create(&item->motion, pixel_budget) == KMX_OK;
@@ -949,7 +1201,8 @@ main(int argc, char **argv) {
                 } else if (type == KMX_MSG_INPUT) {
                     /* Enforced here, not in the client: a viewer that chose to
                      * send input still cannot reach the pane. */
-                    if (item->control && focused < count && panes[focused].alive) {
+                    if (item->control && focused < count && panes[focused].alive &&
+                        panes[focused].input_fd >= 0) {
                         pane_input_queue(&panes[focused], payload, size);
                     }
                 } else if (type == KMX_MSG_FOCUS && size >= 1 && item->control) {
@@ -1004,7 +1257,7 @@ main(int argc, char **argv) {
                     wanted_cols = clients[which].cols;
                 }
             }
-            if (wanted_rows > 0 && wanted_cols > 0 &&
+            if (!broker_session && wanted_rows > 0 && wanted_cols > 0 &&
                 (wanted_rows != rows || wanted_cols != cols)) {
                 kmx_layout candidate = layout;
                 candidate.rows = wanted_rows;
@@ -1053,6 +1306,17 @@ main(int argc, char **argv) {
                         }
                     }
                 }
+            }
+        }
+        for (slot = 0; slot < count; slot++) {
+            if (!pane_input_pending(&panes[slot]) ||
+                panes[slot].input_fd == panes[slot].master) {
+                continue;
+            }
+            if (pane_input_flush(&panes[slot]) != 0) {
+                close(panes[slot].input_fd);
+                panes[slot].input_fd = -1;
+                stop_helper(&panes[slot].input_child);
             }
         }
 
@@ -1128,6 +1392,48 @@ main(int argc, char **argv) {
             if (closed) break;
         }
 
+        if (tap_running) {
+            const unsigned char *frame = NULL;
+            int frame_width = 0;
+            int frame_height = 0;
+            uint64_t offered_micros = 0;
+            short listener_events = tap_listener_index == (nfds_t)-1
+                ? 0 : descriptors[tap_listener_index].revents;
+            short source_events = tap_source_index == (nfds_t)-1
+                ? 0 : descriptors[tap_source_index].revents;
+            kmx_tap_poll(&tap, listener_events, source_events);
+            if (kmx_tap_take(
+                    &tap, &frame, &frame_width, &frame_height,
+                    NULL, NULL, NULL, NULL, &offered_micros)) {
+                uint64_t frame_clock =
+                    offered_micros ? offered_micros / 1000u : now_millis();
+                if (getenv("KMX_DEBUG_FRAMES")) {
+                    fprintf(stderr, "kmx-serve: tapped frame\n");
+                    fflush(stderr);
+                }
+                for (which = 0; which < KMX_MAX_CLIENTS; which++) {
+                    client *item = &clients[which];
+                    kmx_buffer message;
+                    bool produced = false;
+                    if (item->fd < 0 || !item->motion) continue;
+                    if (item->handshaking) continue;
+                    if (require_token && !item->greeted) continue;
+                    kmx_buffer_init(&message);
+                    if (kmx_buffer_append(
+                            &message, &(unsigned char){0}, 1) == KMX_OK &&
+                        kmx_motion_offer(
+                            item->motion, frame, frame_width, frame_height,
+                            frame_clock, &message, &produced, NULL) == KMX_OK &&
+                        produced) {
+                        client_queue_droppable(
+                            item, KMX_MSG_FRAME,
+                            message.data, message.size, &frames_dropped);
+                    }
+                    kmx_buffer_free(&message);
+                }
+            }
+        }
+
         for (which = 0; which < KMX_MAX_CLIENTS; which++) {
             client *item = &clients[which];
             if (item->fd < 0) continue;
@@ -1191,6 +1497,11 @@ main(int argc, char **argv) {
                     kmx_buffer wire;
                     bool known;
                     if (!graphic || !graphic->payload.size) continue;
+                    if (tap_running &&
+                        graphics_is_host_local(
+                            graphic->payload.data, graphic->payload.size)) {
+                        continue;
+                    }
                     key = kmx_image_key_of(
                         graphic->payload.data, graphic->payload.size);
                     known = kmx_image_cache_has(item->holds, &key);
@@ -1262,11 +1573,19 @@ main(int argc, char **argv) {
         if (clients[which].fd >= 0) client_release(&clients[which], count);
     }
     for (slot = 0; slot < count; slot++) {
+        if (panes[slot].input_fd >= 0 &&
+            panes[slot].input_fd != panes[slot].master) {
+            close(panes[slot].input_fd);
+        }
+        stop_helper(&panes[slot].input_child);
+        if (panes[slot].observer_hold >= 0) close(panes[slot].observer_hold);
         if (panes[slot].master >= 0) close(panes[slot].master);
+        if (broker_session) stop_helper(&panes[slot].child);
         kmx_buffer_free(&panes[slot].input);
         kmx_term_free(panes[slot].term);
     }
     if (pixel_running) kmx_pixel_stop(&pixel);
+    if (tap_running) kmx_tap_stop(&tap);
     if (audio_fd >= 0) close(audio_fd);
     if (audio_child > 0) {
         kill(audio_child, SIGTERM);

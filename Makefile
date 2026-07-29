@@ -13,7 +13,7 @@ CPPFLAGS += -DKMX_VERSION=\"$(VERSION)\"
 CFLAGS ?= -O2
 CFLAGS += -std=c11 -Wall -Wextra -Wpedantic -Werror -fPIC
 LDFLAGS ?=
-LDLIBS += -lzstd -lm
+LDLIBS += -lzstd -lz -lm
 
 # Vendored verbatim; built with the upstream project's own warning posture
 # rather than ours, so our -Werror never depends on someone else's code.
@@ -26,6 +26,7 @@ VTERM_OBJECTS := $(VTERM_SOURCES:%.c=$(BUILD_DIR)/%.o)
 
 STATIC_LIB := $(BUILD_DIR)/libkilix-mux.a
 TEST := $(BUILD_DIR)/test-mux
+TAP_TEST := $(BUILD_DIR)/test-tap
 FUZZ := $(BUILD_DIR)/fuzz-decoders
 BENCH := $(BUILD_DIR)/kmx-bench
 SERVE := $(BUILD_DIR)/kmx-serve
@@ -57,10 +58,13 @@ $(BUILD_DIR)/kmx_bench.o: tools/kmx_bench.c include/kilix_mux.h | $(BUILD_DIR)
 $(BENCH): $(BUILD_DIR)/kmx_bench.o $(STATIC_LIB)
 	$(CC) $(LDFLAGS) -o "$@" $(BUILD_DIR)/kmx_bench.o $(STATIC_LIB) $(LDLIBS) -lutil
 
-$(BUILD_DIR)/kmx_serve.o: tools/kmx_serve.c tools/kmx_pixel.h include/kilix_mux.h | $(BUILD_DIR)
+$(BUILD_DIR)/kmx_serve.o: tools/kmx_serve.c tools/kmx_pixel.h tools/kmx_tap.h include/kilix_mux.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Itools -c "$<" -o "$@"
 
 $(BUILD_DIR)/kmx_pixel.o: tools/kmx_pixel.c tools/kmx_pixel.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Itools -c "$<" -o "$@"
+
+$(BUILD_DIR)/kmx_tap.o: tools/kmx_tap.c tools/kmx_tap.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Itools -c "$<" -o "$@"
 
 $(BUILD_DIR)/kmx_shape.o: tools/kmx_shape.c | $(BUILD_DIR)
@@ -72,8 +76,8 @@ $(SHAPE): $(BUILD_DIR)/kmx_shape.o
 $(BUILD_DIR)/kmx_tls.o: tools/kmx_tls.c tools/kmx_tls.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Itools -c "$<" -o "$@"
 
-$(SERVE): $(BUILD_DIR)/kmx_serve.o $(BUILD_DIR)/kmx_pixel.o $(BUILD_DIR)/kmx_tls.o $(STATIC_LIB)
-	$(CC) $(LDFLAGS) -o "$@" $(BUILD_DIR)/kmx_serve.o $(BUILD_DIR)/kmx_pixel.o $(BUILD_DIR)/kmx_tls.o $(STATIC_LIB) $(LDLIBS) -lutil -lssl -lcrypto
+$(SERVE): $(BUILD_DIR)/kmx_serve.o $(BUILD_DIR)/kmx_pixel.o $(BUILD_DIR)/kmx_tap.o $(BUILD_DIR)/kmx_tls.o $(STATIC_LIB)
+	$(CC) $(LDFLAGS) -o "$@" $(BUILD_DIR)/kmx_serve.o $(BUILD_DIR)/kmx_pixel.o $(BUILD_DIR)/kmx_tap.o $(BUILD_DIR)/kmx_tls.o $(STATIC_LIB) $(LDLIBS) -lutil -lssl -lcrypto
 
 $(BUILD_DIR)/kmx_attach.o: tools/kmx_attach.c tools/kmx_tls.h include/kilix_mux.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Itools -c "$<" -o "$@"
@@ -86,6 +90,12 @@ $(BUILD_DIR)/test_mux.o: tests/test_mux.c include/kilix_mux.h | $(BUILD_DIR)
 
 $(TEST): $(BUILD_DIR)/test_mux.o $(STATIC_LIB)
 	$(CC) $(LDFLAGS) -o "$@" $(BUILD_DIR)/test_mux.o $(STATIC_LIB) $(LDLIBS)
+
+$(BUILD_DIR)/test_tap.o: tests/test_tap.c tools/kmx_tap.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Itools -c "$<" -o "$@"
+
+$(TAP_TEST): $(BUILD_DIR)/test_tap.o $(BUILD_DIR)/kmx_tap.o
+	$(CC) $(LDFLAGS) -o "$@" $(BUILD_DIR)/test_tap.o $(BUILD_DIR)/kmx_tap.o
 
 $(BUILD_DIR)/flood_input.o: tests/flood_input.c include/kilix_mux.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c "$<" -o "$@"
@@ -105,8 +115,9 @@ backpressure: $(SERVE) $(FLOOD)
 churn:
 	tests/churn.sh
 
-test: $(TEST)
+test: $(TEST) $(TAP_TEST)
 	$(TEST_ENVIRONMENT) "$(TEST)"
+	$(TEST_ENVIRONMENT) "$(TAP_TEST)"
 
 TEST_ENVIRONMENT ?=
 

@@ -1,6 +1,6 @@
 # Security review
 
-Status: reviewed 2026-07-28 against the tree at that date
+Status: self-reviewed through 2026-07-29; no independent review
 Scope: `kilix-multiplexer` only. The broker's read-only observers are argued
 separately in `kitty-pty-broker/SECURITY.md`, which matters here because the
 multiplexer attaches as one: a bug in this program should not become control
@@ -19,10 +19,11 @@ Two different peers, with different powers:
 | A local process | the Unix socket | Possibly hostile, but running as some user on this machine |
 | A network peer | a TCP port | Anyone who can route to it |
 
-A network peer must present a token, and the recommended route is still an SSH
-tunnel to a loopback port - the token establishes *who may attach*, the tunnel
-establishes *who may watch*. Both matter, and only the first is implemented;
-see [Known gaps](#known-gaps).
+A network peer must present a token. A directly reachable listener also uses
+TLS pinned to the server's printed fingerprint: the token establishes *who may
+attach* and the pin establishes *which server may be watched*. An SSH tunnel
+to a loopback port is still the lower-exposure route because it removes the
+reachable listener entirely.
 
 ## What is enforced, and where
 
@@ -32,8 +33,9 @@ TCP binds loopback unless `--lan` is given (`src/endpoint.c`,
 `kmx_endpoint_listen`). A non-loopback bind is **refused**, not narrowed: a
 caller that asked for a public address and silently got loopback would believe
 it was reachable when it was not. When the bound address is reachable the
-server prints the attach line including the token, and says plainly that the
-session crosses the network in the clear.
+server enables TLS by default and prints the attach line including both the
+token and certificate fingerprint. If the operator explicitly supplies
+`--no-tls`, it says plainly that the session crosses the network in the clear.
 
 Asserted by `tests/integration.sh`, "a non-loopback bind is refused unless
 asked for".
@@ -44,12 +46,11 @@ On a Unix socket, the peer's credentials are checked with `SO_PEERCRED` and a
 peer whose uid differs from the server's is closed immediately
 (`tools/kmx_serve.c`, `peer_is_owner`). The socket itself is created `0600`.
 
-Over TCP there is no equivalent, so a **token** is required instead. It is
-mandatory whenever the bound address is genuinely reachable, cannot be turned
-off, and is minted from `/dev/urandom` (128 bits, hex) unless one is supplied.
-The requirement follows the *address*, not the `--lan` flag: `--lan` on a
-loopback address reaches nobody new, and demanding a token there would be a
-requirement the operator never asked for.
+Over TCP there is no equivalent, so a **token** is always required instead,
+including on loopback. A loopback TCP listener still lacks `SO_PEERCRED`, so
+without a token another local user could attach. The token cannot be turned
+off and is minted from `/dev/urandom` (128 bits, hex) unless one is supplied.
+The requirement follows the transport, not the `--lan` flag.
 
 Comparison is constant-time (`token_matches`): a check that returns on the
 first wrong character tells an attacker how much of it was right. Refusal is
@@ -58,7 +59,8 @@ closed — and **nothing at all is accepted before a valid greeting**.
 
 Asserted by `tests/integration.sh`: a token is minted, and attaching with
 none, with a wrong one, and with the right one give refusal, refusal, and a
-session. Verified across two machines over a real LAN with no tunnel.
+session. `tests/lan.sh` repeats the refusal and recovery across two machines
+over a real LAN with no tunnel.
 
 ### What a peer can read
 
@@ -75,8 +77,8 @@ token's is.
 
 Asserted by `tests/integration.sh`: the right fingerprint attaches, a wrong
 one is refused, and a plaintext client against a TLS server gets nothing
-rather than falling back to something unencrypted. Verified between two
-machines over a real LAN with no tunnel.
+rather than falling back to something unencrypted. `tests/lan.sh` repeats all
+three cases between two machines over a real LAN with no tunnel.
 
 ### What a peer may do
 
@@ -102,6 +104,7 @@ Every length that arrives from a peer is bounded before it is believed:
 | Image payload | `KMX_MESSAGE_MAX`; cache bounded in entries and bytes | `src/graphics.c` |
 | Motion frame | 8192 per axis, 64 MiB total | `src/motion.c` |
 | Audio block | `KMX_AUDIO_BLOCK_MAX`, 1 MiB; rate and channels range-checked | `src/audio.c` |
+| Presenter tap frame | 8192 per axis, 64 MiB total; exact session id | `tools/kmx_tap.c` |
 | Clients | `KMX_MAX_CLIENTS`, 8 | `tools/kmx_serve.c` |
 | Per-client backlog | `KMX_CLIENT_QUEUE_LIMIT`, 4 MiB, then disconnect — except the motion and audio planes, which drop | `tools/kmx_serve.c` |
 | Per-pane typed-ahead input | `KMX_PANE_INPUT_LIMIT`, 256 KiB, then dropped | `tools/kmx_serve.c` |
@@ -208,6 +211,15 @@ swept over every slot, not only the readable ones, because a peer that has gone
 quiet generates no events. Asserted by a test that fills all eight slots with
 silent peers and checks a real client gets in afterwards.
 
+**Live pane observation and input are different descriptors.** The broker-v2
+observer runs in a child process and can only write pane output to a
+non-blocking pipe. It never receives client input and never claims the broker's
+control slot. If live control is enabled, input goes to a separately supplied
+helper through its own non-blocking, bounded pipe; without that helper the pane
+is view-only. The presenter tap is an owner-only `0600` Unix socket, checks
+`SO_PEERCRED`, requires the exact broker session id in every frame, and retains
+only one complete newest frame.
+
 ### Parsers
 
 Every decoder a peer can reach is fuzzed under ASan and UBSan: cells, layout,
@@ -243,7 +255,8 @@ Reading is the weakest of these and is listed last on purpose.
 | `tests/backpressure.sh` | a pane that stops reading stopping the server |
 | `tests/churn.sh` | connections abandoned at eight points of the handshake, under ASan |
 | `tests/integration.sh` | the planes end to end, tokens, TLS pinning, a hostile link |
-| `tests/network.sh REMOTE` | two real machines, both directions |
+| `tests/network.sh REMOTE` | two real machines, both directions through an SSH tunnel |
+| `tests/lan.sh REMOTE` | direct routed TLS both ways, refusal cases, tapped RGB and PCM |
 | `clang --analyze src/*.c tools/*.c` | found three things the compiler did not |
 
 `tests/churn.sh` is the one worth explaining, because both of the mistakes it
@@ -278,14 +291,18 @@ Stated plainly rather than left to be discovered.
    path above now has a bound; none of them is zero. A same-uid or
    token-holding peer can occupy a slot for `KMX_SETTLE_MS` and can reconnect.
    The accept bucket is what makes that finite rather than free.
-6. **Independent review has not been completed.** The tests and defect history
+6. **Live input is only as narrow as the supplied helper.** The multiplexer
+   never constructs it and cannot prove its policy. Kilix supplies a bounded
+   pane-session matcher; a caller using `--input-command` directly is
+   responsible for an equivalent scope.
+7. **Independent review has not been completed.** The tests and defect history
    in this document are evidence about specific behavior, not a substitute for
    an independent security review.
 
 ## Things deliberately not done
 
-- **No new cryptography.** When transport security lands it will be TLS or an
-  SSH tunnel, not a bespoke handshake.
+- **No bespoke cryptography.** Transport security is OpenSSL TLS with a pinned
+  certificate fingerprint, or an SSH tunnel, not a custom handshake.
 - **No persistence.** The multiplexer writes nothing to disk; session content
   lives only in memory and in whatever the broker already records.
 - **Private displays for pixel panes.** A pane's X client runs on a display

@@ -28,9 +28,11 @@
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
+#include <zlib.h>
 
 static volatile sig_atomic_t resize_pending;
 static volatile sig_atomic_t stop_pending;
@@ -180,6 +182,297 @@ reconnect(const kmx_endpoint *endpoint, int seconds) {
     return -1;
 }
 
+#define KMX_REMOTE_IMAGE_ID 2147483000u
+#define KMX_GRAPHICS_CHUNK 4096u
+
+static const char base64_table[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static unsigned char *
+base64_encode(const unsigned char *data, size_t size, size_t *encoded_size) {
+    unsigned char *out;
+    size_t length;
+    size_t input = 0;
+    size_t output = 0;
+    if (!data || !encoded_size || size > (SIZE_MAX - 2u) / 3u) return NULL;
+    length = ((size + 2u) / 3u) * 4u;
+    out = malloc(length ? length : 1);
+    if (!out) return NULL;
+    while (input + 3u <= size) {
+        uint32_t value =
+            (uint32_t)data[input] << 16 |
+            (uint32_t)data[input + 1] << 8 |
+            data[input + 2];
+        out[output++] = (unsigned char)base64_table[(value >> 18) & 63u];
+        out[output++] = (unsigned char)base64_table[(value >> 12) & 63u];
+        out[output++] = (unsigned char)base64_table[(value >> 6) & 63u];
+        out[output++] = (unsigned char)base64_table[value & 63u];
+        input += 3;
+    }
+    if (input < size) {
+        uint32_t value = (uint32_t)data[input] << 16;
+        bool have_second = input + 1 < size;
+        if (have_second) value |= (uint32_t)data[input + 1] << 8;
+        out[output++] = (unsigned char)base64_table[(value >> 18) & 63u];
+        out[output++] = (unsigned char)base64_table[(value >> 12) & 63u];
+        out[output++] = have_second
+            ? (unsigned char)base64_table[(value >> 6) & 63u] : '=';
+        out[output++] = '=';
+    }
+    *encoded_size = output;
+    return out;
+}
+
+/* Present a decoded motion frame through the local Kilix graphics protocol.
+ * Inline zlib is used because the pixels came from another machine: a local
+ * shared-memory name would exist on the wrong host. */
+static int
+display_motion(
+    const unsigned char *rgb,
+    int width,
+    int height,
+    int columns,
+    int rows
+) {
+    unsigned char *compressed = NULL;
+    unsigned char *encoded = NULL;
+    uLongf compressed_size;
+    size_t encoded_size = 0;
+    size_t offset = 0;
+    bool first = true;
+    int result = -1;
+
+    if (!rgb || width <= 0 || height <= 0 || columns <= 0 || rows <= 0) return -1;
+    compressed_size = compressBound((uLong)((size_t)width * (size_t)height * 3u));
+    compressed = malloc((size_t)compressed_size);
+    if (!compressed) goto done;
+    if (compress2(
+            compressed, &compressed_size, rgb,
+            (uLong)((size_t)width * (size_t)height * 3u),
+            Z_BEST_SPEED) != Z_OK) {
+        goto done;
+    }
+    encoded = base64_encode(compressed, (size_t)compressed_size, &encoded_size);
+    if (!encoded) goto done;
+    if (write_all(
+            STDOUT_FILENO, "\033[?2026h\033[H",
+            sizeof "\033[?2026h\033[H" - 1) != 0) {
+        goto done;
+    }
+    while (offset < encoded_size) {
+        char control[256];
+        size_t chunk = encoded_size - offset;
+        int control_size;
+        int more;
+        if (chunk > KMX_GRAPHICS_CHUNK) chunk = KMX_GRAPHICS_CHUNK;
+        more = offset + chunk < encoded_size;
+        if (first) {
+            control_size = snprintf(
+                control, sizeof control,
+                "\033_Ga=T,i=%u,p=1,z=-1,t=d,f=24,o=z,N=1,"
+                "s=%d,v=%d,c=%d,r=%d,q=2,C=1,m=%d;",
+                KMX_REMOTE_IMAGE_ID, width, height, columns, rows, more);
+        } else {
+            control_size = snprintf(
+                control, sizeof control, "\033_Gm=%d;", more);
+        }
+        if (control_size < 0 || (size_t)control_size >= sizeof control ||
+            write_all(STDOUT_FILENO, control, (size_t)control_size) != 0 ||
+            write_all(STDOUT_FILENO, encoded + offset, chunk) != 0 ||
+            write_all(STDOUT_FILENO, "\033\\", 2) != 0) {
+            goto done;
+        }
+        first = false;
+        offset += chunk;
+    }
+    if (write_all(
+            STDOUT_FILENO, "\033[?2026l", sizeof "\033[?2026l" - 1) != 0) {
+        goto done;
+    }
+    result = 0;
+done:
+    free(encoded);
+    free(compressed);
+    return result;
+}
+
+typedef struct {
+    int fd;
+    pid_t child;
+    unsigned char *pending;
+    size_t pending_size;
+    size_t pending_offset;
+    size_t dropped;
+    bool attempted;
+    bool disabled;
+} audio_output;
+
+static bool
+command_exists(const char *name) {
+    const char *path = getenv("PATH");
+    const char *cursor;
+    if (!name || !*name || strchr(name, '/')) return name && access(name, X_OK) == 0;
+    if (!path) return false;
+    cursor = path;
+    while (true) {
+        const char *end = strchr(cursor, ':');
+        size_t directory_size = end ? (size_t)(end - cursor) : strlen(cursor);
+        char candidate[4096];
+        int length;
+        if (directory_size == 0) {
+            length = snprintf(candidate, sizeof candidate, "./%s", name);
+        } else {
+            length = snprintf(
+                candidate, sizeof candidate, "%.*s/%s",
+                (int)directory_size, cursor, name);
+        }
+        if (length > 0 && (size_t)length < sizeof candidate &&
+            access(candidate, X_OK) == 0) {
+            return true;
+        }
+        if (!end) break;
+        cursor = end + 1;
+    }
+    return false;
+}
+
+static void
+audio_output_start(
+    audio_output *output,
+    const char *command,
+    uint32_t sample_rate,
+    uint8_t channels,
+    bool dump
+) {
+    int pipe_fds[2];
+    pid_t child;
+    if (!output || output->attempted) return;
+    output->attempted = true;
+    if ((command && strcmp(command, "none") == 0) || (!command && dump)) {
+        output->disabled = true;
+        return;
+    }
+    if (!command && !command_exists("pacat") && !command_exists("aplay")) {
+        fprintf(stderr,
+            "kmx-attach: no pacat or aplay found; audio is not being played\n");
+        output->disabled = true;
+        return;
+    }
+    if (pipe2(pipe_fds, O_CLOEXEC) != 0) {
+        output->disabled = true;
+        return;
+    }
+    child = fork();
+    if (child < 0) {
+        close(pipe_fds[0]);
+        close(pipe_fds[1]);
+        output->disabled = true;
+        return;
+    }
+    if (child == 0) {
+        char rate[32];
+        char channel_count[16];
+        int null_fd = open("/dev/null", O_WRONLY);
+        snprintf(rate, sizeof rate, "%u", sample_rate);
+        snprintf(channel_count, sizeof channel_count, "%u", channels);
+        setenv("KMX_AUDIO_RATE", rate, 1);
+        setenv("KMX_AUDIO_CHANNELS", channel_count, 1);
+        close(pipe_fds[1]);
+        if (dup2(pipe_fds[0], STDIN_FILENO) < 0) _exit(127);
+        close(pipe_fds[0]);
+        if (null_fd >= 0) {
+            (void)dup2(null_fd, STDOUT_FILENO);
+            (void)dup2(null_fd, STDERR_FILENO);
+            if (null_fd > STDERR_FILENO) close(null_fd);
+        }
+        if (command) {
+            execl("/bin/sh", "sh", "-c", command, (char *)NULL);
+        } else if (command_exists("pacat")) {
+            execlp(
+                "pacat", "pacat", "--playback", "--raw",
+                "--format=s16le", "--rate", rate, "--channels", channel_count,
+                "--latency-msec=100", (char *)NULL);
+        } else {
+            execlp(
+                "aplay", "aplay", "-q", "-t", "raw", "-f", "S16_LE",
+                "-r", rate, "-c", channel_count, (char *)NULL);
+        }
+        _exit(127);
+    }
+    close(pipe_fds[0]);
+    output->fd = pipe_fds[1];
+    output->child = child;
+    make_non_blocking(output->fd);
+}
+
+static void
+audio_output_flush(audio_output *output) {
+    while (output && output->fd >= 0 &&
+           output->pending_offset < output->pending_size) {
+        ssize_t count = write(
+            output->fd,
+            output->pending + output->pending_offset,
+            output->pending_size - output->pending_offset);
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+            close(output->fd);
+            output->fd = -1;
+            break;
+        }
+        if (count == 0) return;
+        output->pending_offset += (size_t)count;
+    }
+    if (output && output->pending_offset == output->pending_size) {
+        free(output->pending);
+        output->pending = NULL;
+        output->pending_size = 0;
+        output->pending_offset = 0;
+    }
+}
+
+static void
+audio_output_offer(audio_output *output, const unsigned char *pcm, size_t size) {
+    if (!output || output->fd < 0 || !pcm || !size) return;
+    audio_output_flush(output);
+    if (output->pending) {
+        output->dropped++;
+        return;
+    }
+    output->pending = malloc(size);
+    if (!output->pending) {
+        output->dropped++;
+        return;
+    }
+    memcpy(output->pending, pcm, size);
+    output->pending_size = size;
+    audio_output_flush(output);
+}
+
+static void
+audio_output_stop(audio_output *output) {
+    if (!output) return;
+    audio_output_flush(output);
+    free(output->pending);
+    output->pending = NULL;
+    if (output->fd >= 0) close(output->fd);
+    output->fd = -1;
+    if (output->child > 0) {
+        int attempt;
+        pid_t reaped = 0;
+        for (attempt = 0; attempt < 20 && reaped == 0; attempt++) {
+            struct timespec pause = {.tv_sec = 0, .tv_nsec = 10000000};
+            reaped = waitpid(output->child, NULL, WNOHANG);
+            if (reaped == 0) nanosleep(&pause, NULL);
+        }
+        if (reaped == 0) {
+            kill(output->child, SIGTERM);
+            (void)waitpid(output->child, NULL, 0);
+        }
+        output->child = -1;
+    }
+}
+
 int
 main(int argc, char **argv) {
     const char *socket_path = NULL;
@@ -189,6 +482,7 @@ main(int argc, char **argv) {
     bool view_only = false;
     const char *token = NULL;
     const char *fingerprint = NULL;
+    const char *audio_output_command = NULL;
     kmx_tls_client *tls_client = NULL;
     kmx_tls_session *tls = NULL;
     int reconnect_seconds = 30;
@@ -212,6 +506,7 @@ main(int argc, char **argv) {
     kmx_audio_sink *audio = NULL;
     unsigned long frames_seen = 0;
     unsigned long blocks_seen = 0;
+    audio_output player;
     kmx_framer framer;
     kmx_grid screen;
     unsigned char buffer[65536];
@@ -222,6 +517,9 @@ main(int argc, char **argv) {
 
     memset(receivers, 0, sizeof receivers);
     memset(panes, 0, sizeof panes);
+    memset(&player, 0, sizeof player);
+    player.fd = -1;
+    player.child = -1;
 
     /* Answered before anything else is parsed, so it works regardless of
      * whether the rest of the command line is right. */
@@ -250,11 +548,17 @@ main(int argc, char **argv) {
             send_text = argv[++index];
         } else if (strcmp(argv[index], "--seconds") == 0 && index + 1 < argc) {
             run_seconds = atoi(argv[++index]);
+        } else if (strcmp(argv[index], "--audio-output") == 0 &&
+                   index + 1 < argc) {
+            audio_output_command = argv[++index];
+        } else if (strcmp(argv[index], "--no-audio") == 0) {
+            audio_output_command = "none";
         } else {
             fprintf(stderr, "usage: kmx-attach --socket PATH [--no-predict]"
                             " [--view] [--token TOKEN]\n"
                             "       [--tls-fingerprint HEX] [--reconnect N]"
-                            "       [--dump] [--send TEXT] [--seconds N]\n");
+                            "       [--dump] [--send TEXT] [--seconds N]\n"
+                            "       [--audio-output COMMAND|--no-audio]\n");
             return 2;
         }
         index++;
@@ -562,6 +866,12 @@ main(int argc, char **argv) {
                             printf("KMX_FRAME %dx%d #%lu sum=%lu\n",
                                    frame_width, frame_height, frames_seen, sum);
                             fflush(stdout);
+                        } else if (pixels &&
+                                   display_motion(
+                                       pixels, frame_width, frame_height,
+                                       cols, rows) != 0) {
+                            exit_code = 1;
+                            stop_pending = 1;
                         }
                     }
                 } else if (type == KMX_MSG_AUDIO) {
@@ -569,12 +879,24 @@ main(int argc, char **argv) {
                         size_t block = 0;
                         uint64_t when = 0;
                         blocks_seen++;
-                        if (kmx_audio_sink_pcm(audio, &block, &when) && dump) {
-                            printf("KMX_AUDIO %zu #%lu at=%llu gap=%llu\n",
-                                   block, blocks_seen,
-                                   (unsigned long long)when,
-                                   (unsigned long long)kmx_audio_sink_gap_millis(audio));
-                            fflush(stdout);
+                        {
+                            const unsigned char *pcm =
+                                kmx_audio_sink_pcm(audio, &block, &when);
+                            if (pcm) {
+                                audio_output_start(
+                                    &player, audio_output_command,
+                                    kmx_audio_sink_sample_rate(audio),
+                                    kmx_audio_sink_channels(audio), dump);
+                                audio_output_offer(&player, pcm, block);
+                                if (dump) {
+                                    printf("KMX_AUDIO %zu #%lu at=%llu gap=%llu\n",
+                                           block, blocks_seen,
+                                           (unsigned long long)when,
+                                           (unsigned long long)
+                                               kmx_audio_sink_gap_millis(audio));
+                                    fflush(stdout);
+                                }
+                            }
                         }
                     }
                 } else if (type == KMX_MSG_EXIT) {
@@ -639,10 +961,20 @@ main(int argc, char **argv) {
             }
             kmx_buffer_free(&painted);
         }
+        audio_output_flush(&player);
     }
 
     if (have_termios) (void)tcsetattr(STDIN_FILENO, TCSANOW, &saved);
-    if (!dump) (void)write_all(STDOUT_FILENO, "\033[0m\r\n", 6);
+    if (!dump) {
+        char remove_image[64];
+        int length = snprintf(
+            remove_image, sizeof remove_image,
+            "\033_Ga=d,d=I,i=%u,q=2\033\\", KMX_REMOTE_IMAGE_ID);
+        if (length > 0 && (size_t)length < sizeof remove_image) {
+            (void)write_all(STDOUT_FILENO, remove_image, (size_t)length);
+        }
+        (void)write_all(STDOUT_FILENO, "\033[0m\r\n", 6);
+    }
     {
         size_t slot;
         for (slot = 0; slot < KMX_MAX_PANES; slot++) {
@@ -657,6 +989,11 @@ main(int argc, char **argv) {
     kmx_grid_free(&screen);
     kmx_predictor_free(predictor);
     kmx_render_free(render);
+    audio_output_stop(&player);
+    if (player.dropped) {
+        fprintf(stderr, "kmx-attach: dropped %zu audio block(s) at playback\n",
+                player.dropped);
+    }
     kmx_tls_session_free(tls);
     kmx_tls_client_free(tls_client);
     if (fd >= 0) close(fd);
