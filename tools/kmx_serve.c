@@ -261,7 +261,18 @@ pane_input_flush(pane *item) {
 static void
 pane_input_queue(pane *item, const void *data, size_t size) {
     compact(&item->input, &item->input_offset);
-    if (item->input.size - item->input_offset + size > KMX_PANE_INPUT_LIMIT) return;
+    /* The limit bounds what is ALREADY waiting, not what is arriving.
+     *
+     * Testing the sum instead meant a single message at or above the limit
+     * failed unconditionally - even against an empty queue and an idle pane,
+     * where nothing was under pressure at all.  Measured: one 300 KiB message
+     * delivered zero bytes to the pane, while the same 300 KiB split into 4 KiB
+     * frames delivered all of it.  A large paste is an ordinary thing to do and
+     * the framer already bounds one message at KMX_MESSAGE_MAX, so a message
+     * that arrives when there is room is taken whole however big it is; what
+     * the limit refuses is piling more on top of a backlog that is already too
+     * deep.  The buffer is therefore bounded by the limit plus one message. */
+    if (item->input.size - item->input_offset > KMX_PANE_INPUT_LIMIT) return;
     if (kmx_buffer_append(&item->input, data, size) != KMX_OK) return;
     (void)pane_input_flush(item);
 }
@@ -1022,6 +1033,18 @@ main(int argc, char **argv) {
                     kmx_term_feed(panes[id].term, buffer, (size_t)received);
                 } else if (received == 0 || (errno != EINTR && errno != EAGAIN)) {
                     panes[id].alive = false;
+                    /* Reaped here rather than only once every pane has gone.
+                     * A session whose first pane exits early otherwise carries
+                     * that pane's zombie for the rest of its life, which in a
+                     * long-lived multi-pane session is exactly the shape that
+                     * accumulates. */
+                    if (panes[id].child > 0) {
+                        int status;
+                        if (waitpid(panes[id].child, &status, WNOHANG) ==
+                            panes[id].child) {
+                            panes[id].child = -1;
+                        }
+                    }
                 }
             }
         }
