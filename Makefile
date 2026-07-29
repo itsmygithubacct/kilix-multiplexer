@@ -29,7 +29,7 @@ SHAPE := $(BUILD_DIR)/kmx-shape
 ATTACH := $(BUILD_DIR)/kmx-attach
 FLOOD := $(BUILD_DIR)/flood-input
 
-.PHONY: all clean test sanitize fuzz backpressure check-vendor install
+.PHONY: all clean test sanitize fuzz backpressure churn check-vendor install
 
 all: $(STATIC_LIB) $(BENCH) $(SERVE) $(ATTACH) $(SHAPE)
 
@@ -94,6 +94,12 @@ $(FLOOD): $(BUILD_DIR)/flood_input.o $(STATIC_LIB)
 # the library.
 backpressure: $(SERVE) $(FLOOD)
 	tests/backpressure.sh
+
+# Abandon connections at every stage of the handshake, under ASan.  Builds its
+# own sanitized server and leaves the tree clean afterwards, so it is not part
+# of `all`.
+churn:
+	tests/churn.sh
 
 test: $(TEST)
 	$(TEST_ENVIRONMENT) "$(TEST)"

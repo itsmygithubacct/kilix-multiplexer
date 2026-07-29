@@ -187,6 +187,34 @@ loop condition, a `memcpy` from a null pointer with zero length in the image
 cache, and a fingerprint comparison that would have read uninitialised bytes if
 `X509_digest` ever returned a length other than 32.
 
+## How to check the claims above
+
+Reading is the weakest of these and is listed last on purpose.
+
+| Check | What it would catch |
+|---|---|
+| `make test` | the library's own invariants |
+| `make sanitize` | memory errors under ASan and UBSan |
+| `FUZZ_SECONDS=600 make fuzz` | decoder bugs; found two that short runs did not |
+| `tests/backpressure.sh` | a pane that stops reading stopping the server |
+| `tests/churn.sh` | connections abandoned at eight points of the handshake, under ASan |
+| `tests/integration.sh` | the planes end to end, tokens, TLS pinning, a hostile link |
+| `tests/network.sh REMOTE` | two real machines, both directions |
+| `clang --analyze src/*.c tools/*.c` | found three things the compiler did not |
+
+`tests/churn.sh` is the one worth explaining, because both of the mistakes it
+was written around are easy to repeat. Its first version left 2,968 of 3,000
+connections refused by the accept rate limiter, so it exercised almost nothing
+while appearing to pass — it now paces itself to the server's allowance and
+fails outright if the server reports a single refusal. And it builds a
+deliberately leaking program first to confirm LeakSanitizer reports in this
+environment, because otherwise a clean run is not evidence of anything. 1,600
+connections across eight abandonment points currently produce no findings.
+
+That is a real result and a narrow one: it says the state machine does not
+corrupt memory under churn. It says nothing about whether it does the right
+thing, which is what a reader is for.
+
 ## Known gaps
 
 Stated plainly rather than left to be discovered.
