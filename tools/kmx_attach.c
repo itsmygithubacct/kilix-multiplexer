@@ -156,6 +156,8 @@ main(int argc, char **argv) {
     kmx_render *render = NULL;
     kmx_predictor *predictor = NULL;
     kmx_image_cache *images = NULL;
+    kmx_motion_sink *motion = NULL;
+    unsigned long frames_seen = 0;
     kmx_framer framer;
     kmx_grid screen;
     unsigned char buffer[65536];
@@ -213,6 +215,7 @@ main(int argc, char **argv) {
     if (kmx_render_create(&render) != KMX_OK ||
         kmx_predictor_create(&predictor) != KMX_OK ||
         kmx_image_cache_create(&images, 256, 32u * 1024u * 1024u) != KMX_OK ||
+        kmx_motion_sink_create(&motion) != KMX_OK ||
         kmx_grid_init(&screen, rows, cols) != KMX_OK) {
         fprintf(stderr, "kmx-attach: out of memory\n");
         return 1;
@@ -378,6 +381,29 @@ main(int argc, char **argv) {
                             (void)write_all(STDOUT_FILENO, "\033\\", 2);
                         }
                     }
+                } else if (type == KMX_MSG_FRAME && size >= 1) {
+                    /* payload[0] is the pane; one pixel pane for now. */
+                    if (kmx_motion_sink_apply(motion, payload + 1, size - 1) == KMX_OK) {
+                        int frame_width = 0;
+                        int frame_height = 0;
+                        const unsigned char *pixels =
+                            kmx_motion_sink_pixels(motion, &frame_width, &frame_height);
+                        frames_seen++;
+                        if (dump && pixels) {
+                            /* A checksum rather than the pixels: enough for a
+                             * test to prove the frame arrived intact, without
+                             * writing megabytes to a log. */
+                            unsigned long sum = 0;
+                            long index;
+                            long total = (long)frame_width * frame_height * 3;
+                            for (index = 0; index < total; index++) {
+                                sum = sum * 131u + pixels[index];
+                            }
+                            printf("KMX_FRAME %dx%d #%lu sum=%lu\n",
+                                   frame_width, frame_height, frames_seen, sum);
+                            fflush(stdout);
+                        }
+                    }
                 } else if (type == KMX_MSG_EXIT) {
                     pane_ended = true;
                     stop_pending = 1;
@@ -453,6 +479,7 @@ main(int argc, char **argv) {
     }
     kmx_framer_free(&framer);
     kmx_image_cache_free(images);
+    kmx_motion_sink_free(motion);
     kmx_grid_free(&screen);
     kmx_predictor_free(predictor);
     kmx_render_free(render);

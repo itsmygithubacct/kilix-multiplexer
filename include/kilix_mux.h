@@ -273,7 +273,9 @@ typedef enum {
     KMX_MSG_EXIT = 6,    /* server -> client: the session ended            */
     KMX_MSG_LAYOUT = 7,  /* server -> client: the layout plane             */
     KMX_MSG_FOCUS = 8,   /* client -> server: focus a pane                 */
-    KMX_MSG_IMAGE = 9    /* server -> client: the still-graphics plane     */
+    KMX_MSG_IMAGE = 9,   /* server -> client: the still-graphics plane     */
+    KMX_MSG_FRAME = 10,  /* server -> client: the motion plane             */
+    KMX_MSG_AUDIO = 11   /* server -> client: the audio plane              */
 } kmx_message_type;
 
 /* The largest single message accepted from a peer.  A length prefix is an

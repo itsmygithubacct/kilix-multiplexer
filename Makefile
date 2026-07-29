@@ -51,11 +51,14 @@ $(BUILD_DIR)/kmx_bench.o: tools/kmx_bench.c include/kilix_mux.h | $(BUILD_DIR)
 $(BENCH): $(BUILD_DIR)/kmx_bench.o $(STATIC_LIB)
 	$(CC) $(LDFLAGS) -o "$@" $(BUILD_DIR)/kmx_bench.o $(STATIC_LIB) $(LDLIBS) -lutil
 
-$(BUILD_DIR)/kmx_serve.o: tools/kmx_serve.c include/kilix_mux.h | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -c "$<" -o "$@"
+$(BUILD_DIR)/kmx_serve.o: tools/kmx_serve.c tools/kmx_pixel.h include/kilix_mux.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Itools -c "$<" -o "$@"
 
-$(SERVE): $(BUILD_DIR)/kmx_serve.o $(STATIC_LIB)
-	$(CC) $(LDFLAGS) -o "$@" $(BUILD_DIR)/kmx_serve.o $(STATIC_LIB) $(LDLIBS) -lutil
+$(BUILD_DIR)/kmx_pixel.o: tools/kmx_pixel.c tools/kmx_pixel.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Itools -c "$<" -o "$@"
+
+$(SERVE): $(BUILD_DIR)/kmx_serve.o $(BUILD_DIR)/kmx_pixel.o $(STATIC_LIB)
+	$(CC) $(LDFLAGS) -o "$@" $(BUILD_DIR)/kmx_serve.o $(BUILD_DIR)/kmx_pixel.o $(STATIC_LIB) $(LDLIBS) -lutil
 
 $(BUILD_DIR)/kmx_attach.o: tools/kmx_attach.c include/kilix_mux.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c "$<" -o "$@"
@@ -81,6 +84,10 @@ sanitize:
 		LDFLAGS="-fsanitize=address,undefined" \
 		TEST_ENVIRONMENT="UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1" \
 		test
+	@# Leave the tree consistent.  Sanitized objects linked into an ordinary
+	@# build fail with undefined __asan_* symbols, which reads as a mysterious
+	@# link error rather than as leftovers from this target.
+	$(MAKE) clean
 
 # Every decoder a remote peer can reach is fuzzed, not merely tested.
 # Requires a clang with libFuzzer.

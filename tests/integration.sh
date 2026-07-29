@@ -365,6 +365,40 @@ else
     report fail "the client reattaches after the link drops"
 fi
 
+# --- a pixel pane: a real X client, captured and streamed -----------------
+#
+# The motion plane driven by something real rather than a frame generator.
+# The X client runs on a display created for the session, so this can never
+# draw on a screen someone is actually using.
+if command -v Xvfb >/dev/null && command -v ffmpeg >/dev/null &&
+   command -v xclock >/dev/null; then
+    pix_port=$(( port + 4 ))
+    "$serve" --socket "127.0.0.1:$pix_port" \
+        --pixel-pane 'xclock -update 1' --pixel-size 320x240 --pixel-fps 4 \
+        >/dev/null 2>&1 &
+    sleep 3
+    timeout 12 "$attach" --socket "127.0.0.1:$pix_port" --dump --seconds 5 \
+        > "$work/pixel.out" 2>&1
+    frames=$(grep -c '^KMX_FRAME' "$work/pixel.out")
+    if [ "$frames" -ge 2 ]; then
+        report pass "a pixel pane streams frames to the client ($frames)"
+    else
+        report fail "a pixel pane streams frames to the client ($frames)"
+    fi
+    # A ticking clock must not produce identical frames: equal checksums
+    # would mean the decoder was reconstructing the same picture every time,
+    # which is what a broken delta path looks like.
+    distinct=$(grep '^KMX_FRAME' "$work/pixel.out" | awk '{print $4}' | sort -u | wc -l)
+    if [ "$distinct" -ge 2 ]; then
+        report pass "successive frames differ, so deltas are being applied"
+    else
+        report fail "successive frames differ, so deltas are being applied"
+    fi
+    pkill -f "pixel-pane" 2>/dev/null
+else
+    echo "skip  pixel pane (needs Xvfb, ffmpeg and xclock)"
+fi
+
 echo
 if [ "$failures" -eq 0 ]; then
     echo "all integration checks passed"

@@ -18,6 +18,7 @@
 
 #include "kilix_mux.h"
 #include "endpoint.h"
+#include "kmx_pixel.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -66,6 +67,7 @@ typedef struct {
 typedef struct {
     int fd;
     bool control;
+    kmx_motion *motion;   /* per client: what IT has been shown */
     int rows;
     int cols;
     kmx_sync *sync[KMX_MAX_PANES];
@@ -175,6 +177,7 @@ client_release(client *item, size_t pane_count) {
         kmx_sync_free(item->sync[slot]);
     }
     kmx_image_cache_free(item->holds);
+    kmx_motion_free(item->motion);
     kmx_framer_free(&item->framer);
     kmx_buffer_free(&item->out);
     memset(item, 0, sizeof *item);
@@ -188,8 +191,13 @@ usage(void) {
           "                 --pane 'COMMAND' [--pane 'COMMAND' ...]\n"
           "       kmx-serve --socket PATH [...] -- COMMAND [ARG...]\n"
           "\n"
+          "       kmx-serve --socket PATH --pixel-pane 'COMMAND'\n"
+          "                 [--pixel-size WxH] [--pixel-fps N] [--pixel-budget BPS]\n"
+          "\n"
           "  --socket accepts a path or HOST:PORT.  TCP binds loopback unless\n"
-          "  --lan is given; reach a session across a network over SSH.\n",
+          "  --lan is given; reach a session across a network over SSH.\n"
+          "  --pixel-pane runs an X client on a private display and streams its\n"
+          "  frames; it never touches the display the operator is using.\n",
           stderr);
 }
 
@@ -199,6 +207,13 @@ main(int argc, char **argv) {
     kmx_endpoint endpoint;
     bool allow_public = false;
     const char *commands[KMX_MAX_PANES];
+    const char *pixel_command = NULL;
+    kmx_pixel_pane pixel;
+    bool pixel_running = false;
+    int pixel_width = 640;
+    int pixel_height = 480;
+    int pixel_fps = 10;
+    uint32_t pixel_budget = 0;
     char *const *single = NULL;
     size_t command_count = 0;
     bool vertical = false;
@@ -228,6 +243,17 @@ main(int argc, char **argv) {
             cols = atoi(argv[++index]);
         } else if (strcmp(argv[index], "--listen") == 0 && index + 1 < argc) {
             socket_path = argv[++index];
+        } else if (strcmp(argv[index], "--pixel-pane") == 0 && index + 1 < argc) {
+            pixel_command = argv[++index];
+        } else if (strcmp(argv[index], "--pixel-size") == 0 && index + 1 < argc) {
+            if (sscanf(argv[++index], "%dx%d", &pixel_width, &pixel_height) != 2) {
+                usage();
+                return 2;
+            }
+        } else if (strcmp(argv[index], "--pixel-fps") == 0 && index + 1 < argc) {
+            pixel_fps = atoi(argv[++index]);
+        } else if (strcmp(argv[index], "--pixel-budget") == 0 && index + 1 < argc) {
+            pixel_budget = (uint32_t)strtoul(argv[++index], NULL, 10);
         } else if (strcmp(argv[index], "--lan") == 0) {
             allow_public = true;
         } else if (strcmp(argv[index], "--split") == 0 && index + 1 < argc) {
@@ -247,14 +273,17 @@ main(int argc, char **argv) {
     if (index < argc && strcmp(argv[index], "--") == 0 && index + 1 < argc) {
         single = &argv[index + 1];
     }
-    if (!socket_path || rows <= 0 || cols <= 0 || (command_count == 0 && !single)) {
+    if (!socket_path || rows <= 0 || cols <= 0 ||
+        (command_count == 0 && !single && !pixel_command)) {
         usage();
         return 2;
     }
-    count = single ? 1 : command_count;
+    /* A pixel pane is the whole session for now: mixing pixel and text panes
+     * in one layout is a later refinement, not part of proving the plane. */
+    count = pixel_command ? 0 : (single ? 1 : command_count);
 
     kmx_layout_init(&layout, rows, cols);
-    if (kmx_layout_arrange(&layout, count, vertical) != KMX_OK) {
+    if (count && kmx_layout_arrange(&layout, count, vertical) != KMX_OK) {
         fprintf(stderr, "kmx-serve: %d by %d is too small for %zu panes\n",
                 rows, cols, count);
         return 1;
@@ -314,6 +343,17 @@ main(int argc, char **argv) {
         item->alive = true;
     }
 
+    if (pixel_command) {
+        if (!kmx_pixel_start(
+                &pixel, pixel_command, pixel_width, pixel_height, pixel_fps)) {
+            fprintf(stderr, "kmx-serve: could not start a private display\n");
+            return 1;
+        }
+        pixel_running = true;
+        fprintf(stderr, "kmx-serve: pixel pane on display :%d, %dx%d\n",
+                pixel.display, pixel_width, pixel_height);
+    }
+
     signal(SIGPIPE, SIG_IGN);
     signal(SIGINT, handle_stop);
     signal(SIGTERM, handle_stop);
@@ -325,6 +365,7 @@ main(int argc, char **argv) {
         size_t pane_at[KMX_MAX_PANES];
         nfds_t client_first;
         nfds_t pane_first;
+        nfds_t pane_descriptors;
         bool any_alive = false;
         int ready;
 
@@ -348,6 +389,19 @@ main(int argc, char **argv) {
             any_alive = true;
             pane_at[descriptor_count - pane_first] = slot;
             descriptors[descriptor_count].fd = panes[slot].master;
+            descriptors[descriptor_count].events = POLLIN;
+            descriptors[descriptor_count].revents = 0;
+            descriptor_count++;
+        }
+
+        /* Captured before anything else is appended.  Deriving this from
+         * descriptor_count later would sweep whatever came after the panes -
+         * the frame pipe - as though it were a pane, index an uninitialised
+         * slot, and write through it. */
+        pane_descriptors = descriptor_count - pane_first;
+
+        if (pixel_running) {
+            descriptors[descriptor_count].fd = pixel.frames;
             descriptors[descriptor_count].events = POLLIN;
             descriptors[descriptor_count].revents = 0;
             descriptor_count++;
@@ -397,6 +451,11 @@ main(int argc, char **argv) {
                     if (ok) {
                         ok = kmx_image_cache_create(
                             &item->holds, 256, 32u * 1024u * 1024u) == KMX_OK;
+                    }
+                    if (ok && pixel_running) {
+                        /* Per client, like the cell baseline: what one client
+                         * has been shown says nothing about another. */
+                        ok = kmx_motion_create(&item->motion, pixel_budget) == KMX_OK;
                     }
                     if (!ok) client_release(item, count);
                 }
@@ -515,7 +574,7 @@ main(int argc, char **argv) {
             }
         }
 
-        for (which = 0; which + pane_first < descriptor_count; which++) {
+        for (which = 0; which < pane_descriptors; which++) {
             size_t id = pane_at[which];
             if (!(descriptors[pane_first + which].revents &
                   (POLLIN | POLLHUP | POLLERR))) {
@@ -532,11 +591,44 @@ main(int argc, char **argv) {
             }
         }
 
+        if (pixel_running) {
+            bool closed = false;
+            while (kmx_pixel_poll(&pixel, &closed)) {
+                if (getenv("KMX_DEBUG_FRAMES")) {
+                    fprintf(stderr, "kmx-serve: frame\n");
+                    fflush(stderr);
+                }
+                for (which = 0; which < KMX_MAX_CLIENTS; which++) {
+                    client *item = &clients[which];
+                    kmx_buffer message;
+                    bool produced = false;
+                    if (item->fd < 0 || !item->motion) continue;
+                    kmx_buffer_init(&message);
+                    if (kmx_buffer_append(
+                            &message, &(unsigned char){0}, 1) == KMX_OK &&
+                        kmx_motion_offer(
+                            item->motion, pixel.frame, pixel.width, pixel.height,
+                            now_millis(), &message, &produced, NULL) == KMX_OK &&
+                        produced) {
+                        if (client_queue(
+                                item, KMX_MSG_FRAME,
+                                message.data, message.size) != 0) {
+                            kmx_buffer_free(&message);
+                            client_release(item, count);
+                            continue;
+                        }
+                    }
+                    kmx_buffer_free(&message);
+                }
+            }
+            if (closed) break;
+        }
+
         for (which = 0; which < KMX_MAX_CLIENTS; which++) {
             client *item = &clients[which];
             if (item->fd < 0) continue;
 
-            if (!kmx_layout_equal(&layout, &item->announced)) {
+            if (count && !kmx_layout_equal(&layout, &item->announced)) {
                 kmx_buffer wire;
                 kmx_buffer_init(&wire);
                 if (kmx_layout_encode(&layout, &wire) == KMX_OK) {
@@ -637,7 +729,7 @@ main(int argc, char **argv) {
             }
         }
 
-        if (!any_alive) {
+        if (!any_alive && !pixel_running) {
             for (slot = 0; slot < count; slot++) {
                 int status;
                 if (panes[slot].child > 0) waitpid(panes[slot].child, &status, WNOHANG);
@@ -658,6 +750,7 @@ main(int argc, char **argv) {
         if (panes[slot].master >= 0) close(panes[slot].master);
         kmx_term_free(panes[slot].term);
     }
+    if (pixel_running) kmx_pixel_stop(&pixel);
     if (listener >= 0) close(listener);
     kmx_endpoint_cleanup(&endpoint);
     return 0;
