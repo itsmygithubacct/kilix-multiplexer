@@ -111,6 +111,27 @@ send_hello(int fd, int rows, int cols, bool view_only) {
     return send_message(fd, KMX_MSG_HELLO, payload, sizeof payload);
 }
 
+/* Reattach after the link drops.
+ *
+ * Worth doing rather than exiting because the session is not on this side:
+ * the panes keep running, and their screens are state the server can describe
+ * again from scratch.  A reattached client therefore needs no history - it is
+ * simply sent the screen as it is now, which is the same message a first-time
+ * client gets and is why reconnection is cheap here. */
+static int
+reconnect(const kmx_endpoint *endpoint, int seconds) {
+    time_t deadline = time(NULL) + seconds;
+    while (time(NULL) <= deadline) {
+        int fd = kmx_endpoint_connect(endpoint);
+        if (fd >= 0) {
+            kmx_endpoint_tune(fd, endpoint);
+            return fd;
+        }
+        usleep(400000);
+    }
+    return -1;
+}
+
 int
 main(int argc, char **argv) {
     const char *socket_path = NULL;
@@ -118,6 +139,8 @@ main(int argc, char **argv) {
     bool predict = true;
     bool dump = false;
     bool view_only = false;
+    int reconnect_seconds = 30;
+    bool pane_ended = false;
     int run_seconds = 0;
     time_t started_at;
     bool sent_once = false;
@@ -149,6 +172,8 @@ main(int argc, char **argv) {
             socket_path = argv[++index];
         } else if (strcmp(argv[index], "--no-predict") == 0) {
             predict = false;
+        } else if (strcmp(argv[index], "--reconnect") == 0 && index + 1 < argc) {
+            reconnect_seconds = atoi(argv[++index]);
         } else if (strcmp(argv[index], "--view") == 0) {
             view_only = true;
             predict = false;
@@ -160,8 +185,8 @@ main(int argc, char **argv) {
             run_seconds = atoi(argv[++index]);
         } else {
             fprintf(stderr, "usage: kmx-attach --socket PATH [--no-predict]"
-                            " [--view]\n       [--dump] [--send TEXT]"
-                            " [--seconds N]\n");
+                            " [--view] [--reconnect N]\n"
+                            "       [--dump] [--send TEXT] [--seconds N]\n");
             return 2;
         }
         index++;
@@ -247,7 +272,39 @@ main(int argc, char **argv) {
 
         if (descriptors[0].revents & (POLLIN | POLLHUP | POLLERR)) {
             ssize_t count = read(fd, buffer, sizeof buffer);
-            if (count <= 0) break;
+            if (count <= 0) {
+                int replacement;
+                /* A pane that ended is not a link that dropped; do not chase
+                 * a session that is over. */
+                if (pane_ended || reconnect_seconds <= 0) break;
+                close(fd);
+                replacement = reconnect(&endpoint, reconnect_seconds);
+                if (replacement < 0) {
+                    fd = -1;
+                    break;
+                }
+                fd = replacement;
+                /* Everything held about the old connection is now a guess:
+                 * the panes may have been rearranged, and this client holds
+                 * nothing the server knows about. */
+                {
+                    size_t slot;
+                    for (slot = 0; slot < KMX_MAX_PANES; slot++) {
+                        if (receivers[slot]) {
+                            kmx_receiver_free(receivers[slot]);
+                            receivers[slot] = NULL;
+                        }
+                    }
+                }
+                kmx_framer_free(&framer);
+                kmx_framer_init(&framer);
+                kmx_predictor_reset(predictor);
+                kmx_render_invalidate(render);
+                layout.pane_count = 0;
+                send_hello(fd, rows, cols, view_only);
+                if (!view_only) send_dimensions(fd, KMX_MSG_RESIZE, rows, cols);
+                continue;
+            }
             if (kmx_framer_push(&framer, buffer, (size_t)count) != KMX_OK) break;
             while (true) {
                 kmx_message_type type;
@@ -322,6 +379,7 @@ main(int argc, char **argv) {
                         }
                     }
                 } else if (type == KMX_MSG_EXIT) {
+                    pane_ended = true;
                     stop_pending = 1;
                 }
                 kmx_framer_consume(&framer);
@@ -398,6 +456,6 @@ main(int argc, char **argv) {
     kmx_grid_free(&screen);
     kmx_predictor_free(predictor);
     kmx_render_free(render);
-    close(fd);
+    if (fd >= 0) close(fd);
     return exit_code;
 }

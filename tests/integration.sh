@@ -332,6 +332,39 @@ else
     report fail "a client that stops reading does not stall the others"
 fi
 
+# --- the client survives the server being restarted under it ---------------
+#
+# The session is not on the client's side: the panes keep running and their
+# screens are state the server can describe again.  So a dropped link should
+# be reattached, not fatal.  Here the server process is replaced entirely,
+# which is a harsher test than a dropped connection.
+rc_port=$(( port + 3 ))
+"$serve" --socket "127.0.0.1:$rc_port" --rows 12 --cols 60 \
+    -- /bin/sh -c 'printf "BEFORE_DROP\r\n"; sleep 30' >/dev/null 2>&1 &
+first_server=$!
+sleep 0.8
+timeout 20 "$attach" --socket "127.0.0.1:$rc_port" --dump --seconds 12 \
+    --reconnect 10 > "$work/reconnect.out" 2>&1 &
+reader=$!
+sleep 2
+kill "$first_server" 2>/dev/null
+wait "$first_server" 2>/dev/null
+sleep 1
+# A new session on the same address; the client should find its way back.
+"$serve" --socket "127.0.0.1:$rc_port" --rows 12 --cols 60 \
+    -- /bin/sh -c 'printf "AFTER_RECONNECT\r\n"; sleep 20' >/dev/null 2>&1 &
+second_server=$!
+wait "$reader" 2>/dev/null
+kill "$second_server" 2>/dev/null
+wait "$second_server" 2>/dev/null
+text=$(visible "$work/reconnect.out")
+if printf '%s' "$text" | grep -q BEFORE_DROP &&
+   printf '%s' "$text" | grep -q AFTER_RECONNECT; then
+    report pass "the client reattaches after the link drops"
+else
+    report fail "the client reattaches after the link drops"
+fi
+
 echo
 if [ "$failures" -eq 0 ]; then
     echo "all integration checks passed"
