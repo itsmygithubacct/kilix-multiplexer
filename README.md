@@ -13,10 +13,10 @@ where there is actually video — rather than one undifferentiated stream.
 
 Design notes are maintained separately from this release tree.
 
-**Status: the text plane works end to end.** A pane can be served and attached
-over a socket, with predictive local echo. It is **one pane and one client**:
-there is no layout plane, no graphics or audio plane, and no network transport
-beyond a Unix socket yet.
+**Status: the text and layout planes work end to end.** A multi-pane session
+can be served and attached over a socket, with predictive local echo and
+client-drawn chrome. Still missing: the graphics, motion and audio planes,
+multi-client attach, and any transport beyond a Unix socket.
 
 ```sh
 make               # library and tools
@@ -31,8 +31,12 @@ tools/bench.sh         # what the cell plane actually costs
 ## Try it
 
 ```sh
-kmx-serve --socket /tmp/pane.sock -- bash     # in one terminal
-kmx-attach --socket /tmp/pane.sock            # in another; Ctrl-] detaches
+# one pane
+kmx-serve --socket ./kmx.sock -- bash
+# or several, side by side
+kmx-serve --socket ./kmx.sock --split horizontal --pane bash --pane 'top -d1'
+
+kmx-attach --socket ./kmx.sock   # Ctrl-] detaches, Ctrl-O changes pane
 ```
 
 The client renders the screen, forwards typing, follows resizes, and echoes
@@ -76,9 +80,13 @@ predictor is for.
   text beside it cannot be reordered. Sequences split across reads are
   reassembled. They are captured but not yet carried: that is the still and
   motion planes, which come later.
-- **`kmx-serve` / `kmx-attach`** — a pane served over an owner-only socket and
-  a client that renders it, with an incremental framer, a diffing renderer,
-  and predictive local echo.
+- **Layout plane** — where the panes are, in a few dozen bytes. A four-pane
+  arrangement encodes in under 120 bytes, and because the client knows the
+  geometry it draws the dividers and title bars itself rather than receiving
+  pictures of them. Sent only when the arrangement changes.
+- **`kmx-serve` / `kmx-attach`** — a multi-pane session served over an
+  owner-only socket and a client that composites and renders it, with an
+  incremental framer, a diffing renderer, and predictive local echo.
 
 ## Properties the tests assert
 
