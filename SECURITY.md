@@ -103,7 +103,7 @@ Every length that arrives from a peer is bounded before it is believed:
 | Motion frame | 8192 per axis, 64 MiB total | `src/motion.c` |
 | Audio block | `KMX_AUDIO_BLOCK_MAX`, 1 MiB; rate and channels range-checked | `src/audio.c` |
 | Clients | `KMX_MAX_CLIENTS`, 8 | `tools/kmx_serve.c` |
-| Per-client backlog | `KMX_CLIENT_QUEUE_LIMIT`, 4 MiB, then disconnect | `tools/kmx_serve.c` |
+| Per-client backlog | `KMX_CLIENT_QUEUE_LIMIT`, 4 MiB, then disconnect — except the motion and audio planes, which drop | `tools/kmx_serve.c` |
 | Per-pane typed-ahead input | `KMX_PANE_INPUT_LIMIT`, 256 KiB, then dropped | `tools/kmx_serve.c` |
 | Time to finish connecting | `KMX_SETTLE_MS`, 10 s for handshake and HELLO | `tools/kmx_serve.c` |
 
@@ -140,6 +140,19 @@ against the version before the fix, the server stopped serving after 0.1 MB and
 had to be killed. Input is now queued per pane, bounded, and drained on POLLOUT
 like everything else; `tests/backpressure.sh` fails against the old binary and
 passes against the new one.
+
+**And the backlog limit punished the wrong plane.** A client that overran the
+4 MiB backlog was disconnected, which is right for the cell plane — a client
+that far behind is better replaced than buffered — and wrong for motion and
+audio, whose whole contract is that they may drop. An incompressible 1080p
+frame is 6,220,814 bytes on the wire (measured, not estimated), so it overran
+the backlog, dropped the client mid-stream, and dropped it again on the next
+such frame after it reconnected. The one plane documented as droppable was the
+one that could kill the connection. Those two planes now discard and count;
+the count is printed at shutdown so a session dropping everything is visible
+rather than silent. Raising the decompression bound to admit a 64 MiB frame is
+what exposed this: it made the decoder agree that such a frame is legitimate
+while nothing downstream could carry one.
 
 **The TLS handshake did not either.** It ran to completion inside the accept
 path on a blocking socket, so a peer that connected and then went quiet held

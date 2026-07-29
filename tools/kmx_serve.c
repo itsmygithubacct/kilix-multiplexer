@@ -174,6 +174,28 @@ client_queue(client *item, kmx_message_type type, const void *payload, size_t si
     return result;
 }
 
+/* Queue a message for a plane that is allowed to lose one.
+ *
+ * The motion and audio planes both drop rather than buffer when their rate
+ * allowance is spent, and the socket has to agree with that: a frame or a block
+ * that does not fit the backlog is discarded, not grounds for disconnecting.
+ *
+ * It was grounds for disconnecting, which is worse than it sounds.  A 1080p
+ * frame of incompressible pixels is about 6 MB on the wire, over the 4 MiB
+ * backlog, so the client was dropped mid-stream - and reconnected, and was
+ * dropped again on the next such frame.  The one plane whose documented
+ * contract is that it may drop was the one that could kill the connection. */
+static void
+client_queue_droppable(
+    client *item,
+    kmx_message_type type,
+    const void *payload,
+    size_t size,
+    size_t *dropped
+) {
+    if (client_queue(item, type, payload, size) != 0 && dropped) (*dropped)++;
+}
+
 /* Push what will go without blocking.  Anything left waits for POLLOUT. */
 static int
 client_flush(client *item) {
@@ -390,6 +412,11 @@ main(int argc, char **argv) {
     unsigned accept_allowance = KMX_ACCEPT_BURST;
     uint64_t accept_refilled = 0;
     unsigned long accepts_refused = 0;
+    /* Reported at shutdown rather than silently swallowed: a plane that drops
+     * is behaving as designed, but a plane that drops everything is a
+     * misconfiguration, and the difference should be visible. */
+    size_t frames_dropped = 0;
+    size_t blocks_dropped = 0;
     size_t count;
     size_t slot;
     size_t which;
@@ -410,7 +437,10 @@ main(int argc, char **argv) {
         } else if (strcmp(argv[index], "--pixel-pane") == 0 && index + 1 < argc) {
             pixel_command = argv[++index];
         } else if (strcmp(argv[index], "--pixel-size") == 0 && index + 1 < argc) {
-            if (sscanf(argv[++index], "%dx%d", &pixel_width, &pixel_height) != 2) {
+            if (sscanf(argv[++index], "%dx%d", &pixel_width, &pixel_height) != 2 ||
+                pixel_width < 1 || pixel_height < 1 ||
+                pixel_width > 8192 || pixel_height > 8192 ||
+                (long)pixel_width * pixel_height * 3L > 64L * 1024L * 1024L) {
                 usage();
                 return 2;
             }
@@ -1013,19 +1043,15 @@ main(int argc, char **argv) {
                     bool produced = false;
                     if (item->fd < 0 || !item->audio) continue;
                     if (item->handshaking) continue;
-            if (require_token && !item->greeted) continue;
+                    if (require_token && !item->greeted) continue;
                     kmx_buffer_init(&message);
                     if (kmx_audio_offer(
                             item->audio, audio_block, audio_block_bytes,
                             audio_clock, &message, &produced, NULL) == KMX_OK &&
                         produced) {
-                        if (client_queue(
-                                item, KMX_MSG_AUDIO,
-                                message.data, message.size) != 0) {
-                            kmx_buffer_free(&message);
-                            client_release(item, count);
-                            continue;
-                        }
+                        client_queue_droppable(
+                            item, KMX_MSG_AUDIO,
+                            message.data, message.size, &blocks_dropped);
                     }
                     kmx_buffer_free(&message);
                 }
@@ -1054,7 +1080,7 @@ main(int argc, char **argv) {
                     bool produced = false;
                     if (item->fd < 0 || !item->motion) continue;
                     if (item->handshaking) continue;
-            if (require_token && !item->greeted) continue;
+                    if (require_token && !item->greeted) continue;
                     kmx_buffer_init(&message);
                     if (kmx_buffer_append(
                             &message, &(unsigned char){0}, 1) == KMX_OK &&
@@ -1062,13 +1088,9 @@ main(int argc, char **argv) {
                             item->motion, pixel.frame, pixel.width, pixel.height,
                             now_millis(), &message, &produced, NULL) == KMX_OK &&
                         produced) {
-                        if (client_queue(
-                                item, KMX_MSG_FRAME,
-                                message.data, message.size) != 0) {
-                            kmx_buffer_free(&message);
-                            client_release(item, count);
-                            continue;
-                        }
+                        client_queue_droppable(
+                            item, KMX_MSG_FRAME,
+                            message.data, message.size, &frames_dropped);
                     }
                     kmx_buffer_free(&message);
                 }
@@ -1221,6 +1243,11 @@ main(int argc, char **argv) {
         waitpid(audio_child, NULL, 0);
     }
     free(audio_block);
+    if (frames_dropped || blocks_dropped) {
+        fprintf(stderr,
+            "kmx-serve: dropped %zu video frame(s) and %zu audio block(s) that "
+            "did not fit a client's backlog\n", frames_dropped, blocks_dropped);
+    }
     if (accepts_refused) {
         fprintf(stderr, "kmx-serve: refused %lu connection(s) to the rate limit\n",
                 accepts_refused);
