@@ -1498,6 +1498,87 @@ test_audio_sink_rejects_malformed_input(void) {
     kmx_buffer_free(&message);
 }
 
+/* Pacing follows the measured round trip: there is no point producing
+ * messages faster than the far end can acknowledge them. */
+static void
+test_pacing_follows_the_round_trip(void) {
+    kmx_sync *sync;
+    kmx_buffer message;
+    kmx_sync_info info;
+    bool produced = false;
+    uint64_t clock = 1000;
+    int step;
+
+    CHECK(kmx_sync_create(&sync, 12, 40) == KMX_OK);
+    CHECK(kmx_sync_rtt_millis(sync) == 0);
+    CHECK(kmx_sync_interval_millis(sync) == KMX_SEND_INTERVAL_MIN_MS);
+
+    /* A slow link: every acknowledgement comes back 400 ms later. */
+    for (step = 0; step < 12; step++) {
+        char text[32];
+        snprintf(text, sizeof text, "step %d ", step);
+        CHECK(kmx_sync_feed(sync, text, strlen(text)) == KMX_OK);
+        kmx_buffer_init(&message);
+        clock += KMX_SEND_INTERVAL_MAX_MS;
+        CHECK(kmx_sync_poll(sync, clock, &message, &produced, &info) == KMX_OK);
+        if (produced) {
+            CHECK(kmx_sync_ack_at(sync, info.sequence, clock + 400) == KMX_OK);
+        }
+        kmx_buffer_free(&message);
+    }
+    /* The estimate converges on the truth, and the interval on half of it. */
+    CHECK(kmx_sync_rtt_millis(sync) > 300);
+    CHECK(kmx_sync_rtt_millis(sync) <= 400);
+    CHECK(kmx_sync_interval_millis(sync) > KMX_SEND_INTERVAL_MIN_MS);
+    /* Never outside the bounds, however slow the link. */
+    CHECK(kmx_sync_interval_millis(sync) <= KMX_SEND_INTERVAL_MAX_MS);
+    CHECK(kmx_sync_throughput(sync) > 0);
+    kmx_sync_free(sync);
+
+    /* A caller that pinned the interval is not second-guessed. */
+    CHECK(kmx_sync_create(&sync, 12, 40) == KMX_OK);
+    kmx_sync_set_interval(sync, 60);
+    clock = 1000;
+    for (step = 0; step < 6; step++) {
+        CHECK(kmx_sync_feed(sync, "x", 1) == KMX_OK);
+        kmx_buffer_init(&message);
+        clock += KMX_SEND_INTERVAL_MAX_MS;
+        CHECK(kmx_sync_poll(sync, clock, &message, &produced, &info) == KMX_OK);
+        if (produced) {
+            CHECK(kmx_sync_ack_at(sync, info.sequence, clock + 900) == KMX_OK);
+        }
+        kmx_buffer_free(&message);
+    }
+    CHECK(kmx_sync_rtt_millis(sync) > 0);
+    CHECK(kmx_sync_interval_millis(sync) == 60);
+    kmx_sync_free(sync);
+}
+
+/* A fast link should not be slowed down by the same machinery. */
+static void
+test_pacing_stays_quick_on_a_fast_link(void) {
+    kmx_sync *sync;
+    kmx_buffer message;
+    kmx_sync_info info;
+    bool produced = false;
+    uint64_t clock = 1000;
+    int step;
+
+    CHECK(kmx_sync_create(&sync, 12, 40) == KMX_OK);
+    for (step = 0; step < 10; step++) {
+        CHECK(kmx_sync_feed(sync, "y", 1) == KMX_OK);
+        kmx_buffer_init(&message);
+        clock += KMX_SEND_INTERVAL_MAX_MS;
+        CHECK(kmx_sync_poll(sync, clock, &message, &produced, &info) == KMX_OK);
+        if (produced) {
+            CHECK(kmx_sync_ack_at(sync, info.sequence, clock + 2) == KMX_OK);
+        }
+        kmx_buffer_free(&message);
+    }
+    CHECK(kmx_sync_interval_millis(sync) == KMX_SEND_INTERVAL_MIN_MS);
+    kmx_sync_free(sync);
+}
+
 int
 main(void) {
     RUN(test_grid_basics);
@@ -1542,6 +1623,8 @@ main(void) {
     RUN(test_audio_reports_gaps);
     RUN(test_audio_drops_rather_than_buffers);
     RUN(test_audio_sink_rejects_malformed_input);
+    RUN(test_pacing_follows_the_round_trip);
+    RUN(test_pacing_stays_quick_on_a_fast_link);
     puts("all kilix-multiplexer tests passed");
     return 0;
 }

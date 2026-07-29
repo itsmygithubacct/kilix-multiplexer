@@ -214,8 +214,28 @@ kmx_result kmx_sync_poll(
  * lost message is superseded by the next one rather than retransmitted. */
 kmx_result kmx_sync_ack(kmx_sync *sync, uint64_t sequence);
 
-/* Set the interval between messages, clamped to the bounds above. */
+/* The same, with the arrival time, which is what makes the round trip
+ * measurable.  Callers that have a clock should prefer this. */
+kmx_result kmx_sync_ack_at(kmx_sync *sync, uint64_t sequence, uint64_t now_millis);
+
+/* Pin the interval between messages, clamped to the bounds above.  Doing so
+ * turns off the automatic pacing below: a caller that has said what it wants
+ * is not second-guessed. */
 void kmx_sync_set_interval(kmx_sync *sync, unsigned millis);
+
+/* Round-trip time as measured from acknowledgements, in milliseconds, or 0
+ * before the first one arrives.
+ *
+ * Unless the interval has been pinned, this drives it: there is no point
+ * producing messages faster than the far end can acknowledge them, and on a
+ * slow link that only builds a backlog of screens that are already stale.  The
+ * interval follows the smoothed round trip, clamped to the bounds above. */
+unsigned kmx_sync_rtt_millis(const kmx_sync *sync);
+unsigned kmx_sync_interval_millis(const kmx_sync *sync);
+
+/* Bytes per second the far end has been shown to absorb, or 0 before there is
+ * enough evidence.  Intended as the budget the motion plane spends. */
+uint32_t kmx_sync_throughput(const kmx_sync *sync);
 
 /* Forget what the receiver is believed to hold, so the next message is a full
  * screen.  This is what a newly attached client needs: it holds nothing, but

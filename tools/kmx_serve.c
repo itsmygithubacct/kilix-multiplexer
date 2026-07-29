@@ -465,7 +465,11 @@ main(int argc, char **argv) {
                     for (position = 1; position < 9; position++) {
                         sequence = (sequence << 8) | payload[position];
                     }
-                    if (pane_id < count) kmx_sync_ack(item->sync[pane_id], sequence);
+                    /* With the arrival time, so the round trip is
+                     * measurable and the send interval can follow it. */
+                    if (pane_id < count) {
+                        kmx_sync_ack_at(item->sync[pane_id], sequence, now_millis());
+                    }
                 }
                 kmx_framer_consume(&item->framer);
             }

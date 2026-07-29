@@ -139,6 +139,8 @@ kmx_decompress(const void *data, size_t size, kmx_buffer *out) {
 typedef struct {
     uint64_t sequence;
     kmx_grid state;
+    uint64_t sent_at;
+    size_t wire_bytes;
     bool used;
 } sent_state;
 
@@ -152,6 +154,10 @@ struct kmx_sync {
     uint64_t next_sequence;
     uint64_t last_send_millis;
     unsigned interval_millis;
+    bool interval_pinned;
+    unsigned smoothed_rtt;
+    uint64_t acked_bytes;
+    uint64_t acked_span;
 };
 
 static kmx_result
@@ -231,6 +237,23 @@ kmx_sync_set_interval(kmx_sync *sync, unsigned millis) {
     if (millis < KMX_SEND_INTERVAL_MIN_MS) millis = KMX_SEND_INTERVAL_MIN_MS;
     if (millis > KMX_SEND_INTERVAL_MAX_MS) millis = KMX_SEND_INTERVAL_MAX_MS;
     sync->interval_millis = millis;
+    sync->interval_pinned = true;
+}
+
+unsigned
+kmx_sync_rtt_millis(const kmx_sync *sync) {
+    return sync ? sync->smoothed_rtt : 0;
+}
+
+unsigned
+kmx_sync_interval_millis(const kmx_sync *sync) {
+    return sync ? sync->interval_millis : 0;
+}
+
+uint32_t
+kmx_sync_throughput(const kmx_sync *sync) {
+    if (!sync || !sync->acked_span || !sync->acked_bytes) return 0;
+    return (uint32_t)((sync->acked_bytes * 1000u) / sync->acked_span);
 }
 
 void
@@ -317,6 +340,8 @@ kmx_sync_poll(
         return result;
     }
     slot->sequence = sequence;
+    slot->sent_at = now_millis;
+    slot->wire_bytes = out->size;
     slot->used = true;
 
     sync->last_send_millis = now_millis ? now_millis : 1;
@@ -331,8 +356,41 @@ kmx_sync_poll(
     return KMX_OK;
 }
 
+/* Fold a round-trip sample into the smoothed estimate and, unless the caller
+ * pinned it, into the send interval.
+ *
+ * There is no point producing messages faster than the far end can
+ * acknowledge them: on a slow link that only builds a backlog of screens that
+ * are already stale by the time they arrive.  Half the round trip is the
+ * useful rate - a message in flight each way - clamped to the bounds this
+ * plane will accept.
+ *
+ * The weighting is the usual 7/8 smoothing: one slow sample should nudge the
+ * estimate, not seize it. */
+static void
+observe_round_trip(kmx_sync *sync, uint64_t sample, size_t bytes) {
+    if (sample > 60000u) return; /* a clock jump, not a round trip */
+    sync->smoothed_rtt = sync->smoothed_rtt
+        ? (unsigned)((sync->smoothed_rtt * 7u + sample) / 8u)
+        : (unsigned)sample;
+    sync->acked_bytes += bytes;
+    sync->acked_span += sample ? sample : 1u;
+    if (sync->interval_pinned) return;
+    {
+        unsigned wanted = sync->smoothed_rtt / 2u;
+        if (wanted < KMX_SEND_INTERVAL_MIN_MS) wanted = KMX_SEND_INTERVAL_MIN_MS;
+        if (wanted > KMX_SEND_INTERVAL_MAX_MS) wanted = KMX_SEND_INTERVAL_MAX_MS;
+        sync->interval_millis = wanted;
+    }
+}
+
 kmx_result
 kmx_sync_ack(kmx_sync *sync, uint64_t sequence) {
+    return kmx_sync_ack_at(sync, sequence, 0);
+}
+
+kmx_result
+kmx_sync_ack_at(kmx_sync *sync, uint64_t sequence, uint64_t now_millis) {
     sent_state *slot;
     if (!sync) return KMX_ERR_INVALID;
     if (sequence == 0 || sequence >= sync->next_sequence) return KMX_ERR_INVALID;
@@ -341,6 +399,9 @@ kmx_sync_ack(kmx_sync *sync, uint64_t sequence) {
      * error; the baseline simply stays where it is and the next message is a
      * larger diff. */
     if (!slot->used || slot->sequence != sequence) return KMX_OK;
+    if (now_millis && now_millis >= slot->sent_at) {
+        observe_round_trip(sync, now_millis - slot->sent_at, slot->wire_bytes);
+    }
     if (kmx_grid_copy(&sync->acked, &slot->state) != KMX_OK) return KMX_ERR_MEMORY;
     sync->acked_valid = true;
     return KMX_OK;
