@@ -1168,6 +1168,198 @@ test_repeated_image_costs_a_reference(void) {
     kmx_term_free(term);
 }
 
+/* ---- motion plane ------------------------------------------------------ */
+
+/* Noise rather than a gradient.  A gradient compresses almost to nothing, so
+ * a keyframe of one would be tiny and comparing a delta against it would prove
+ * nothing.  Real screen content is somewhere between the two; noise is the
+ * harsher end and makes the comparison meaningful. */
+static void
+fill_frame(unsigned char *frame, int width, int height, unsigned char seed) {
+    int index;
+    rng_state = 0x2545f4914f6cdd1dull ^ ((uint64_t)seed << 32) ^ (uint64_t)seed;
+    for (index = 0; index < width * height * 3; index++) {
+        frame[index] = (unsigned char)next_random();
+    }
+}
+
+/* Offer a frame and, when something is produced, apply it to the sink. */
+static bool
+motion_step(
+    kmx_motion *motion,
+    kmx_motion_sink *sink,
+    const unsigned char *frame,
+    int width,
+    int height,
+    uint64_t clock,
+    kmx_motion_info *info
+) {
+    kmx_buffer message;
+    bool produced = false;
+    kmx_buffer_init(&message);
+    CHECK(kmx_motion_offer(
+        motion, frame, width, height, clock, &message, &produced, info) == KMX_OK);
+    if (produced) {
+        CHECK(kmx_motion_sink_apply(sink, message.data, message.size) == KMX_OK);
+    }
+    kmx_buffer_free(&message);
+    return produced;
+}
+
+static void
+test_motion_roundtrip_and_deltas(void) {
+    /* Tall enough that one changed band is a small fraction of the screen,
+     * which is the case a delta exists for. */
+    enum { WIDTH = 64, HEIGHT = 160 };
+    static unsigned char frame[WIDTH * HEIGHT * 3];
+    kmx_motion *motion;
+    kmx_motion_sink *sink;
+    kmx_motion_info info;
+    size_t keyframe_bytes;
+    int width = 0;
+    int height = 0;
+
+    CHECK(kmx_motion_create(&motion, 0) == KMX_OK);
+    CHECK(kmx_motion_sink_create(&sink) == KMX_OK);
+
+    /* The first frame has to be whole: the far end holds nothing. */
+    fill_frame(frame, WIDTH, HEIGHT, 0);
+    CHECK(motion_step(motion, sink, frame, WIDTH, HEIGHT, 0, &info));
+    CHECK(info.keyframe);
+    keyframe_bytes = info.wire_bytes;
+    CHECK(memcmp(kmx_motion_sink_pixels(sink, &width, &height), frame,
+                 sizeof frame) == 0);
+    CHECK(width == WIDTH && height == HEIGHT);
+
+    /* An unchanged frame costs nothing at all, exactly like an idle
+     * terminal. */
+    CHECK(!motion_step(motion, sink, frame, WIDTH, HEIGHT, 100, &info));
+
+    /* A change in one band sends that band, not the screen. */
+    memset(frame + 3 * WIDTH * 3, 0xAB, (size_t)WIDTH * 3);
+    CHECK(motion_step(motion, sink, frame, WIDTH, HEIGHT, 200, &info));
+    CHECK(!info.keyframe);
+    CHECK(info.rects == 1);
+    CHECK(info.wire_bytes * 4 < keyframe_bytes);
+    CHECK(memcmp(kmx_motion_sink_pixels(sink, NULL, NULL), frame,
+                 sizeof frame) == 0);
+
+    /* A change everywhere costs about a whole frame, and still lands
+     * exactly. */
+    fill_frame(frame, WIDTH, HEIGHT, 99);
+    CHECK(motion_step(motion, sink, frame, WIDTH, HEIGHT, 300, &info));
+    CHECK(info.rects > 1);
+    CHECK(memcmp(kmx_motion_sink_pixels(sink, NULL, NULL), frame,
+                 sizeof frame) == 0);
+
+    kmx_motion_sink_free(sink);
+    kmx_motion_free(motion);
+}
+
+static void
+test_motion_resize_forces_a_keyframe(void) {
+    enum { BIG = 40 };
+    static unsigned char frame[BIG * BIG * 3];
+    kmx_motion *motion;
+    kmx_motion_sink *sink;
+    kmx_motion_info info;
+    int width = 0;
+    int height = 0;
+
+    CHECK(kmx_motion_create(&motion, 0) == KMX_OK);
+    CHECK(kmx_motion_sink_create(&sink) == KMX_OK);
+    fill_frame(frame, BIG, BIG, 1);
+    CHECK(motion_step(motion, sink, frame, BIG, BIG, 0, &info));
+    CHECK(info.keyframe);
+    /* A different size cannot be described as a difference from the old one. */
+    fill_frame(frame, BIG / 2, BIG, 2);
+    CHECK(motion_step(motion, sink, frame, BIG / 2, BIG, 100, &info));
+    CHECK(info.keyframe);
+    CHECK(kmx_motion_sink_pixels(sink, &width, &height) != NULL);
+    CHECK(width == BIG / 2 && height == BIG);
+    kmx_motion_sink_free(sink);
+    kmx_motion_free(motion);
+}
+
+/* The plane that is allowed to drop.  A budget that is spent means this frame
+ * is discarded, not queued: by the time there is room a newer frame exists. */
+static void
+test_motion_drops_rather_than_queues(void) {
+    enum { WIDTH = 64, HEIGHT = 64 };
+    static unsigned char frame[WIDTH * HEIGHT * 3];
+    kmx_motion *motion;
+    kmx_motion_sink *sink;
+    kmx_motion_info info;
+    int step;
+    int sent = 0;
+
+    /* A ceiling far below what these frames need. */
+    CHECK(kmx_motion_create(&motion, 4096) == KMX_OK);
+    CHECK(kmx_motion_sink_create(&sink) == KMX_OK);
+    for (step = 0; step < 20; step++) {
+        fill_frame(frame, WIDTH, HEIGHT, (unsigned char)step);
+        /* All inside one second, so the allowance does not refill. */
+        if (motion_step(motion, sink, frame, WIDTH, HEIGHT, 10, &info)) sent++;
+    }
+    CHECK(sent >= 1);
+    CHECK(sent < 20);
+    CHECK(kmx_motion_dropped(motion) > 0);
+
+    /* A later second refills the allowance, and what arrives is the frame as
+     * it is now - not the backlog. */
+    fill_frame(frame, WIDTH, HEIGHT, 200);
+    CHECK(motion_step(motion, sink, frame, WIDTH, HEIGHT, 5000, &info));
+    CHECK(memcmp(kmx_motion_sink_pixels(sink, NULL, NULL), frame,
+                 sizeof frame) == 0);
+
+    kmx_motion_sink_free(sink);
+    kmx_motion_free(motion);
+}
+
+static void
+test_motion_sink_rejects_malformed_input(void) {
+    enum { WIDTH = 32, HEIGHT = 16 };
+    static unsigned char frame[WIDTH * HEIGHT * 3];
+    kmx_motion *motion;
+    kmx_motion_sink *sink;
+    kmx_buffer message;
+    bool produced = false;
+    size_t index;
+
+    CHECK(kmx_motion_create(&motion, 0) == KMX_OK);
+    CHECK(kmx_motion_sink_create(&sink) == KMX_OK);
+    fill_frame(frame, WIDTH, HEIGHT, 7);
+    kmx_buffer_init(&message);
+    CHECK(kmx_motion_offer(
+        motion, frame, WIDTH, HEIGHT, 0, &message, &produced, NULL) == KMX_OK);
+    CHECK(produced);
+
+    for (index = 0; index < message.size; index++) {
+        kmx_motion_sink *scratch;
+        CHECK(kmx_motion_sink_create(&scratch) == KMX_OK);
+        CHECK(kmx_motion_sink_apply(scratch, message.data, index) != KMX_OK);
+        kmx_motion_sink_free(scratch);
+    }
+    /* A delta with nothing to apply it to is refused rather than guessed. */
+    {
+        kmx_motion_sink *scratch;
+        kmx_buffer delta;
+        kmx_motion_info info;
+        memset(frame, 0x5a, sizeof frame);
+        kmx_buffer_init(&delta);
+        CHECK(kmx_motion_offer(
+            motion, frame, WIDTH, HEIGHT, 100, &delta, &produced, &info) == KMX_OK);
+        CHECK(produced && !info.keyframe);
+        CHECK(kmx_motion_sink_create(&scratch) == KMX_OK);
+        CHECK(kmx_motion_sink_apply(scratch, delta.data, delta.size) == KMX_ERR_PROTOCOL);
+        kmx_motion_sink_free(scratch);
+        kmx_buffer_free(&delta);
+    }
+    kmx_buffer_free(&message);
+    kmx_motion_sink_free(sink);
+    kmx_motion_free(motion);
+}
+
 int
 main(void) {
     RUN(test_grid_basics);
@@ -1204,6 +1396,10 @@ main(void) {
     RUN(test_image_cache_respects_the_byte_budget);
     RUN(test_image_message_roundtrip);
     RUN(test_repeated_image_costs_a_reference);
+    RUN(test_motion_roundtrip_and_deltas);
+    RUN(test_motion_resize_forces_a_keyframe);
+    RUN(test_motion_drops_rather_than_queues);
+    RUN(test_motion_sink_rejects_malformed_input);
     puts("all kilix-multiplexer tests passed");
     return 0;
 }

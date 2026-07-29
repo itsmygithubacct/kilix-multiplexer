@@ -402,6 +402,70 @@ kmx_result kmx_image_decode(
     kmx_image_message *message
 );
 
+/* ---- motion plane ------------------------------------------------------ */
+
+/* A pane whose content is pixels rather than cells: a browser, a GUI app, a
+ * desktop.  Kilix knows which panes these are because it launched them, so
+ * unlike a pixel protocol this plane never has to *detect* video - it is told.
+ *
+ * This is the one plane allowed to drop.  Frames are offered; what is sent is
+ * whatever the rate allowance permits, and a frame that does not fit is
+ * discarded rather than queued, because the next one supersedes it anyway.
+ *
+ * The codec here is lossless rectangles.  That is the right default for
+ * screen content and it keeps the plane free of an encoder dependency; a lossy
+ * or inter-frame codec can be added later as another choice without changing
+ * the plane's shape. */
+
+#define KMX_MOTION_MAX_RECTS 64
+
+typedef struct kmx_motion kmx_motion;
+
+typedef struct {
+    bool keyframe;
+    size_t rects;
+    size_t wire_bytes;
+    size_t pixel_bytes;   /* what an uncompressed full frame would have cost */
+} kmx_motion_info;
+
+/* `bytes_per_second` is the ceiling this pane may occupy.  Zero means no
+ * limit, which is only sensible on a local socket. */
+kmx_result kmx_motion_create(kmx_motion **out, uint32_t bytes_per_second);
+void kmx_motion_free(kmx_motion *motion);
+
+/* Offer a frame.  `produced` is false when nothing changed, or when the rate
+ * allowance is spent - which is a drop, not an error. */
+kmx_result kmx_motion_offer(
+    kmx_motion *motion,
+    const void *rgb,
+    int width,
+    int height,
+    uint64_t now_millis,
+    kmx_buffer *out,
+    bool *produced,
+    kmx_motion_info *info
+);
+
+/* Force the next frame to be a keyframe: after a resize, or for a client that
+ * has just attached and holds nothing. */
+void kmx_motion_invalidate(kmx_motion *motion);
+size_t kmx_motion_dropped(const kmx_motion *motion);
+
+typedef struct kmx_motion_sink kmx_motion_sink;
+
+kmx_result kmx_motion_sink_create(kmx_motion_sink **out);
+void kmx_motion_sink_free(kmx_motion_sink *sink);
+kmx_result kmx_motion_sink_apply(
+    kmx_motion_sink *sink,
+    const void *data,
+    size_t size
+);
+const unsigned char *kmx_motion_sink_pixels(
+    const kmx_motion_sink *sink,
+    int *width,
+    int *height
+);
+
 /* ---- client-side rendering --------------------------------------------- */
 
 /* Turns a received grid into terminal output, emitting only what changed
