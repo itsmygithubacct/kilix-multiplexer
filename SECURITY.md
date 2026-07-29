@@ -1,7 +1,10 @@
 # Security review
 
 Status: reviewed 2026-07-28 against the tree at that date
-Scope: `kilix-multiplexer` only. `kitty-pty-broker` has its own posture.
+Scope: `kilix-multiplexer` only. The broker's read-only observers are argued
+separately in `kitty-pty-broker/SECURITY.md`, which matters here because the
+multiplexer attaches as one: a bug in this program should not become control
+of the shell.
 
 This is a program that puts a shell on a socket. The review below is written
 to be argued with: each claim says what enforces it and where, so a reader can
