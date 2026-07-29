@@ -17,7 +17,16 @@ static const char *current_test = "(startup)";
     } \
 } while (0)
 
-#define RUN(test) do { current_test = #test; test(); } while (0)
+/* KMX_TEST_VERBOSE=1 names each test as it starts, so a hang is attributable
+ * without reaching for a debugger. */
+#define RUN(test) do { \
+    current_test = #test; \
+    if (getenv("KMX_TEST_VERBOSE")) { \
+        fprintf(stderr, "run %s\n", current_test); \
+        fflush(stderr); \
+    } \
+    test(); \
+} while (0)
 
 /* Deterministic, so a failure is reproducible without a recorded seed. */
 static uint64_t rng_state = 0x9e3779b97f4a7c15ull;
@@ -951,6 +960,214 @@ test_layout_composites_panes_and_chrome(void) {
     kmx_grid_free(&screen);
 }
 
+/* ---- still-graphics plane ---------------------------------------------- */
+
+static void
+test_image_keys_address_content(void) {
+    kmx_image_key a = kmx_image_key_of("hello", 5);
+    kmx_image_key b = kmx_image_key_of("hello", 5);
+    kmx_image_key c = kmx_image_key_of("hellp", 5);
+    kmx_image_key d = kmx_image_key_of("hello", 4);
+    CHECK(kmx_image_key_equal(&a, &b));
+    CHECK(!kmx_image_key_equal(&a, &c));
+    /* Length is part of the identity, so a prefix is not the same image. */
+    CHECK(!kmx_image_key_equal(&a, &d));
+}
+
+/* Distinct payloads must not collide in practice; a collision here would mean
+ * showing the wrong picture. */
+static void
+test_image_keys_do_not_collide(void) {
+    static kmx_image_key keys[4096];
+    size_t index;
+    size_t other;
+    for (index = 0; index < 4096; index++) {
+        char payload[64];
+        int written = snprintf(
+            payload, sizeof payload, "Gi=%zu,a=T;payload-%zu-%zu",
+            index, index * 7919, index ^ 0x5a5a);
+        keys[index] = kmx_image_key_of(payload, (size_t)written);
+    }
+    for (index = 0; index < 4096; index++) {
+        for (other = index + 1; other < 4096; other++) {
+            CHECK(!kmx_image_key_equal(&keys[index], &keys[other]));
+        }
+    }
+}
+
+static void
+test_image_cache_bounds_and_eviction(void) {
+    kmx_image_cache *cache;
+    kmx_image_key first;
+    kmx_image_key second;
+    kmx_image_key third;
+    size_t size = 0;
+
+    CHECK(kmx_image_cache_create(&cache, 2, 1024) == KMX_OK);
+    first = kmx_image_key_of("aaa", 3);
+    second = kmx_image_key_of("bbb", 3);
+    third = kmx_image_key_of("ccc", 3);
+
+    CHECK(kmx_image_cache_put(cache, &first, "aaa", 3) == KMX_OK);
+    CHECK(kmx_image_cache_put(cache, &second, "bbb", 3) == KMX_OK);
+    CHECK(kmx_image_cache_count(cache) == 2);
+    CHECK(kmx_image_cache_bytes(cache) == 6);
+    CHECK(kmx_image_cache_has(cache, &first));
+    CHECK(memcmp(kmx_image_cache_get(cache, &first, &size), "aaa", 3) == 0);
+    CHECK(size == 3);
+
+    /* Touching `first` on read makes `second` the least recently wanted, so
+     * that is what a third entry displaces. */
+    CHECK(kmx_image_cache_put(cache, &third, "ccc", 3) == KMX_OK);
+    CHECK(kmx_image_cache_count(cache) == 2);
+    CHECK(kmx_image_cache_has(cache, &first));
+    CHECK(kmx_image_cache_has(cache, &third));
+    CHECK(!kmx_image_cache_has(cache, &second));
+
+    /* Storing the same image twice is a no-op, not a second copy. */
+    CHECK(kmx_image_cache_put(cache, &first, "aaa", 3) == KMX_OK);
+    CHECK(kmx_image_cache_count(cache) == 2);
+
+    /* An image larger than the whole budget is refused rather than evicting
+     * everything to make room for something that still would not fit. */
+    {
+        static unsigned char huge[2048];
+        kmx_image_key key = kmx_image_key_of(huge, sizeof huge);
+        CHECK(kmx_image_cache_put(cache, &key, huge, sizeof huge) == KMX_ERR_LIMIT);
+        CHECK(kmx_image_cache_count(cache) == 2);
+    }
+    kmx_image_cache_free(cache);
+    CHECK(kmx_image_cache_create(&cache, 0, 1024) == KMX_ERR_INVALID);
+}
+
+/* A byte budget is honoured even when the entry count is not the constraint. */
+static void
+test_image_cache_respects_the_byte_budget(void) {
+    kmx_image_cache *cache;
+    static unsigned char payload[400];
+    int index;
+    CHECK(kmx_image_cache_create(&cache, 64, 1000) == KMX_OK);
+    for (index = 0; index < 10; index++) {
+        kmx_image_key key;
+        memset(payload, 'a' + index, sizeof payload);
+        key = kmx_image_key_of(payload, sizeof payload);
+        CHECK(kmx_image_cache_put(cache, &key, payload, sizeof payload) == KMX_OK);
+        CHECK(kmx_image_cache_bytes(cache) <= 1000);
+    }
+    CHECK(kmx_image_cache_count(cache) == 2);
+    kmx_image_cache_free(cache);
+}
+
+static void
+test_image_message_roundtrip(void) {
+    kmx_buffer wire;
+    kmx_image_message message;
+    kmx_image_key key = kmx_image_key_of("Gi=1,a=T;PIXELS", 15);
+    size_t index;
+
+    /* A transfer. */
+    kmx_buffer_init(&wire);
+    CHECK(kmx_image_encode(2, &key, "Gi=1,a=T;PIXELS", 15, &wire) == KMX_OK);
+    CHECK(kmx_image_decode(wire.data, wire.size, &message) == KMX_OK);
+    CHECK(message.pane == 2);
+    CHECK(kmx_image_key_equal(&message.key, &key));
+    CHECK(message.has_data);
+    CHECK(message.size == 15);
+    CHECK(memcmp(message.data, "Gi=1,a=T;PIXELS", 15) == 0);
+
+    /* A reference: the same picture, at a fraction of the size. */
+    {
+        kmx_buffer reference;
+        kmx_buffer_init(&reference);
+        CHECK(kmx_image_encode(2, &key, NULL, 0, &reference) == KMX_OK);
+        CHECK(reference.size < wire.size);
+        CHECK(reference.size <= KMX_IMAGE_KEY_BYTES + 4);
+        CHECK(kmx_image_decode(reference.data, reference.size, &message) == KMX_OK);
+        CHECK(!message.has_data);
+        CHECK(kmx_image_key_equal(&message.key, &key));
+        kmx_buffer_free(&reference);
+    }
+
+    /* Malformed input is rejected, never guessed at. */
+    for (index = 0; index < wire.size; index++) {
+        CHECK(kmx_image_decode(wire.data, index, &message) != KMX_OK);
+    }
+    CHECK(kmx_buffer_append(&wire, "\0", 1) == KMX_OK);
+    CHECK(kmx_image_decode(wire.data, wire.size, &message) != KMX_OK);
+    kmx_buffer_free(&wire);
+}
+
+/* The plane's whole point: a picture that appears twice is transferred once.
+ * This is what a byte-forwarding multiplexer cannot do, because it only sees
+ * the escape sequence go past. */
+static void
+test_repeated_image_costs_a_reference(void) {
+    kmx_term *term;
+    kmx_image_cache *client;
+    kmx_grid grid;
+    size_t transferred = 0;
+    size_t referenced = 0;
+    size_t bytes_first = 0;
+    size_t bytes_again = 0;
+    int round;
+
+    CHECK(kmx_term_create(&term, 10, 40) == KMX_OK);
+    CHECK(kmx_grid_init(&grid, 10, 40) == KMX_OK);
+    CHECK(kmx_image_cache_create(&client, 16, 1024 * 1024) == KMX_OK);
+
+    for (round = 0; round < 3; round++) {
+        static char payload[4096];
+        char stream[4200];
+        size_t index;
+        size_t events;
+        int written;
+        for (index = 0; index < sizeof payload - 1; index++) {
+            payload[index] = (char)('A' + (index % 26));
+        }
+        payload[sizeof payload - 1] = '\0';
+        written = snprintf(stream, sizeof stream, "\033_Gi=3,a=T;%s\033\\", payload);
+        CHECK(written > 0);
+        kmx_term_graphics_clear(term);
+        CHECK(kmx_term_feed(term, stream, (size_t)written) == KMX_OK);
+        CHECK(kmx_term_snapshot(term, &grid) == KMX_OK);
+
+        events = kmx_term_graphics_count(term);
+        CHECK(events == 1);
+        for (index = 0; index < events; index++) {
+            const kmx_graphics_event *event = kmx_term_graphics_at(term, index);
+            kmx_image_key key =
+                kmx_image_key_of(event->payload.data, event->payload.size);
+            kmx_buffer message;
+            kmx_buffer_init(&message);
+            if (kmx_image_cache_has(client, &key)) {
+                CHECK(kmx_image_encode(0, &key, NULL, 0, &message) == KMX_OK);
+                referenced++;
+                bytes_again += message.size;
+            } else {
+                CHECK(kmx_image_encode(
+                    0, &key, event->payload.data, event->payload.size,
+                    &message) == KMX_OK);
+                CHECK(kmx_image_cache_put(
+                    client, &key, event->payload.data,
+                    event->payload.size) == KMX_OK);
+                transferred++;
+                bytes_first += message.size;
+            }
+            kmx_buffer_free(&message);
+        }
+    }
+
+    CHECK(transferred == 1);
+    CHECK(referenced == 2);
+    /* Four kilobytes the first time, a couple of dozen bytes each time after. */
+    CHECK(bytes_first > 4000);
+    CHECK(bytes_again < 64);
+
+    kmx_image_cache_free(client);
+    kmx_grid_free(&grid);
+    kmx_term_free(term);
+}
+
 int
 main(void) {
     RUN(test_grid_basics);
@@ -981,6 +1198,12 @@ main(void) {
     RUN(test_layout_roundtrip);
     RUN(test_layout_rejects_impossible_geometry);
     RUN(test_layout_composites_panes_and_chrome);
+    RUN(test_image_keys_address_content);
+    RUN(test_image_keys_do_not_collide);
+    RUN(test_image_cache_bounds_and_eviction);
+    RUN(test_image_cache_respects_the_byte_budget);
+    RUN(test_image_message_roundtrip);
+    RUN(test_repeated_image_costs_a_reference);
     puts("all kilix-multiplexer tests passed");
     return 0;
 }

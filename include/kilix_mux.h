@@ -242,7 +242,8 @@ typedef enum {
     KMX_MSG_ACK = 5,     /* client -> server: sequence received            */
     KMX_MSG_EXIT = 6,    /* server -> client: the session ended            */
     KMX_MSG_LAYOUT = 7,  /* server -> client: the layout plane             */
-    KMX_MSG_FOCUS = 8    /* client -> server: focus a pane                 */
+    KMX_MSG_FOCUS = 8,   /* client -> server: focus a pane                 */
+    KMX_MSG_IMAGE = 9    /* server -> client: the still-graphics plane     */
 } kmx_message_type;
 
 /* The largest single message accepted from a peer.  A length prefix is an
@@ -320,6 +321,75 @@ kmx_result kmx_layout_composite(
     const kmx_grid *const *panes,
     size_t pane_count,
     kmx_grid *out
+);
+
+/* ---- still-graphics plane ---------------------------------------------- */
+
+/* Images are addressed by their content, not by when they were sent.  A
+ * redraw, a reattach, or the same image appearing twice all become a
+ * reference to something the client already holds - which is the difference
+ * between a photograph costing once and costing every time the screen
+ * repaints.
+ *
+ * The key is a non-cryptographic 128-bit hash.  It is defending against
+ * coincidence, not against an adversary choosing a collision: both ends of
+ * this connection are the same user. */
+#define KMX_IMAGE_KEY_BYTES 16
+
+typedef struct {
+    unsigned char bytes[KMX_IMAGE_KEY_BYTES];
+} kmx_image_key;
+
+kmx_image_key kmx_image_key_of(const void *data, size_t size);
+bool kmx_image_key_equal(const kmx_image_key *a, const kmx_image_key *b);
+
+typedef struct kmx_image_cache kmx_image_cache;
+
+/* Bounded in both entries and bytes: an image cache that grows without limit
+ * is a way for a pane to exhaust memory at both ends. */
+kmx_result kmx_image_cache_create(
+    kmx_image_cache **out,
+    size_t max_entries,
+    size_t max_bytes
+);
+void kmx_image_cache_free(kmx_image_cache *cache);
+bool kmx_image_cache_has(const kmx_image_cache *cache, const kmx_image_key *key);
+kmx_result kmx_image_cache_put(
+    kmx_image_cache *cache,
+    const kmx_image_key *key,
+    const void *data,
+    size_t size
+);
+const unsigned char *kmx_image_cache_get(
+    const kmx_image_cache *cache,
+    const kmx_image_key *key,
+    size_t *size
+);
+size_t kmx_image_cache_count(const kmx_image_cache *cache);
+size_t kmx_image_cache_bytes(const kmx_image_cache *cache);
+
+/* Wire form of one image event.  `data` may be NULL, which encodes a
+ * reference to an image the client is known to hold already. */
+kmx_result kmx_image_encode(
+    uint32_t pane,
+    const kmx_image_key *key,
+    const void *data,
+    size_t size,
+    kmx_buffer *out
+);
+
+typedef struct {
+    uint32_t pane;
+    kmx_image_key key;
+    bool has_data;
+    const unsigned char *data;
+    size_t size;
+} kmx_image_message;
+
+kmx_result kmx_image_decode(
+    const void *wire,
+    size_t wire_size,
+    kmx_image_message *message
 );
 
 /* ---- client-side rendering --------------------------------------------- */
