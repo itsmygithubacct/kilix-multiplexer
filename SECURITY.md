@@ -172,4 +172,5 @@ Stated plainly rather than left to be discovered.
       allocation from the full value. Fixed, pinned by a regression test, and
       the other decoders audited for the same shape (they bound the 64-bit
       value first, which is the correct order)
+- [x] Re-soaked against the fix — 47.9M executions in 15 minutes, clean
 - [ ] A longer soak still, hours rather than minutes, before publication
