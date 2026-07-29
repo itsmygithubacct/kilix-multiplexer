@@ -40,9 +40,21 @@ On a Unix socket, the peer's credentials are checked with `SO_PEERCRED` and a
 peer whose uid differs from the server's is closed immediately
 (`tools/kmx_serve.c`, `peer_is_owner`). The socket itself is created `0600`.
 
-Over TCP there is no equivalent, and the code does not pretend otherwise: the
-credential check is applied where it means something rather than skipped
-silently everywhere. **Over TCP, the tunnel is the authentication.**
+Over TCP there is no equivalent, so a **token** is required instead. It is
+mandatory whenever the bound address is genuinely reachable, cannot be turned
+off, and is minted from `/dev/urandom` (128 bits, hex) unless one is supplied.
+The requirement follows the *address*, not the `--lan` flag: `--lan` on a
+loopback address reaches nobody new, and demanding a token there would be a
+requirement the operator never asked for.
+
+Comparison is constant-time (`token_matches`): a check that returns on the
+first wrong character tells an attacker how much of it was right. Refusal is
+silent — a peer that cannot present the token learns only that the connection
+closed — and **nothing at all is accepted before a valid greeting**.
+
+Asserted by `tests/integration.sh`: a token is minted, and attaching with
+none, with a wrong one, and with the right one give refusal, refusal, and a
+session. Verified across two machines over a real LAN with no tunnel.
 
 ### What a peer may do
 
@@ -92,14 +104,13 @@ is rejected and that trailing bytes are an error rather than ignored.
 
 Stated plainly rather than left to be discovered.
 
-1. **No authentication of its own.** Over TCP, anyone who can connect to the
-   port gets the session, with control rights unless they ask for less. The
-   loopback default plus SSH is the whole access-control story. `--lan`
-   therefore hands out a shell to the network segment. Kilix's own tiers mint a
-   token and TLS for this case (`config/stream.py`); this project has not
-   adopted that yet, and **must before it is exposed by default**.
-2. **No transport encryption.** Content crosses the network in the clear
-   without a tunnel. Over loopback that is fine; over `--lan` it is not.
+1. **No transport encryption.** Content crosses the network in the clear
+   without a tunnel. Over loopback that is fine; over a reachable address it
+   is not, and the server says so when it binds one. A token establishes *who*
+   may attach; it does nothing about *who may watch*. Kilix's own tiers add
+   TLS for this (`config/stream.py`) and this project has not; until it does,
+   a reachable bind is only appropriate on a segment you would already trust
+   with the terminal's contents.
 3. **No rate limit on connection attempts.** Eight client slots fill on a
    first-come basis, so a local process can occupy them.
 4. **The pixel pane runs a shell command** given on the server's own command
@@ -122,6 +133,7 @@ Stated plainly rather than left to be discovered.
 
 ## Before any public release
 
-- [ ] Adopt Kilix's token + TLS posture for the `--lan` path, or remove `--lan`
+- [x] Token authentication for reachable binds — done 2026-07-28
+- [ ] TLS, so a reachable bind is confidential as well as authenticated
 - [ ] Independent review of the LAN path
 - [ ] Extended fuzzing run against a seeded corpus, not just the default 30s

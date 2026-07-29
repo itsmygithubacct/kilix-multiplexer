@@ -35,7 +35,7 @@ report() {
 
 # Strip the escape sequences so assertions are about what a person would see.
 visible() {
-    sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g; s/\x1b[()][A-Z0-9]//g' "$1" | tr -d '\r'
+    sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g; s/\x1b[()][A-Z0-9]//g' "${1:--}" | tr -d '\r'
 }
 
 start_pane() {
@@ -433,6 +433,43 @@ if [ -S "$work/audio2.sock" ]; then
     fi
 else
     report fail "could not start the audio session"
+fi
+
+# --- a reachable socket demands a token ------------------------------------
+#
+# --lan hands the session to whoever can route to the port, so a token is
+# mandatory there and cannot be turned off.  Refusal is silent: a peer that
+# cannot present it learns only that the connection closed.
+tok_port=$(( port + 5 ))
+# A genuinely reachable address, since the requirement follows the address
+# rather than the flag.  Without one there is nothing to test here.
+host_ip=$(ip -4 addr show scope global 2>/dev/null |
+          grep -oE 'inet [0-9.]+' | awk '{print $2}' | head -1)
+if [ -z "$host_ip" ]; then
+    echo "skip  token checks (no non-loopback address)"
+    host_ip=""
+fi
+if [ -n "$host_ip" ]; then
+"$serve" --socket "$host_ip:$tok_port" --lan --rows 10 --cols 40 \
+    -- /bin/sh -c 'printf "TOKEN_PANE\r\n"; sleep 15' >"$work/token.log" 2>&1 &
+sleep 1.5
+minted=$(grep -oE -- '--token [0-9a-f]+' "$work/token.log" | awk '{print $2}' | head -1)
+if [ -n "$minted" ] && [ "${#minted}" -eq 32 ]; then
+    report pass "a token is minted for a reachable socket"
+else
+    report fail "a token is minted for a reachable socket"
+fi
+without=$(timeout 8 "$attach" --socket "$host_ip:$tok_port" --dump --seconds 2 2>&1 | visible /dev/stdin | grep -c TOKEN_PANE)
+wrong=$(timeout 8 "$attach" --socket "$host_ip:$tok_port" \
+    --token 0000000000000000000000000000dead --dump --seconds 2 2>&1 |
+    visible /dev/stdin | grep -c TOKEN_PANE)
+right=$(timeout 8 "$attach" --socket "$host_ip:$tok_port" \
+    --token "$minted" --dump --seconds 3 2>&1 | visible /dev/stdin | grep -c TOKEN_PANE)
+if [ "$without" -eq 0 ] && [ "$wrong" -eq 0 ] && [ "$right" -ge 1 ]; then
+    report pass "the token is required and checked"
+else
+    report fail "the token is required and checked (none=$without wrong=$wrong right=$right)"
+fi
 fi
 
 echo

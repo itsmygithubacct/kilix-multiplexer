@@ -43,6 +43,10 @@
 #define KMX_ROLE_CONTROL 0u
 #define KMX_ROLE_VIEW 1u
 
+/* 128 bits, hex encoded.  Long enough that guessing is not a strategy and
+ * short enough to paste. */
+#define KMX_TOKEN_HEX 32
+
 typedef struct {
     kmx_term *term;
     int master;
@@ -67,6 +71,7 @@ typedef struct {
 typedef struct {
     int fd;
     bool control;
+    bool greeted;
     kmx_motion *motion;   /* per client: what IT has been shown */
     kmx_audio *audio;     /* per client: its own rate allowance */
     int rows;
@@ -157,6 +162,50 @@ write_all(int fd, const void *data, size_t size) {
     return 0;
 }
 
+/* Compared in constant time: a token check that returns early on the first
+ * wrong character tells an attacker how much of it was right. */
+static bool
+token_matches(const char *expected, const char *offered, size_t offered_size) {
+    size_t index;
+    unsigned char difference = 0;
+    size_t expected_size = strlen(expected);
+    if (offered_size != expected_size) return false;
+    for (index = 0; index < expected_size; index++) {
+        difference |= (unsigned char)(expected[index] ^ offered[index]);
+    }
+    return difference == 0;
+}
+
+static bool
+mint_token(char *out, size_t size) {
+    static const char hex[] = "0123456789abcdef";
+    unsigned char raw[KMX_TOKEN_HEX / 2];
+    size_t index;
+    int fd;
+    if (size <= KMX_TOKEN_HEX) return false;
+    fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    {
+        size_t got = 0;
+        while (got < sizeof raw) {
+            ssize_t count = read(fd, raw + got, sizeof raw - got);
+            if (count <= 0) {
+                if (count < 0 && errno == EINTR) continue;
+                close(fd);
+                return false;
+            }
+            got += (size_t)count;
+        }
+    }
+    close(fd);
+    for (index = 0; index < sizeof raw; index++) {
+        out[index * 2] = hex[raw[index] >> 4];
+        out[index * 2 + 1] = hex[raw[index] & 15];
+    }
+    out[KMX_TOKEN_HEX] = '\0';
+    return true;
+}
+
 static bool
 peer_is_owner(int fd) {
 #ifdef SO_PEERCRED
@@ -200,7 +249,8 @@ usage(void) {
           "  --lan is given; reach a session across a network over SSH.\n"
           "  --pixel-pane runs an X client on a private display and streams its\n"
           "  frames; it never touches the display the operator is using.\n"
-          "  --audio-source runs a command that writes raw 16-bit PCM to stdout.\n",
+          "  --audio-source runs a command that writes raw 16-bit PCM to stdout.\n"
+          "  --lan requires a token; one is generated and printed if not given.\n",
           stderr);
 }
 
@@ -209,6 +259,8 @@ main(int argc, char **argv) {
     const char *socket_path = NULL;
     kmx_endpoint endpoint;
     bool allow_public = false;
+    char token[KMX_TOKEN_HEX + 1];
+    bool require_token = false;
     const char *commands[KMX_MAX_PANES];
     const char *pixel_command = NULL;
     kmx_pixel_pane pixel;
@@ -277,6 +329,15 @@ main(int argc, char **argv) {
             audio_budget = (uint32_t)strtoul(argv[++index], NULL, 10);
         } else if (strcmp(argv[index], "--lan") == 0) {
             allow_public = true;
+        } else if (strcmp(argv[index], "--token") == 0 && index + 1 < argc) {
+            const char *given = argv[++index];
+            if (strlen(given) < 16 || strlen(given) > KMX_TOKEN_HEX) {
+                fprintf(stderr, "kmx-serve: a token must be 16 to %d characters\n",
+                        KMX_TOKEN_HEX);
+                return 2;
+            }
+            snprintf(token, sizeof token, "%s", given);
+            require_token = true;
         } else if (strcmp(argv[index], "--split") == 0 && index + 1 < argc) {
             vertical = strcmp(argv[++index], "vertical") == 0;
         } else if (strcmp(argv[index], "--pane") == 0 && index + 1 < argc) {
@@ -314,6 +375,21 @@ main(int argc, char **argv) {
         fprintf(stderr, "kmx-serve: cannot make sense of '%s'\n", socket_path);
         return 2;
     }
+    /* A token is mandatory once the socket is genuinely reachable from a
+     * network, and there is no way to turn it off: the alternative is handing
+     * a shell to whoever can route to the port.
+     *
+     * The requirement follows the address, not the flag.  --lan on a loopback
+     * address reaches nobody new, and demanding a token there would be a
+     * requirement the operator never asked for. */
+    if (endpoint.kind == KMX_ENDPOINT_TCP &&
+        !kmx_endpoint_is_loopback(&endpoint) && !require_token) {
+        if (!mint_token(token, sizeof token)) {
+            fprintf(stderr, "kmx-serve: could not generate a token\n");
+            return 1;
+        }
+        require_token = true;
+    }
     listener = kmx_endpoint_listen(&endpoint, allow_public);
     if (listener < 0) {
         if (errno == EPERM) {
@@ -326,11 +402,20 @@ main(int argc, char **argv) {
         }
         return 1;
     }
-    if (endpoint.kind == KMX_ENDPOINT_TCP && !kmx_endpoint_is_loopback(&endpoint)) {
+    /* Printed whenever a token is required, however it came to be required:
+     * a token the operator is never told is a session nobody can attach to. */
+    if (require_token) {
         fprintf(stderr,
-            "kmx-serve: listening on %s:%d, which is reachable from the "
-            "network.  Anyone who can connect gets this session.\n",
-            endpoint.host, endpoint.port);
+            "kmx-serve: listening on %s:%d\n"
+            "  Attach with:  kmx-attach --socket %s:%d --token %s\n",
+            endpoint.host, endpoint.port, endpoint.host, endpoint.port, token);
+        if (endpoint.kind == KMX_ENDPOINT_TCP &&
+            !kmx_endpoint_is_loopback(&endpoint)) {
+            fprintf(stderr,
+                "  Reachable from the network, and carried in the clear:\n"
+                "  anyone who can watch the segment can read this session.\n"
+                "  Use an SSH tunnel to a loopback port if that matters.\n");
+        }
     }
 
     for (slot = 0; slot < count; slot++) {
@@ -571,11 +656,25 @@ main(int argc, char **argv) {
                 }
                 if (!available) break;
                 if (type == KMX_MSG_HELLO && size >= 4) {
+                    if (require_token &&
+                        !(size > 5 &&
+                          token_matches(
+                              token, (const char *)payload + 5, size - 5))) {
+                        /* No error frame: a peer that cannot present the
+                         * token learns only that the connection closed. */
+                        client_release(item, count);
+                        break;
+                    }
+                    item->greeted = true;
                     item->rows = (payload[0] << 8) | payload[1];
                     item->cols = (payload[2] << 8) | payload[3];
                     /* A client that does not say is a control client, so an
                      * older client keeps working. */
                     if (size >= 5) item->control = payload[4] == KMX_ROLE_CONTROL;
+                } else if (require_token && !item->greeted) {
+                    /* Nothing is accepted before a valid greeting. */
+                    client_release(item, count);
+                    break;
                 } else if (type == KMX_MSG_INPUT) {
                     /* Enforced here, not in the client: a viewer that chose to
                      * send input still cannot reach the pane. */

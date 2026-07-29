@@ -101,14 +101,21 @@ send_dimensions(int fd, kmx_message_type type, int rows, int cols) {
 /* The role is declared in HELLO.  The server enforces it; this only says
  * which one is being asked for. */
 static int
-send_hello(int fd, int rows, int cols, bool view_only) {
-    unsigned char payload[5];
+send_hello(int fd, int rows, int cols, bool view_only, const char *token) {
+    unsigned char payload[5 + 64];
+    size_t size = 5;
     payload[0] = (unsigned char)(rows >> 8);
     payload[1] = (unsigned char)rows;
     payload[2] = (unsigned char)(cols >> 8);
     payload[3] = (unsigned char)cols;
     payload[4] = view_only ? 1u : 0u;
-    return send_message(fd, KMX_MSG_HELLO, payload, sizeof payload);
+    if (token) {
+        size_t length = strlen(token);
+        if (length > sizeof payload - 5) return -1;
+        memcpy(payload + 5, token, length);
+        size += length;
+    }
+    return send_message(fd, KMX_MSG_HELLO, payload, size);
 }
 
 /* Reattach after the link drops.
@@ -139,6 +146,7 @@ main(int argc, char **argv) {
     bool predict = true;
     bool dump = false;
     bool view_only = false;
+    const char *token = NULL;
     int reconnect_seconds = 30;
     bool pane_ended = false;
     int run_seconds = 0;
@@ -178,6 +186,8 @@ main(int argc, char **argv) {
             predict = false;
         } else if (strcmp(argv[index], "--reconnect") == 0 && index + 1 < argc) {
             reconnect_seconds = atoi(argv[++index]);
+        } else if (strcmp(argv[index], "--token") == 0 && index + 1 < argc) {
+            token = argv[++index];
         } else if (strcmp(argv[index], "--view") == 0) {
             view_only = true;
             predict = false;
@@ -189,7 +199,7 @@ main(int argc, char **argv) {
             run_seconds = atoi(argv[++index]);
         } else {
             fprintf(stderr, "usage: kmx-attach --socket PATH [--no-predict]"
-                            " [--view] [--reconnect N]\n"
+                            " [--view] [--token TOKEN]\n       [--reconnect N]"
                             "       [--dump] [--send TEXT] [--seconds N]\n");
             return 2;
         }
@@ -225,7 +235,7 @@ main(int argc, char **argv) {
     }
     kmx_framer_init(&framer);
 
-    send_hello(fd, rows, cols, view_only);
+    send_hello(fd, rows, cols, view_only, token);
     if (!view_only) send_dimensions(fd, KMX_MSG_RESIZE, rows, cols);
 
     if (!dump && isatty(STDIN_FILENO) && tcgetattr(STDIN_FILENO, &saved) == 0) {
@@ -307,7 +317,7 @@ main(int argc, char **argv) {
                 kmx_predictor_reset(predictor);
                 kmx_render_invalidate(render);
                 layout.pane_count = 0;
-                send_hello(fd, rows, cols, view_only);
+                send_hello(fd, rows, cols, view_only, token);
                 if (!view_only) send_dimensions(fd, KMX_MSG_RESIZE, rows, cols);
                 continue;
             }
