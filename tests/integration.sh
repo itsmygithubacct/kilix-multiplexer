@@ -399,6 +399,42 @@ else
     echo "skip  pixel pane (needs Xvfb, ffmpeg and xclock)"
 fi
 
+# --- the audio plane, end to end ------------------------------------------
+#
+# A deterministic PCM source rather than a sound card: this is about the
+# plane, not about whether the machine has speakers.
+"$serve" --socket "$work/audio2.sock" --rows 12 --cols 60 \
+    --audio-source 'while :; do head -c 19200 /dev/zero; sleep 0.1; done' \
+    --audio-rate 48000 --audio-channels 2 \
+    -- /bin/sh -c 'printf "WITH_AUDIO\r\n"; sleep 20' >/dev/null 2>&1 &
+for attempt in $(seq 1 40); do [ -S "$work/audio2.sock" ] && break; sleep 0.1; done
+if [ -S "$work/audio2.sock" ]; then
+    timeout 10 "$attach" --socket "$work/audio2.sock" --dump --seconds 3 \
+        > "$work/audio.out" 2>&1
+    blocks=$(grep -c '^KMX_AUDIO' "$work/audio.out")
+    if [ "$blocks" -ge 10 ]; then
+        report pass "audio blocks reach the client ($blocks)"
+    else
+        report fail "audio blocks reach the client ($blocks)"
+    fi
+    # 48 kHz stereo 16-bit for 20 ms is exactly 3840 bytes.  A different size
+    # would mean the block boundary and the declared format disagree.
+    if grep -q '^KMX_AUDIO 3840 ' "$work/audio.out"; then
+        report pass "audio block size matches the declared format"
+    else
+        report fail "audio block size matches the declared format"
+    fi
+    # Timestamps must advance by the block's own duration, which is what lets
+    # a receiver tell a gap from a late delivery.
+    if grep -q 'at=.*gap=0' "$work/audio.out"; then
+        report pass "audio timestamps run continuously"
+    else
+        report fail "audio timestamps run continuously"
+    fi
+else
+    report fail "could not start the audio session"
+fi
+
 echo
 if [ "$failures" -eq 0 ]; then
     echo "all integration checks passed"

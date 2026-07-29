@@ -157,7 +157,9 @@ main(int argc, char **argv) {
     kmx_predictor *predictor = NULL;
     kmx_image_cache *images = NULL;
     kmx_motion_sink *motion = NULL;
+    kmx_audio_sink *audio = NULL;
     unsigned long frames_seen = 0;
+    unsigned long blocks_seen = 0;
     kmx_framer framer;
     kmx_grid screen;
     unsigned char buffer[65536];
@@ -216,6 +218,7 @@ main(int argc, char **argv) {
         kmx_predictor_create(&predictor) != KMX_OK ||
         kmx_image_cache_create(&images, 256, 32u * 1024u * 1024u) != KMX_OK ||
         kmx_motion_sink_create(&motion) != KMX_OK ||
+        kmx_audio_sink_create(&audio) != KMX_OK ||
         kmx_grid_init(&screen, rows, cols) != KMX_OK) {
         fprintf(stderr, "kmx-attach: out of memory\n");
         return 1;
@@ -404,6 +407,19 @@ main(int argc, char **argv) {
                             fflush(stdout);
                         }
                     }
+                } else if (type == KMX_MSG_AUDIO) {
+                    if (kmx_audio_sink_apply(audio, payload, size) == KMX_OK) {
+                        size_t block = 0;
+                        uint64_t when = 0;
+                        blocks_seen++;
+                        if (kmx_audio_sink_pcm(audio, &block, &when) && dump) {
+                            printf("KMX_AUDIO %zu #%lu at=%llu gap=%llu\n",
+                                   block, blocks_seen,
+                                   (unsigned long long)when,
+                                   (unsigned long long)kmx_audio_sink_gap_millis(audio));
+                            fflush(stdout);
+                        }
+                    }
                 } else if (type == KMX_MSG_EXIT) {
                     pane_ended = true;
                     stop_pending = 1;
@@ -480,6 +496,7 @@ main(int argc, char **argv) {
     kmx_framer_free(&framer);
     kmx_image_cache_free(images);
     kmx_motion_sink_free(motion);
+    kmx_audio_sink_free(audio);
     kmx_grid_free(&screen);
     kmx_predictor_free(predictor);
     kmx_render_free(render);

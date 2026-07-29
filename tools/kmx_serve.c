@@ -68,6 +68,7 @@ typedef struct {
     int fd;
     bool control;
     kmx_motion *motion;   /* per client: what IT has been shown */
+    kmx_audio *audio;     /* per client: its own rate allowance */
     int rows;
     int cols;
     kmx_sync *sync[KMX_MAX_PANES];
@@ -178,6 +179,7 @@ client_release(client *item, size_t pane_count) {
     }
     kmx_image_cache_free(item->holds);
     kmx_motion_free(item->motion);
+    kmx_audio_free(item->audio);
     kmx_framer_free(&item->framer);
     kmx_buffer_free(&item->out);
     memset(item, 0, sizeof *item);
@@ -197,7 +199,8 @@ usage(void) {
           "  --socket accepts a path or HOST:PORT.  TCP binds loopback unless\n"
           "  --lan is given; reach a session across a network over SSH.\n"
           "  --pixel-pane runs an X client on a private display and streams its\n"
-          "  frames; it never touches the display the operator is using.\n",
+          "  frames; it never touches the display the operator is using.\n"
+          "  --audio-source runs a command that writes raw 16-bit PCM to stdout.\n",
           stderr);
 }
 
@@ -214,6 +217,16 @@ main(int argc, char **argv) {
     int pixel_height = 480;
     int pixel_fps = 10;
     uint32_t pixel_budget = 0;
+    const char *audio_command = NULL;
+    int audio_rate = 48000;
+    int audio_channels = 2;
+    uint32_t audio_budget = 0;
+    int audio_fd = -1;
+    pid_t audio_child = -1;
+    unsigned char *audio_block = NULL;
+    size_t audio_block_bytes = 0;
+    size_t audio_filled = 0;
+    uint64_t audio_clock = 0;
     char *const *single = NULL;
     size_t command_count = 0;
     bool vertical = false;
@@ -254,6 +267,14 @@ main(int argc, char **argv) {
             pixel_fps = atoi(argv[++index]);
         } else if (strcmp(argv[index], "--pixel-budget") == 0 && index + 1 < argc) {
             pixel_budget = (uint32_t)strtoul(argv[++index], NULL, 10);
+        } else if (strcmp(argv[index], "--audio-source") == 0 && index + 1 < argc) {
+            audio_command = argv[++index];
+        } else if (strcmp(argv[index], "--audio-rate") == 0 && index + 1 < argc) {
+            audio_rate = atoi(argv[++index]);
+        } else if (strcmp(argv[index], "--audio-channels") == 0 && index + 1 < argc) {
+            audio_channels = atoi(argv[++index]);
+        } else if (strcmp(argv[index], "--audio-budget") == 0 && index + 1 < argc) {
+            audio_budget = (uint32_t)strtoul(argv[++index], NULL, 10);
         } else if (strcmp(argv[index], "--lan") == 0) {
             allow_public = true;
         } else if (strcmp(argv[index], "--split") == 0 && index + 1 < argc) {
@@ -354,6 +375,50 @@ main(int argc, char **argv) {
                 pixel.display, pixel_width, pixel_height);
     }
 
+    if (audio_command) {
+        int pipe_fds[2];
+        if (audio_rate <= 0 || audio_rate > 384000 ||
+            audio_channels <= 0 || audio_channels > 8 || pipe(pipe_fds) != 0) {
+            fprintf(stderr, "kmx-serve: bad audio source\n");
+            return 1;
+        }
+        audio_child = fork();
+        if (audio_child < 0) {
+            fprintf(stderr, "kmx-serve: fork: %s\n", strerror(errno));
+            return 1;
+        }
+        if (audio_child == 0) {
+            int null_fd = open("/dev/null", O_RDWR);
+            close(pipe_fds[0]);
+            dup2(pipe_fds[1], STDOUT_FILENO);
+            close(pipe_fds[1]);
+            if (null_fd >= 0) {
+                dup2(null_fd, STDIN_FILENO);
+                dup2(null_fd, STDERR_FILENO);
+                if (null_fd > STDERR_FILENO) close(null_fd);
+            }
+            execl("/bin/sh", "sh", "-c", audio_command, (char *)NULL);
+            _exit(127);
+        }
+        close(pipe_fds[1]);
+        audio_fd = pipe_fds[0];
+        {
+            int flags = fcntl(audio_fd, F_GETFL, 0);
+            if (flags >= 0) fcntl(audio_fd, F_SETFL, flags | O_NONBLOCK);
+        }
+        /* Twenty milliseconds a block: small enough that a drop is a blink
+         * rather than a stutter, large enough not to be all framing. */
+        audio_block_bytes =
+            (size_t)audio_rate * (size_t)audio_channels * 2u / 50u;
+        audio_block = malloc(audio_block_bytes);
+        if (!audio_block) {
+            fprintf(stderr, "kmx-serve: out of memory\n");
+            return 1;
+        }
+        fprintf(stderr, "kmx-serve: audio source, %d Hz, %d channel(s)\n",
+                audio_rate, audio_channels);
+    }
+
     signal(SIGPIPE, SIG_IGN);
     signal(SIGINT, handle_stop);
     signal(SIGTERM, handle_stop);
@@ -399,6 +464,13 @@ main(int argc, char **argv) {
          * the frame pipe - as though it were a pane, index an uninitialised
          * slot, and write through it. */
         pane_descriptors = descriptor_count - pane_first;
+
+        if (audio_fd >= 0) {
+            descriptors[descriptor_count].fd = audio_fd;
+            descriptors[descriptor_count].events = POLLIN;
+            descriptors[descriptor_count].revents = 0;
+            descriptor_count++;
+        }
 
         if (pixel_running) {
             descriptors[descriptor_count].fd = pixel.frames;
@@ -451,6 +523,11 @@ main(int argc, char **argv) {
                     if (ok) {
                         ok = kmx_image_cache_create(
                             &item->holds, 256, 32u * 1024u * 1024u) == KMX_OK;
+                    }
+                    if (ok && audio_command) {
+                        ok = kmx_audio_create(
+                            &item->audio, (uint32_t)audio_rate,
+                            (uint8_t)audio_channels, audio_budget) == KMX_OK;
                     }
                     if (ok && pixel_running) {
                         /* Per client, like the cell baseline: what one client
@@ -589,6 +666,49 @@ main(int argc, char **argv) {
                     panes[id].alive = false;
                 }
             }
+        }
+
+        while (audio_fd >= 0) {
+            /* Deliberately not named `count`: that is the pane count in this
+             * scope, and shadowing it here would hand the wrong value to
+             * client_release. */
+            ssize_t received = read(
+                audio_fd, audio_block + audio_filled,
+                audio_block_bytes - audio_filled);
+            if (received > 0) {
+                audio_filled += (size_t)received;
+                if (audio_filled < audio_block_bytes) continue;
+                audio_filled = 0;
+                for (which = 0; which < KMX_MAX_CLIENTS; which++) {
+                    client *item = &clients[which];
+                    kmx_buffer message;
+                    bool produced = false;
+                    if (item->fd < 0 || !item->audio) continue;
+                    kmx_buffer_init(&message);
+                    if (kmx_audio_offer(
+                            item->audio, audio_block, audio_block_bytes,
+                            audio_clock, &message, &produced, NULL) == KMX_OK &&
+                        produced) {
+                        if (client_queue(
+                                item, KMX_MSG_AUDIO,
+                                message.data, message.size) != 0) {
+                            kmx_buffer_free(&message);
+                            client_release(item, count);
+                            continue;
+                        }
+                    }
+                    kmx_buffer_free(&message);
+                }
+                /* The clock advances by the block's own duration, so a
+                 * receiver can tell a gap from a late delivery. */
+                audio_clock += 20;
+                continue;
+            }
+            if (received < 0 && errno == EINTR) continue;
+            if (received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+            close(audio_fd);
+            audio_fd = -1;
+            break;
         }
 
         if (pixel_running) {
@@ -751,6 +871,12 @@ main(int argc, char **argv) {
         kmx_term_free(panes[slot].term);
     }
     if (pixel_running) kmx_pixel_stop(&pixel);
+    if (audio_fd >= 0) close(audio_fd);
+    if (audio_child > 0) {
+        kill(audio_child, SIGTERM);
+        waitpid(audio_child, NULL, 0);
+    }
+    free(audio_block);
     if (listener >= 0) close(listener);
     kmx_endpoint_cleanup(&endpoint);
     return 0;
