@@ -109,13 +109,25 @@ kmx_motion_dropped(const kmx_motion *motion) {
     return motion ? motion->dropped : 0;
 }
 
-/* Frame dimensions come from a pane, not from a peer, but they still size an
- * allocation, so they are bounded. */
+/* Dimensions bound an allocation, so they are checked at the width they
+ * arrived at.
+ *
+ * The decoder reads them as 64-bit varints, and an earlier version validated
+ * `(int)width` while computing the frame size from the full value - so a width
+ * of 0x100000001 truncated to 1, passed the check, and then asked for twenty
+ * petabytes.  Found by a long fuzz soak, having survived every short run.
+ * Hence one validator over uint64_t, used before anything is narrowed. */
+static bool
+valid_dimensions(uint64_t width, uint64_t height) {
+    if (!width || !height) return false;
+    if (width > 8192u || height > 8192u) return false;
+    return width * height * KMX_MOTION_BYTES <= 64u * 1024u * 1024u;
+}
+
 static bool
 valid_frame(int width, int height) {
     if (width <= 0 || height <= 0) return false;
-    if (width > 8192 || height > 8192) return false;
-    return (long long)width * height * KMX_MOTION_BYTES <= 64LL * 1024 * 1024;
+    return valid_dimensions((uint64_t)width, (uint64_t)height);
 }
 
 static bool
@@ -307,7 +319,8 @@ kmx_motion_sink_apply(kmx_motion_sink *sink, const void *data, size_t size) {
 
     result = get_varint(&in, &width);
     if (result == KMX_OK) result = get_varint(&in, &height);
-    if (result == KMX_OK && !valid_frame((int)width, (int)height)) {
+    /* Checked before narrowing, not after. */
+    if (result == KMX_OK && !valid_dimensions(width, height)) {
         result = KMX_ERR_PROTOCOL;
     }
     if (result == KMX_OK && in.offset >= in.size) result = KMX_ERR_TRUNCATED;

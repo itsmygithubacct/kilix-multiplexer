@@ -1316,6 +1316,52 @@ test_motion_drops_rather_than_queues(void) {
     kmx_motion_free(motion);
 }
 
+/* Dimensions that are only harmless once narrowed.
+ *
+ * The decoder reads them as 64-bit varints.  An earlier version validated
+ * `(int)width` while sizing the allocation from the full value, so a width of
+ * 0x100000001 truncated to 1, passed the check, and asked for twenty
+ * petabytes.  A long fuzz soak found it after every short run had missed it;
+ * this pins it. */
+static void
+test_motion_sink_rejects_truncating_dimensions(void) {
+    kmx_motion_sink *sink;
+    kmx_buffer body;
+    kmx_buffer message;
+    unsigned char header[4] = {0x4b, 0x4d, 0x56, 0x01};
+    unsigned char varint[10];
+    size_t used;
+    uint64_t width = 0x100000001ull; /* 1 once truncated to 32 bits */
+    unsigned char flags = 1u;
+
+    kmx_buffer_init(&body);
+    used = 0;
+    {
+        uint64_t value = width;
+        do {
+            unsigned char byte = (unsigned char)(value & 0x7fu);
+            value >>= 7;
+            if (value) byte |= 0x80u;
+            varint[used++] = byte;
+        } while (value);
+    }
+    CHECK(kmx_buffer_append(&body, varint, used) == KMX_OK);
+    CHECK(kmx_buffer_append(&body, &(unsigned char){1}, 1) == KMX_OK); /* height */
+    CHECK(kmx_buffer_append(&body, &flags, 1) == KMX_OK);
+    CHECK(kmx_buffer_append(&body, "xyz", 3) == KMX_OK);
+
+    kmx_buffer_init(&message);
+    CHECK(kmx_buffer_append(&message, header, sizeof header) == KMX_OK);
+    CHECK(kmx_compress(body.data, body.size, &message) == KMX_OK);
+
+    CHECK(kmx_motion_sink_create(&sink) == KMX_OK);
+    /* Refused, not attempted. */
+    CHECK(kmx_motion_sink_apply(sink, message.data, message.size) == KMX_ERR_PROTOCOL);
+    kmx_motion_sink_free(sink);
+    kmx_buffer_free(&message);
+    kmx_buffer_free(&body);
+}
+
 static void
 test_motion_sink_rejects_malformed_input(void) {
     enum { WIDTH = 32, HEIGHT = 16 };
@@ -1618,6 +1664,7 @@ main(void) {
     RUN(test_motion_roundtrip_and_deltas);
     RUN(test_motion_resize_forces_a_keyframe);
     RUN(test_motion_drops_rather_than_queues);
+    RUN(test_motion_sink_rejects_truncating_dimensions);
     RUN(test_motion_sink_rejects_malformed_input);
     RUN(test_audio_roundtrip_and_timestamps);
     RUN(test_audio_reports_gaps);

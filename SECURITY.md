@@ -105,6 +105,14 @@ Every length that arrives from a peer is bounded before it is believed:
 | Clients | `KMX_MAX_CLIENTS`, 8 | `tools/kmx_serve.c` |
 | Per-client backlog | `KMX_CLIENT_QUEUE_LIMIT`, 4 MiB, then disconnect | `tools/kmx_serve.c` |
 
+### How often a peer may try
+
+Accepts are drawn from a bucket of `KMX_ACCEPT_BURST` (16) refilled at
+`KMX_ACCEPT_PER_SECOND` (8). Beyond that, connections are closed without a
+word — distinguishing a flood from a mistake is not this layer's job, and
+answering costs more than ignoring. The count of refusals is reported at
+shutdown so the behaviour is visible rather than silent.
+
 ### What a peer can make the server do
 
 Nothing that blocks it. Client sockets are non-blocking with a bounded
@@ -126,13 +134,13 @@ is rejected and that trailing bytes are an error rather than ignored.
 
 Stated plainly rather than left to be discovered.
 
-1. **TLS is opt-in, not the default.** `--tls` encrypts and authenticates the
-   server; without it a reachable bind is still cleartext, and the server says
-   so when it binds one. The default is not TLS because the recommended route
-   remains an SSH tunnel to loopback, which already provides both. A future
-   revision should probably make `--lan` imply `--tls`.
-2. **No rate limit on connection attempts.** Eight client slots fill on a
-   first-come basis, so a local process can occupy them.
+1. **A reachable bind is only as private as the segment, if TLS is refused.**
+   Encryption is now the default for a reachable address; `--no-tls` turns it
+   off and says so, which is reasonable inside a tunnel and not otherwise.
+2. **The accept rate limit is a brake, not a defence.** A bucket of 16 with 8
+   per second stops a loop turning a wrong token guess into an unbounded one,
+   and bounds what a discovered port costs. It does not stop a determined
+   local process, which shares the user's privileges anyway.
 3. **The pixel pane runs a shell command** given on the server's own command
    line. That is the operator's own input, not a peer's, but it is worth
    naming: a peer cannot start a pane, and there is no message that does.
@@ -154,7 +162,14 @@ Stated plainly rather than left to be discovered.
 
 - [x] Token authentication for reachable binds — done 2026-07-28
 - [x] TLS with fingerprint pinning — done 2026-07-28
-- [ ] Consider making `--lan` imply `--tls`
+- [x] A reachable bind encrypts by default; `--no-tls` is explicit (2026-07-29)
+- [x] Accept rate limiting (2026-07-29)
 - [ ] Independent review of the LAN path
 - [x] Seeded corpus — `make fuzz` builds it from real messages (2026-07-29)
-- [ ] A long soak, hours rather than seconds, before anything is published
+- [x] A long soak — 25 minutes, 2 workers, **found a real bug** (2026-07-29):
+      the motion decoder validated its dimensions after narrowing them to
+      `int`, so a width of 0x100000001 passed as 1 and then sized an
+      allocation from the full value. Fixed, pinned by a regression test, and
+      the other decoders audited for the same shape (they bound the 64-bit
+      value first, which is the correct order)
+- [ ] A longer soak still, hours rather than minutes, before publication

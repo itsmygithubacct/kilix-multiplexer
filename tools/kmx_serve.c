@@ -40,6 +40,17 @@
 
 #define KMX_MAX_CLIENTS 8
 
+/* Accepts allowed per second before new connections are dropped.
+ *
+ * Eight client slots fill on a first-come basis, so anything that can connect
+ * can also occupy them, and a peer that fails the token check can retry
+ * without limit.  A bucket does not stop a determined local process - it
+ * shares the user's privileges anyway - but it does stop a loop from turning
+ * a wrong guess into an unbounded one, and it bounds what a reachable port
+ * costs when someone finds it. */
+#define KMX_ACCEPT_BURST 16
+#define KMX_ACCEPT_PER_SECOND 8
+
 /* HELLO role byte. */
 #define KMX_ROLE_CONTROL 0u
 #define KMX_ROLE_VIEW 1u
@@ -268,8 +279,9 @@ usage(void) {
           "  frames; it never touches the display the operator is using.\n"
           "  --audio-source runs a command that writes raw 16-bit PCM to stdout.\n"
           "  --lan requires a token; one is generated and printed if not given.\n"
-          "  --tls adds confidentiality: the server prints a fingerprint the\n"
-          "  client must be given, which is the only thing identifying it.\n",
+          "  A reachable bind encrypts by default and prints a fingerprint the\n"
+          "  client must be given; --no-tls turns that off, which is only\n"
+          "  reasonable inside a tunnel.\n",
           stderr);
 }
 
@@ -281,6 +293,7 @@ main(int argc, char **argv) {
     char token[KMX_TOKEN_HEX + 1];
     bool require_token = false;
     bool use_tls = false;
+    bool refuse_tls = false;
     kmx_tls_server *tls = NULL;
     char fingerprint[KMX_TLS_FINGERPRINT_HEX + 1];
     const char *commands[KMX_MAX_PANES];
@@ -313,6 +326,9 @@ main(int argc, char **argv) {
     kmx_layout layout;
     unsigned char buffer[65536];
     size_t focused = 0;
+    unsigned accept_allowance = KMX_ACCEPT_BURST;
+    uint64_t accept_refilled = 0;
+    unsigned long accepts_refused = 0;
     size_t count;
     size_t slot;
     size_t which;
@@ -353,6 +369,8 @@ main(int argc, char **argv) {
             allow_public = true;
         } else if (strcmp(argv[index], "--tls") == 0) {
             use_tls = true;
+        } else if (strcmp(argv[index], "--no-tls") == 0) {
+            refuse_tls = true;
         } else if (strcmp(argv[index], "--token") == 0 && index + 1 < argc) {
             const char *given = argv[++index];
             if (strlen(given) < 16 || strlen(given) > KMX_TOKEN_HEX) {
@@ -426,6 +444,20 @@ main(int argc, char **argv) {
         }
         return 1;
     }
+    /* A reachable bind encrypts by default.  The old behaviour - cleartext
+     * unless asked otherwise - made the safe choice the one you had to
+     * remember, which is the wrong way round for something carrying a
+     * terminal.  Turning it off is still possible and now has to be said out
+     * loud, because over an SSH tunnel it is a reasonable thing to want. */
+    if (endpoint.kind == KMX_ENDPOINT_TCP &&
+        !kmx_endpoint_is_loopback(&endpoint) && !refuse_tls) {
+        use_tls = true;
+    }
+    if (use_tls && refuse_tls) {
+        fprintf(stderr, "kmx-serve: --tls and --no-tls disagree\n");
+        return 2;
+    }
+
     if (use_tls) {
         if (endpoint.kind != KMX_ENDPOINT_TCP) {
             fprintf(stderr, "kmx-serve: --tls applies to a TCP socket\n");
@@ -610,6 +642,26 @@ main(int argc, char **argv) {
 
         if (descriptors[0].revents & POLLIN) {
             int accepted = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
+            if (accepted >= 0) {
+                /* Refill first, then spend.  A dropped connection is closed
+                 * without a word: telling a flood apart from a mistake is not
+                 * this layer's job, and answering costs more than ignoring. */
+                uint64_t moment = now_millis();
+                uint64_t since = moment - accept_refilled;
+                if (since >= 1000) {
+                    uint64_t earned = (since / 1000u) * KMX_ACCEPT_PER_SECOND;
+                    accept_allowance = accept_allowance + earned > KMX_ACCEPT_BURST
+                        ? KMX_ACCEPT_BURST : accept_allowance + earned;
+                    accept_refilled = moment;
+                }
+                if (!accept_allowance) {
+                    close(accepted);
+                    accepted = -1;
+                    accepts_refused++;
+                } else {
+                    accept_allowance--;
+                }
+            }
             if (accepted >= 0) {
                 size_t free_slot = KMX_MAX_CLIENTS;
                 for (which = 0; which < KMX_MAX_CLIENTS; which++) {
@@ -1036,6 +1088,10 @@ main(int argc, char **argv) {
         waitpid(audio_child, NULL, 0);
     }
     free(audio_block);
+    if (accepts_refused) {
+        fprintf(stderr, "kmx-serve: refused %lu connection(s) to the rate limit\n",
+                accepts_refused);
+    }
     if (listener >= 0) close(listener);
     kmx_tls_server_free(tls);
     kmx_endpoint_cleanup(&endpoint);
