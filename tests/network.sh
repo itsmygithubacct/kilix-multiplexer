@@ -7,7 +7,7 @@
 #   tests/network.sh REMOTE [REMOTE_PATH]
 #
 # REMOTE is an ssh destination that can be reached without a password.
-# REMOTE_PATH is where this tree lives on it (default kmx-test); it is
+# REMOTE_PATH is where this tree lives on it (default: kmx-test); it is
 # synchronised and built before the checks run.
 #
 # Not part of `make test`: it needs a second machine.
