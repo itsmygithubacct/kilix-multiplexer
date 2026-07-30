@@ -151,6 +151,13 @@ predictor is for.
   Checked rather than assumed: killing the observer with SIGKILL left the
   broker session alive, and a fresh observer replayed output produced before
   the kill.
+- **The planes are not synchronised.** Motion and audio are carried
+  independently and neither waits on the other, which is what keeps a stalling
+  video from stuttering the sound — but it also means they are not aligned. The
+  motion plane carries no presentation timestamp at all, so a client renders
+  frames on arrival. For a pane that makes notification sounds this is
+  invisible; for watching video with a soundtrack it will drift. Scoped, with
+  the measurements, in the project's research notes under `AV_SYNC_SCOPE.md`.
 - **Only tapped local graphics are portable.** Inline Kitty graphics remain
   semantic. Host-local `t=s`, `t=f` and `t=t` references are suppressed when
   the presenter tap supplies the corresponding RGB, but an unrelated producer
