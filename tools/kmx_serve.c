@@ -433,13 +433,18 @@ start_broker_observer(
 }
 
 /*
- * Live input is deliberately a different descriptor from broker observation.
- * Kilix supplies a pane-scoped helper here; without one a live pane is
- * view-only.  This preserves the broker's assertion that an observer can
- * never inject bytes.
+ * Live input is deliberately a different descriptor from broker observation
+ * or pixel capture.  Kilix supplies a pane-scoped helper here; without one a
+ * live or pixel pane is view-only.  This preserves the broker's assertion
+ * that an observer can never inject bytes, and keeps X input confined to the
+ * private display created for the pixel pane.
  */
 static pid_t
-start_input_helper(const char *command, int *input_fd) {
+start_input_helper(
+    const char *command,
+    const char *display_name,
+    int *input_fd
+) {
     int pipe_fds[2];
     pid_t child;
     if (!command || !input_fd || pipe2(pipe_fds, O_CLOEXEC) != 0) return -1;
@@ -457,6 +462,9 @@ start_input_helper(const char *command, int *input_fd) {
         if (null_fd >= 0) {
             (void)dup2(null_fd, STDOUT_FILENO);
             if (null_fd > STDERR_FILENO) close(null_fd);
+        }
+        if (display_name && *display_name) {
+            setenv("DISPLAY", display_name, 1);
         }
         execl("/bin/sh", "sh", "-c", command, (char *)NULL);
         _exit(127);
@@ -504,6 +512,7 @@ usage(void) {
           "\n"
           "       kmx-serve --socket PATH --pixel-pane 'COMMAND'\n"
           "                 [--pixel-size WxH] [--pixel-fps N] [--pixel-budget BPS]\n"
+          "                 [--input-command COMMAND]\n"
           "\n"
           "       kmx-serve --socket PATH --broker-session ID\n"
           "                 --broker-runtime DIR [--broker-executable PATH]\n"
@@ -513,7 +522,7 @@ usage(void) {
           "  --socket accepts a path or HOST:PORT.  TCP binds loopback unless\n"
           "  --lan is given; reach a session across a network over SSH.\n"
           "  --pixel-pane runs an X client on a private display and streams its\n"
-          "  frames; it never touches the display the operator is using.\n"
+          "  frames; input uses a helper confined to that private display.\n"
           "  --broker-session observes a live protocol-v2 broker session.  The\n"
           "  observer stays read-only; input uses the separate helper command.\n"
           "  --tap-socket receives presenter RGB frames for the named session.\n"
@@ -711,7 +720,7 @@ main(int argc, char **argv) {
         (broker_session && (!broker_runtime || !*broker_runtime)) ||
         (broker_session &&
          (command_count != 0 || single || pixel_command)) ||
-        (input_command && !broker_session) ||
+        (input_command && !broker_session && !pixel_command) ||
         (tap_path && (!tap_session || !*tap_session)) ||
         (tap_session_given && !tap_path)) {
         usage();
@@ -834,7 +843,8 @@ main(int argc, char **argv) {
             item->fixed_size = true;
             item->alive = true;
             if (input_command) {
-                item->input_child = start_input_helper(input_command, &item->input_fd);
+                item->input_child =
+                    start_input_helper(input_command, NULL, &item->input_fd);
                 if (item->input_child < 0) {
                     fprintf(stderr, "kmx-serve: could not start input helper: %s\n",
                             strerror(errno));
@@ -883,6 +893,7 @@ main(int argc, char **argv) {
     }
 
     if (pixel_command) {
+        char display_name[32];
         if (!kmx_pixel_start(
                 &pixel, pixel_command, pixel_width, pixel_height, pixel_fps)) {
             fprintf(stderr, "kmx-serve: could not start a private display\n");
@@ -891,6 +902,22 @@ main(int argc, char **argv) {
         pixel_running = true;
         fprintf(stderr, "kmx-serve: pixel pane on display :%d, %dx%d\n",
                 pixel.display, pixel_width, pixel_height);
+        if (input_command) {
+            snprintf(display_name, sizeof display_name, ":%d", pixel.display);
+            panes[0].input_child =
+                start_input_helper(input_command, display_name, &panes[0].input_fd);
+            if (panes[0].input_child < 0) {
+                fprintf(stderr, "kmx-serve: could not start pixel input helper: %s\n",
+                        strerror(errno));
+                kmx_pixel_stop(&pixel);
+                pixel_running = false;
+                return 1;
+            }
+            fprintf(stderr, "kmx-serve: pixel input helper enabled\n");
+        } else {
+            fprintf(stderr,
+                "kmx-serve: pixel pane is view-only (no input helper)\n");
+        }
     }
 
     if (audio_command) {
@@ -1244,7 +1271,11 @@ main(int argc, char **argv) {
                 } else if (type == KMX_MSG_INPUT) {
                     /* Enforced here, not in the client: a viewer that chose to
                      * send input still cannot reach the pane. */
-                    if (item->control && focused < count && panes[focused].alive &&
+                    if (item->control && pixel_running &&
+                        panes[0].input_fd >= 0) {
+                        pane_input_queue(&panes[0], payload, size);
+                    } else if (item->control && focused < count &&
+                        panes[focused].alive &&
                         panes[focused].input_fd >= 0) {
                         pane_input_queue(&panes[focused], payload, size);
                     }
@@ -1361,6 +1392,12 @@ main(int argc, char **argv) {
                 panes[slot].input_fd = -1;
                 stop_helper(&panes[slot].input_child);
             }
+        }
+        if (pixel_running && pane_input_pending(&panes[0]) &&
+            pane_input_flush(&panes[0]) != 0) {
+            close(panes[0].input_fd);
+            panes[0].input_fd = -1;
+            stop_helper(&panes[0].input_child);
         }
 
         while (audio_fd >= 0) {
@@ -1626,6 +1663,11 @@ main(int argc, char **argv) {
         if (broker_session) stop_helper(&panes[slot].child);
         kmx_buffer_free(&panes[slot].input);
         kmx_term_free(panes[slot].term);
+    }
+    if (pixel_running && count == 0) {
+        if (panes[0].input_fd >= 0) close(panes[0].input_fd);
+        stop_helper(&panes[0].input_child);
+        kmx_buffer_free(&panes[0].input);
     }
     if (pixel_running) kmx_pixel_stop(&pixel);
     if (tap_running) kmx_tap_stop(&tap);

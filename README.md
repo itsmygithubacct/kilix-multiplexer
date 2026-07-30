@@ -11,7 +11,8 @@ planes. This project exploits that, carrying a session as typed per-pane
 substreams — lossless cell diffs for text, tiles for still images, video only
 where there is actually video — rather than one undifferentiated stream.
 
-Design notes are maintained separately from this release tree.
+This release tree contains the portable implementation and its public design
+and security notes. Machine-specific integration details live outside it.
 
 **Status: all six planes work end to end** — layout, cells, stills, motion,
 audio, and input. A multi-pane session can be served over a Unix socket or TCP,
@@ -43,6 +44,14 @@ kmx-serve --socket ./kmx.sock --split horizontal --pane bash --pane 'top -d1'
 
 kmx-attach --socket ./kmx.sock   # Ctrl-] detaches, Ctrl-O changes pane
 ```
+
+## Local configuration and state
+
+Treat the source checkout as read-only when integrating the multiplexer with a
+particular machine or account. Personal wrappers, configuration, logs, and
+runtime state belong outside the checkout in a location selected by the
+operator. Host aliases, usernames, account/profile choices, local checkout
+paths, tokens, and private endpoints do not belong in this repository.
 
 The client renders the screen, forwards typing, follows resizes, and echoes
 keystrokes optimistically — underlined until the server confirms them.
@@ -110,12 +119,13 @@ predictor is for.
   client loses stale media rather than stalling lossless text. A private X
   display remains available as the standalone pixel source; live Kilix uses
   the non-blocking presenter tap.
-- **Live pane source** — `--broker-session` starts the public broker-v2
-  observer CLI outside the scheduler and holds no PTY control slot. A separate
-  `--input-command` is the only possible live input descriptor. Host-local
-  `t=s`, `t=f` and `t=t` graphics references are suppressed when the tap
-  supplies portable pixels, because replaying their names on another host
-  cannot work.
+- **Live pane source and pixel input** — `--broker-session` starts the public
+  broker-v2 observer CLI outside the scheduler and holds no PTY control slot.
+  A separate `--input-command` is the only possible live input descriptor.
+  Pixel panes can use the same option; their helper inherits only the private
+  X display created for that pane. Host-local `t=s`, `t=f` and `t=t` graphics
+  references are suppressed when the tap supplies portable pixels, because
+  replaying their names on another host cannot work.
 - **Layout plane** — where the panes are, in a few dozen bytes. A four-pane
   arrangement encodes in under 120 bytes, and because the client knows the
   geometry it draws the dividers and title bars itself rather than receiving
@@ -143,6 +153,11 @@ predictor is for.
   layout mixing them. Live `--broker-session` is also one selected pane.
   Mixing native text and pixel panes in one served layout is a refinement the
   plane model allows and the implementation does not do yet.
+- **A pixel pane is view-only unless it has an input helper.**
+  `--input-command` receives authenticated controller input on stdin and runs
+  with `DISPLAY` set to the pixel pane's private X server. `kmx-attach
+  --pixel-input` requests CSI-u keyboard and SGR-pixel mouse reports and scales
+  mouse coordinates when the local placement and remote framebuffer differ.
 - **A standalone child lives and dies with the server.** If `kmx-serve` owns
   the command itself, exiting the server ends it. A live `--broker-session`
   pane is different: `kitty-pty-broker` keeps owning the PTY and the local

@@ -401,11 +401,13 @@ if command -v Xvfb >/dev/null && command -v ffmpeg >/dev/null &&
     pix_port=$(( port + 4 ))
     "$serve" --socket "127.0.0.1:$pix_port" \
         --pixel-pane 'xclock -update 1' --pixel-size 320x240 --pixel-fps 4 \
+        --input-command "cat > '$work/pixel.input'" \
         >"$work/pixel.log" 2>&1 &
     wait_for_token "$work/pixel.log"
     sleep 2
     timeout 12 "$attach" --socket "127.0.0.1:$pix_port" \
         --token "$(token_from "$work/pixel.log")" --dump --seconds 5 \
+        --send PIXEL_INPUT \
         > "$work/pixel.out" 2>&1
     frames=$(grep -c '^KMX_FRAME' "$work/pixel.out")
     if [ "$frames" -ge 2 ]; then
@@ -421,6 +423,11 @@ if command -v Xvfb >/dev/null && command -v ffmpeg >/dev/null &&
         report pass "successive frames differ, so deltas are being applied"
     else
         report fail "successive frames differ, so deltas are being applied"
+    fi
+    if [ "$(cat "$work/pixel.input" 2>/dev/null)" = PIXEL_INPUT ]; then
+        report pass "a control client's input reaches the pixel-pane helper"
+    else
+        report fail "a control client's input reaches the pixel-pane helper"
     fi
     pkill -f "pixel-pane" 2>/dev/null
 else

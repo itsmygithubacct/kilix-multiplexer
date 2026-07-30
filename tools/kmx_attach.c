@@ -110,6 +110,20 @@ get_size(int *rows, int *cols) {
     *cols = 80;
 }
 
+static void
+get_pixel_size(int *width, int *height) {
+    struct winsize size;
+    memset(&size, 0, sizeof size);
+    if (ioctl(STDIN_FILENO, TIOCGWINSZ, &size) == 0 &&
+        size.ws_xpixel && size.ws_ypixel) {
+        *width = size.ws_xpixel;
+        *height = size.ws_ypixel;
+        return;
+    }
+    *width = 0;
+    *height = 0;
+}
+
 static int
 send_dimensions(int fd, kmx_message_type type, int rows, int cols) {
     unsigned char payload[4];
@@ -296,6 +310,150 @@ done:
     return result;
 }
 
+static int
+scaled_coordinate(int value, int local_extent, int remote_extent) {
+    long long numerator;
+    if (local_extent <= 1 || remote_extent <= 1) return 0;
+    if (value < 0) value = 0;
+    if (value >= local_extent) value = local_extent - 1;
+    numerator =
+        (long long)value * (remote_extent - 1) + (local_extent - 1) / 2;
+    return (int)(numerator / (local_extent - 1));
+}
+
+/*
+ * Pixel panes request SGR-pixel mouse reports from Kilix. Their coordinates
+ * describe the local terminal, while the XTest helper receives coordinates in
+ * the remote framebuffer. Rewrite only those reports and leave CSI-u keys,
+ * bracketed paste and arbitrary text byte-for-byte intact.
+ *
+ * `pending` retains a CSI split across read() calls. Ctrl-] is encoded as
+ * CSI-u while the enhanced keyboard protocol is active, so recognise that
+ * sequence here as the same local detach key used by ordinary panes.
+ */
+static int
+pixel_input_transform(
+    kmx_buffer *pending,
+    const void *data,
+    size_t size,
+    int local_width,
+    int local_height,
+    int remote_width,
+    int remote_height,
+    kmx_buffer *out,
+    bool *detach
+) {
+    size_t at = 0;
+    if (kmx_buffer_append(pending, data, size) != KMX_OK) return -1;
+    kmx_buffer_reset(out);
+    while (at < pending->size) {
+        size_t end;
+        size_t length;
+        unsigned char final;
+        char sequence[128];
+
+        if (pending->data[at] != '\033' ||
+            at + 1 >= pending->size ||
+            pending->data[at + 1] != '[') {
+            if (pending->data[at] == '\033' && at + 1 == pending->size) break;
+            if (kmx_buffer_append(out, pending->data + at, 1) != KMX_OK) {
+                return -1;
+            }
+            at++;
+            continue;
+        }
+
+        end = at + 2;
+        while (end < pending->size &&
+               !(pending->data[end] >= 0x40 && pending->data[end] <= 0x7e)) {
+            end++;
+        }
+        if (end == pending->size) {
+            if (pending->size - at < sizeof sequence) break;
+            if (kmx_buffer_append(out, pending->data + at, 1) != KMX_OK) {
+                return -1;
+            }
+            at++;
+            continue;
+        }
+
+        length = end - at + 1;
+        final = pending->data[end];
+        if (length < sizeof sequence) {
+            int code = 0;
+            int modifiers = 1;
+            memcpy(sequence, pending->data + at, length);
+            sequence[length] = '\0';
+
+            if (final == 'u' &&
+                sscanf(sequence, "\033[%d;%d", &code, &modifiers) == 2 &&
+                code == ']' && ((modifiers - 1) & 4)) {
+                *detach = true;
+                at = end + 1;
+                continue;
+            }
+
+            if ((final == 'M' || final == 'm') &&
+                length >= 4 && sequence[2] == '<') {
+                unsigned button = 0;
+                int x = 0;
+                int y = 0;
+                char parsed_final = '\0';
+                int consumed = 0;
+                if (sscanf(
+                        sequence, "\033[<%u;%d;%d%c%n",
+                        &button, &x, &y, &parsed_final, &consumed) == 4 &&
+                    consumed == (int)length &&
+                    (parsed_final == 'M' || parsed_final == 'm') &&
+                    local_width > 0 && local_height > 0 &&
+                    remote_width > 0 && remote_height > 0) {
+                    char rewritten[128];
+                    int rewritten_size;
+                    x = scaled_coordinate(x, local_width, remote_width);
+                    y = scaled_coordinate(y, local_height, remote_height);
+                    rewritten_size = snprintf(
+                        rewritten, sizeof rewritten, "\033[<%u;%d;%d%c",
+                        button, x, y, parsed_final);
+                    if (rewritten_size < 0 ||
+                        (size_t)rewritten_size >= sizeof rewritten ||
+                        kmx_buffer_append(
+                            out, rewritten, (size_t)rewritten_size) != KMX_OK) {
+                        return -1;
+                    }
+                    at = end + 1;
+                    continue;
+                }
+            }
+        }
+        if (kmx_buffer_append(out, pending->data + at, length) != KMX_OK) {
+            return -1;
+        }
+        at = end + 1;
+    }
+    if (at) {
+        memmove(pending->data, pending->data + at, pending->size - at);
+        pending->size -= at;
+    }
+    return 0;
+}
+
+static int
+enable_pixel_input(void) {
+    static const char controls[] =
+        "\033[?25l\033[>15u"
+        "\033[?1003h\033[?1006h\033[?1016h\033[?2004h";
+    return write_all(STDOUT_FILENO, controls, sizeof controls - 1);
+}
+
+static void
+disable_pixel_input(void) {
+    static const char controls[] =
+        "\033[<u"
+        "\033[?1003l\033[?1006l\033[?1016l\033[?2004l"
+        "\033_Ga=d,d=A\033\\\033[?25h";
+    (void)write_all(STDOUT_FILENO, controls, sizeof controls - 1);
+}
+
 typedef struct {
     int fd;
     pid_t child;
@@ -480,6 +638,7 @@ main(int argc, char **argv) {
     bool predict = true;
     bool dump = false;
     bool view_only = false;
+    bool pixel_input = false;
     const char *token = NULL;
     const char *fingerprint = NULL;
     const char *audio_output_command = NULL;
@@ -513,6 +672,13 @@ main(int argc, char **argv) {
     size_t focus_hint = 0;
     int rows;
     int cols;
+    int local_pixel_width = 0;
+    int local_pixel_height = 0;
+    int remote_pixel_width = 0;
+    int remote_pixel_height = 0;
+    bool pixel_input_enabled = false;
+    kmx_buffer pixel_input_pending;
+    kmx_buffer pixel_input_output;
     int exit_code = 0;
 
     memset(receivers, 0, sizeof receivers);
@@ -520,6 +686,8 @@ main(int argc, char **argv) {
     memset(&player, 0, sizeof player);
     player.fd = -1;
     player.child = -1;
+    kmx_buffer_init(&pixel_input_pending);
+    kmx_buffer_init(&pixel_input_output);
 
     /* Answered before anything else is parsed, so it works regardless of
      * whether the rest of the command line is right. */
@@ -542,6 +710,9 @@ main(int argc, char **argv) {
         } else if (strcmp(argv[index], "--view") == 0) {
             view_only = true;
             predict = false;
+        } else if (strcmp(argv[index], "--pixel-input") == 0) {
+            pixel_input = true;
+            predict = false;
         } else if (strcmp(argv[index], "--dump") == 0) {
             dump = true;
         } else if (strcmp(argv[index], "--send") == 0 && index + 1 < argc) {
@@ -558,7 +729,8 @@ main(int argc, char **argv) {
                             " [--view] [--token TOKEN]\n"
                             "       [--tls-fingerprint HEX] [--reconnect N]"
                             "       [--dump] [--send TEXT] [--seconds N]\n"
-                            "       [--audio-output COMMAND|--no-audio]\n");
+                            "       [--audio-output COMMAND|--no-audio]"
+                            " [--pixel-input]\n");
             return 2;
         }
         index++;
@@ -570,6 +742,7 @@ main(int argc, char **argv) {
     }
 
     get_size(&rows, &cols);
+    get_pixel_size(&local_pixel_width, &local_pixel_height);
     if (!kmx_endpoint_parse(socket_path, &endpoint)) {
         fprintf(stderr, "kmx-attach: cannot make sense of '%s'\n", socket_path);
         return 2;
@@ -635,6 +808,10 @@ main(int argc, char **argv) {
         cfmakeraw(&raw);
         if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) == 0) have_termios = true;
     }
+    if (pixel_input && !view_only && have_termios &&
+        enable_pixel_input() == 0) {
+        pixel_input_enabled = true;
+    }
     {
         /* sigaction with no SA_RESTART, deliberately.  glibc's signal() sets
          * SA_RESTART, so the handler ran, set its flag, and the interrupted
@@ -661,6 +838,7 @@ main(int argc, char **argv) {
         if (resize_pending && !dump) {
             resize_pending = 0;
             get_size(&rows, &cols);
+            get_pixel_size(&local_pixel_width, &local_pixel_height);
             if (!view_only) send_dimensions(fd, KMX_MSG_RESIZE, rows, cols);
             /* The screen is about to be described differently, so anything
              * predicted about the old one is void. */
@@ -852,6 +1030,8 @@ main(int argc, char **argv) {
                         int frame_height = 0;
                         const unsigned char *pixels =
                             kmx_motion_sink_pixels(motion, &frame_width, &frame_height);
+                        remote_pixel_width = frame_width;
+                        remote_pixel_height = frame_height;
                         frames_seen++;
                         if (dump && pixels) {
                             /* A checksum rather than the pixels: enough for a
@@ -911,7 +1091,25 @@ main(int argc, char **argv) {
             ssize_t count = read(STDIN_FILENO, buffer, sizeof buffer);
             if (count > 0) {
                 if (memchr(buffer, 0x1d, (size_t)count)) break; /* Ctrl-] */
-                if (memchr(buffer, 0x0f, (size_t)count) && layout.pane_count > 1) {
+                if (pixel_input) {
+                    bool detach = false;
+                    if (pixel_input_transform(
+                            &pixel_input_pending, buffer, (size_t)count,
+                            local_pixel_width, local_pixel_height,
+                            remote_pixel_width, remote_pixel_height,
+                            &pixel_input_output, &detach) != 0) {
+                        break;
+                    }
+                    if (detach) break;
+                    if (pixel_input_output.size &&
+                        send_message(
+                            fd, KMX_MSG_INPUT,
+                            pixel_input_output.data,
+                            pixel_input_output.size) != 0) {
+                        break;
+                    }
+                } else if (memchr(buffer, 0x0f, (size_t)count) &&
+                           layout.pane_count > 1) {
                     /* Ctrl-O: move focus on.  The server owns focus, so this
                      * asks rather than assumes. */
                     unsigned char wanted =
@@ -964,6 +1162,7 @@ main(int argc, char **argv) {
         audio_output_flush(&player);
     }
 
+    if (pixel_input_enabled) disable_pixel_input();
     if (have_termios) (void)tcsetattr(STDIN_FILENO, TCSANOW, &saved);
     if (!dump) {
         char remove_image[64];
@@ -983,6 +1182,8 @@ main(int argc, char **argv) {
         }
     }
     kmx_framer_free(&framer);
+    kmx_buffer_free(&pixel_input_output);
+    kmx_buffer_free(&pixel_input_pending);
     kmx_image_cache_free(images);
     kmx_motion_sink_free(motion);
     kmx_audio_sink_free(audio);

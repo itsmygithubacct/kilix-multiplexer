@@ -294,7 +294,9 @@ Stated plainly rather than left to be discovered.
 6. **Live input is only as narrow as the supplied helper.** The multiplexer
    never constructs it and cannot prove its policy. Kilix supplies a bounded
    pane-session matcher; a caller using `--input-command` directly is
-   responsible for an equivalent scope.
+   responsible for an equivalent scope. For a pixel pane the helper inherits
+   the private `DISPLAY`, but what it injects on that display remains the
+   helper's policy.
 7. **Independent review has not been completed.** The tests and defect history
    in this document are evidence about specific behavior, not a substitute for
    an independent security review.

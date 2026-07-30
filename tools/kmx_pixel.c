@@ -32,16 +32,23 @@ close_fd(int *fd) {
 }
 
 static void
-reap(pid_t *pid) {
+reap(pid_t *pid, unsigned grace_millis) {
     int status;
+    unsigned waited = 0;
     if (*pid <= 0) return;
     kill(*pid, SIGTERM);
-    /* A short wait, then insist.  A capture process that will not leave must
-     * not hold the session open. */
-    usleep(150000);
+    while (waited < grace_millis) {
+        pid_t result = waitpid(*pid, &status, WNOHANG);
+        if (result == *pid || (result < 0 && errno == ECHILD)) {
+            *pid = -1;
+            return;
+        }
+        usleep(50000);
+        waited += 50;
+    }
     if (waitpid(*pid, &status, WNOHANG) != *pid) {
         kill(*pid, SIGKILL);
-        waitpid(*pid, &status, 0);
+        (void)waitpid(*pid, &status, 0);
     }
     *pid = -1;
 }
@@ -223,9 +230,11 @@ void
 kmx_pixel_stop(kmx_pixel_pane *pane) {
     if (!pane) return;
     close_fd(&pane->frames);
-    reap(&pane->capture);
-    reap(&pane->app);
-    reap(&pane->server);
+    reap(&pane->capture, 250);
+    /* GUI applications keep profile state. Give them time to flush it after
+     * SIGTERM instead of turning every streamed session into a crash restore. */
+    reap(&pane->app, 5000);
+    reap(&pane->server, 250);
     free(pane->frame);
     pane->frame = NULL;
 }
