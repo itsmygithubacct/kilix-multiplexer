@@ -5,10 +5,16 @@
  * either a CA nobody maintains or a client that accepts any certificate - the
  * second being worse than no TLS, because it looks like security.
  *
- * So the server mints a key and a self-signed certificate at startup, keeps
- * both in memory, and prints the certificate's fingerprint.  The client is
- * given that fingerprint and refuses anything else.  Trust is established once,
- * out of band, by the person who can read both screens. */
+ * So the server mints a key and a self-signed certificate, prints the
+ * certificate's fingerprint, and the client is given that fingerprint and
+ * refuses anything else.  Trust is established once, out of band, by the person
+ * who can read both screens.
+ *
+ * That identity is persisted, because it was originally minted fresh on every
+ * start - which meant the fingerprint to pin changed every restart, and an
+ * operator who has to re-copy it constantly stops checking it.  Pinning that
+ * people are trained to ignore is worse than none, since it still looks like
+ * assurance.  --tls-ephemeral restores the in-memory-only behaviour. */
 #define _GNU_SOURCE
 
 #include "kmx_tls.h"
@@ -21,8 +27,12 @@
 #include <openssl/x509.h>
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
 #include <string.h>
 
 struct kmx_tls_server {
@@ -70,6 +80,116 @@ certificate_fingerprint(X509 *certificate, char *out, size_t size) {
 
 /* A certificate with no name in it, because there is no name to verify: the
  * fingerprint is the identity. */
+/* Where a persistent identity lives.
+ *
+ * A certificate regenerated on every start means the fingerprint a client is
+ * told to pin changes every time the server restarts - so the operator either
+ * re-copies it constantly or, far more likely, stops checking it. A pinning
+ * scheme people are trained to ignore provides no assurance while looking as
+ * though it does, which is worse than none.
+ *
+ * The cost is real and worth stating: the private key is now on disk rather
+ * than only in memory. It is written 0600 in a 0700 directory, so it is exposed
+ * to the same-uid processes that could have read it out of memory anyway, and
+ * to backups - which is the part that is genuinely new. --tls-ephemeral keeps
+ * the old behaviour for anyone who prefers it. */
+static int mkdir_p_private(const char *path);
+
+static bool
+identity_path(char *out, size_t size, const char *leaf) {
+    const char *state = getenv("XDG_STATE_HOME");
+    const char *home = getenv("HOME");
+    int written;
+    if (state && *state == '/') {
+        written = snprintf(out, size, "%s/kilix-multiplexer", state);
+    } else if (home && *home == '/') {
+        written = snprintf(out, size, "%s/.local/state/kilix-multiplexer", home);
+    } else {
+        return false;
+    }
+    if (written < 0 || (size_t)written >= size) return false;
+    if (mkdir_p_private(out) != 0) return false;
+    written = snprintf(out + written, size - (size_t)written, "/%s", leaf);
+    return written > 0 && (size_t)written < size - strlen(out);
+}
+
+/* Each component created 0700, and an existing path must already be a
+ * directory this user owns - not a symlink someone else planted. */
+static int
+mkdir_p_private(const char *path) {
+    char work[512];
+    size_t index;
+    struct stat info;
+    if (snprintf(work, sizeof work, "%s", path) >= (int)sizeof work) return -1;
+    for (index = 1; work[index]; index++) {
+        if (work[index] != '/') continue;
+        work[index] = 0;
+        if (mkdir(work, 0700) != 0 && errno != EEXIST) return -1;
+        work[index] = '/';
+    }
+    if (mkdir(work, 0700) != 0 && errno != EEXIST) return -1;
+    if (lstat(work, &info) != 0) return -1;
+    if (!S_ISDIR(info.st_mode) || info.st_uid != getuid()) return -1;
+    return 0;
+}
+
+/* Load a previously stored identity. Any problem is treated as "no identity",
+ * because falling back to generating a fresh one is always safe; trusting a
+ * half-read key is not. */
+static bool
+load_identity(EVP_PKEY **key_out, X509 **certificate_out) {
+    char key_path[512];
+    char cert_path[512];
+    FILE *file;
+    EVP_PKEY *key = NULL;
+    X509 *certificate = NULL;
+    struct stat info;
+
+    if (!identity_path(key_path, sizeof key_path, "server.key")) return false;
+    if (!identity_path(cert_path, sizeof cert_path, "server.crt")) return false;
+    if (lstat(key_path, &info) != 0 || !S_ISREG(info.st_mode) ||
+        info.st_uid != getuid() || (info.st_mode & 0077) != 0) {
+        return false;
+    }
+    file = fopen(key_path, "r");
+    if (!file) return false;
+    key = PEM_read_PrivateKey(file, NULL, NULL, NULL);
+    fclose(file);
+    if (!key) return false;
+    file = fopen(cert_path, "r");
+    if (!file) { EVP_PKEY_free(key); return false; }
+    certificate = PEM_read_X509(file, NULL, NULL, NULL);
+    fclose(file);
+    if (!certificate) { EVP_PKEY_free(key); return false; }
+    *key_out = key;
+    *certificate_out = certificate;
+    return true;
+}
+
+static void
+store_identity(EVP_PKEY *key, X509 *certificate) {
+    char key_path[512];
+    char cert_path[512];
+    FILE *file;
+    int fd;
+    if (!identity_path(key_path, sizeof key_path, "server.key")) return;
+    if (!identity_path(cert_path, sizeof cert_path, "server.crt")) return;
+    /* O_EXCL-less but 0600 from creation, so there is no window where the key
+     * exists with looser permissions. */
+    fd = open(key_path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
+    if (fd < 0) return;
+    file = fdopen(fd, "w");
+    if (!file) { close(fd); return; }
+    PEM_write_PrivateKey(file, key, NULL, NULL, 0, NULL, NULL);
+    fclose(file);
+    fd = open(cert_path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
+    if (fd < 0) return;
+    file = fdopen(fd, "w");
+    if (!file) { close(fd); return; }
+    PEM_write_X509(file, certificate);
+    fclose(file);
+}
+
 static bool
 make_self_signed(EVP_PKEY **key_out, X509 **certificate_out) {
     EVP_PKEY *key = NULL;
@@ -105,12 +225,15 @@ make_self_signed(EVP_PKEY **key_out, X509 **certificate_out) {
 }
 
 kmx_tls_server *
-kmx_tls_server_create(char *fingerprint, size_t size) {
+kmx_tls_server_create(char *fingerprint, size_t size, bool ephemeral) {
     kmx_tls_server *server = calloc(1, sizeof *server);
     if (!server) return NULL;
-    if (!make_self_signed(&server->key, &server->certificate)) {
-        free(server);
-        return NULL;
+    if (ephemeral || !load_identity(&server->key, &server->certificate)) {
+        if (!make_self_signed(&server->key, &server->certificate)) {
+            free(server);
+            return NULL;
+        }
+        if (!ephemeral) store_identity(server->key, server->certificate);
     }
     server->context = SSL_CTX_new(TLS_server_method());
     if (!server->context) {

@@ -148,18 +148,27 @@ predictor is for.
   pane is different: `kitty-pty-broker` keeps owning the PTY and the local
   frontend stays attached when the observer server exits. Client
   `--reconnect` reconnects to a running server; it does not restart one.
+  Checked rather than assumed: killing the observer with SIGKILL left the
+  broker session alive, and a fresh observer replayed output produced before
+  the kill.
 - **Only tapped local graphics are portable.** Inline Kitty graphics remain
   semantic. Host-local `t=s`, `t=f` and `t=t` references are suppressed when
   the presenter tap supplies the corresponding RGB, but an unrelated producer
   outside that tap cannot have an already-consumed local payload reconstructed.
-- **The TLS certificate is generated per server start**, so a pinned
-  fingerprint is per-session and has to be re-copied each time you start one.
-  That is a real usability cost and it pushes people toward not checking the
-  fingerprint at all.
-- **Eight client slots, and a ten-second grace period for a new connection to
-  authenticate.** Eight peers that connect and stay silent can therefore keep a
-  session unattachable. On a loopback bind that is nothing; on `--lan` it is a
-  denial of service available to anyone who can reach the port.
+- **The TLS identity is now persisted** in the user's XDG state directory
+  (0600 in a 0700 directory), so a pinned fingerprint stays valid across
+  restarts. It used to be minted per start, which meant re-copying the
+  fingerprint constantly and, in practice, learning to skip the check.
+  `--tls-ephemeral` restores the old behaviour. The trade is explicit: the
+  private key is on disk now, so it is exposed to backups in a way it was not
+  before.
+- **Eight client slots.** A connection that has not authenticated within
+  `KMX_SETTLE_MS` is dropped, and when every slot is taken a new connection
+  displaces the *oldest un-authenticated* one — so peers that connect and stay
+  silent can no longer lock a session out, which they previously could, for
+  free, from anywhere that could reach the port. A peer that has authenticated
+  is never displaced. Eight simultaneous *legitimate* clients is still the
+  ceiling.
 
 ## Properties the tests assert
 

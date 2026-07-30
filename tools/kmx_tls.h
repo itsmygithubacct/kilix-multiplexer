@@ -25,7 +25,12 @@ typedef struct kmx_tls_session kmx_tls_session;
 
 /* Generate a key and a self-signed certificate, both held in memory and never
  * written to disk. `fingerprint` receives the hex digest. */
-kmx_tls_server *kmx_tls_server_create(char *fingerprint, size_t size);
+/* `ephemeral` keeps the old behaviour: a fresh identity per start, never
+ * written to disk.  The default persists it under XDG_STATE_HOME so that a
+ * pinned fingerprint stays valid across restarts - see kmx_tls.c for why that
+ * trade is worth making. */
+kmx_tls_server *kmx_tls_server_create(
+    char *fingerprint, size_t size, bool ephemeral);
 void kmx_tls_server_free(kmx_tls_server *server);
 
 /* How a handshake in progress wants to be driven. */

@@ -520,6 +520,9 @@ usage(void) {
           "  --audio-source runs a command that writes raw 16-bit PCM to stdout.\n"
           "  --lan requires a token; one is generated and printed if not given.\n"
           "  A reachable bind encrypts by default and prints a fingerprint the\n"
+        "  client must be given.  That identity persists under XDG_STATE_HOME so\n"
+        "  the fingerprint stays the same across restarts; --tls-ephemeral mints\n"
+        "  a fresh one per start and never writes it to disk.\n"
           "  client must be given; --no-tls turns that off, which is only\n"
           "  reasonable inside a tunnel.\n",
           stderr);
@@ -534,6 +537,7 @@ main(int argc, char **argv) {
     bool require_token = false;
     bool use_tls = false;
     bool refuse_tls = false;
+    bool tls_ephemeral = false;
     kmx_tls_server *tls = NULL;
     char fingerprint[KMX_TLS_FINGERPRINT_HEX + 1];
     const char *commands[KMX_MAX_PANES];
@@ -579,6 +583,9 @@ main(int argc, char **argv) {
     unsigned accept_allowance = KMX_ACCEPT_BURST;
     uint64_t accept_refilled = 0;
     unsigned long accepts_refused = 0;
+    /* Counted and reported: a session displacing peers constantly is being
+     * leaned on, and that should be visible rather than silent. */
+    unsigned long displaced_pending = 0;
     /* Reported at shutdown rather than silently swallowed: a plane that drops
      * is behaving as designed, but a plane that drops everything is a
      * misconfiguration, and the difference should be visible. */
@@ -661,6 +668,8 @@ main(int argc, char **argv) {
             allow_public = true;
         } else if (strcmp(argv[index], "--tls") == 0) {
             use_tls = true;
+        } else if (strcmp(argv[index], "--tls-ephemeral") == 0) {
+            tls_ephemeral = true;
         } else if (strcmp(argv[index], "--no-tls") == 0) {
             refuse_tls = true;
         } else if (strcmp(argv[index], "--token") == 0 && index + 1 < argc) {
@@ -769,7 +778,7 @@ main(int argc, char **argv) {
             fprintf(stderr, "kmx-serve: --tls applies to a TCP socket\n");
             return 2;
         }
-        tls = kmx_tls_server_create(fingerprint, sizeof fingerprint);
+        tls = kmx_tls_server_create(fingerprint, sizeof fingerprint, tls_ephemeral);
         if (!tls) {
             fprintf(stderr, "kmx-serve: could not set up TLS\n");
             return 1;
@@ -1049,6 +1058,40 @@ main(int argc, char **argv) {
                     if (clients[which].fd < 0) {
                         free_slot = which;
                         break;
+                    }
+                }
+                /* No free slot: take the oldest one still not authenticated.
+                 *
+                 * Without this, eight peers that connect and say nothing hold
+                 * every slot for KMX_SETTLE_MS and can simply reconnect, which
+                 * kept a session unattachable indefinitely at no cost to
+                 * whoever could reach the port.  The settle sweep bounded how
+                 * long each squatter lasted; it did nothing about the next one.
+                 *
+                 * A peer that has greeted is never displaced - that is a real
+                 * client and losing it would be the denial of service moved
+                 * rather than removed.  Among the un-greeted, the oldest goes:
+                 * a legitimate client greets in milliseconds, so the connection
+                 * being evicted is the one that has already had its whole
+                 * chance and not taken it. */
+                if (free_slot == KMX_MAX_CLIENTS) {
+                    uint64_t oldest = 0;
+                    size_t victim = KMX_MAX_CLIENTS;
+                    for (which = 0; which < KMX_MAX_CLIENTS; which++) {
+                        if (clients[which].fd < 0) continue;
+                        if (clients[which].greeted) continue;
+                        /* settle_by is armed at accept and cleared on HELLO, so
+                         * the largest one is the connection that arrived first. */
+                        if (victim == KMX_MAX_CLIENTS ||
+                            clients[which].settle_by < oldest) {
+                            oldest = clients[which].settle_by;
+                            victim = which;
+                        }
+                    }
+                    if (victim != KMX_MAX_CLIENTS) {
+                        client_release(&clients[victim], count);
+                        displaced_pending++;
+                        free_slot = victim;
                     }
                 }
                 kmx_endpoint_tune(accepted, &endpoint);
@@ -1596,6 +1639,11 @@ main(int argc, char **argv) {
         fprintf(stderr,
             "kmx-serve: dropped %zu video frame(s) and %zu audio block(s) that "
             "did not fit a client's backlog\n", frames_dropped, blocks_dropped);
+    }
+    if (displaced_pending) {
+        fprintf(stderr,
+            "kmx-serve: displaced %lu connection(s) that never authenticated\n",
+            displaced_pending);
     }
     if (accepts_refused) {
         fprintf(stderr, "kmx-serve: refused %lu connection(s) to the rate limit\n",
