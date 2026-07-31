@@ -11,12 +11,13 @@ import ctypes
 import json
 import os
 from pathlib import Path
+import re
+import shlex
 import shutil
 import signal
 import subprocess
 import sys
 import time
-import shlex
 
 
 def parse_args():
@@ -27,7 +28,13 @@ def parse_args():
     parser.add_argument("--height", required=True, type=int)
     parser.add_argument("--fps", type=int, default=10)
     parser.add_argument("--url", default="about:blank")
-    parser.add_argument("--kilix-home", default=os.environ.get("KILIX_HOME", "kilix"))
+    configured_home = os.environ.get("KILIX_HOME")
+    parser.add_argument(
+        "--kilix-home",
+        default=configured_home,
+        required=not configured_home,
+        help="Kilix source root (or set KILIX_HOME)",
+    )
     parser.add_argument("--user-data-dir")
     parser.add_argument(
         "--profile-number",
@@ -35,6 +42,18 @@ def parse_args():
         help="0 selects Default; N selects the directory 'Profile N'",
     )
     return parser.parse_args()
+
+
+def process_is_live(pid):
+    try:
+        state = next(
+            line.split()[1]
+            for line in Path(f"/proc/{pid}/status").read_text().splitlines()
+            if line.startswith("State:")
+        )
+    except (FileNotFoundError, PermissionError, ProcessLookupError, StopIteration):
+        return False
+    return state not in {"X", "Z"}
 
 
 def processes_matching(predicate):
@@ -49,9 +68,11 @@ def processes_matching(predicate):
                 for line in (entry / "status").read_text().splitlines()
                 if line.startswith("State:")
             )
-            cmdline = (entry / "cmdline").read_bytes().replace(b"\0", b" ").decode(
-                "utf-8", "replace"
-            )
+            argv = [
+                value.decode("utf-8", "replace")
+                for value in (entry / "cmdline").read_bytes().split(b"\0")
+                if value
+            ]
         except (
             FileNotFoundError,
             PermissionError,
@@ -61,7 +82,7 @@ def processes_matching(predicate):
             continue
         if state == "Z":
             continue
-        if predicate(comm, cmdline):
+        if predicate(comm, argv):
             matches.append(int(entry.name))
     return matches
 
@@ -75,7 +96,7 @@ def terminate_pids(pids, timeout=4.0):
             pass
     deadline = time.monotonic() + timeout
     while pids and time.monotonic() < deadline:
-        pids = {pid for pid in pids if Path(f"/proc/{pid}").exists()}
+        pids = {pid for pid in pids if process_is_live(pid)}
         if pids:
             time.sleep(0.1)
     for pid in pids:
@@ -83,6 +104,70 @@ def terminate_pids(pids, timeout=4.0):
             os.kill(pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
             pass
+    deadline = time.monotonic() + 1.0
+    while pids and time.monotonic() < deadline:
+        pids = {pid for pid in pids if process_is_live(pid)}
+        if pids:
+            time.sleep(0.02)
+    return pids
+
+
+def resolve_profile_configuration(args):
+    ephemeral_profile = args.user_data_dir is None
+    if ephemeral_profile:
+        user_data_dir = Path(f"/tmp/kmx-remote-chrome-{args.token}")
+        if user_data_dir.is_symlink() or (
+            user_data_dir.exists() and not user_data_dir.is_dir()
+        ):
+            raise SystemExit(
+                f"remote Chrome: unsafe temporary profile path: {user_data_dir}"
+            )
+    else:
+        user_data_dir = Path(args.user_data_dir).expanduser().resolve()
+        if not user_data_dir.is_dir():
+            raise SystemExit(
+                f"remote Chrome: user-data directory does not exist: {user_data_dir}"
+            )
+
+    profile_directory = None
+    if args.profile_number is not None:
+        if args.profile_number < 0:
+            raise SystemExit("remote Chrome: profile number cannot be negative")
+        profile_directory = (
+            "Default" if args.profile_number == 0
+            else f"Profile {args.profile_number}"
+        )
+        selected_profile = user_data_dir / profile_directory
+        if not selected_profile.is_dir():
+            raise SystemExit(
+                f"remote Chrome: profile does not exist: {selected_profile}"
+            )
+    return ephemeral_profile, user_data_dir, profile_directory
+
+
+def resolve_kilix_home(value):
+    kilix_home = Path(value).expanduser().resolve()
+    required_modules = (
+        kilix_home / "config" / "apprun.py",
+        kilix_home / "config" / "xinject.py",
+    )
+    if not kilix_home.is_dir() or not all(path.is_file() for path in required_modules):
+        raise SystemExit(
+            "remote Chrome: Kilix source root is missing required input modules: "
+            f"{kilix_home}"
+        )
+    return kilix_home
+
+
+def validate_arguments(args):
+    if not (1024 <= args.port <= 65535):
+        raise SystemExit("remote Chrome: invalid port")
+    if not re.fullmatch(r"[0-9a-fA-F]{16,32}", args.token):
+        raise SystemExit("remote Chrome: token must be 16-32 hexadecimal characters")
+    if args.width < 320 or args.height < 200:
+        raise SystemExit("remote Chrome: framebuffer is too small")
+    if not (1 <= args.fps <= 60):
+        raise SystemExit("remote Chrome: fps must be between 1 and 60")
 
 
 def profile_state_snapshot(local_state):
@@ -134,12 +219,12 @@ def restore_profile_state(local_state, snapshot):
 
 def main():
     args = parse_args()
-    if not (1024 <= args.port <= 65535):
-        raise SystemExit("remote Chrome: invalid port")
-    if len(args.token) < 16 or len(args.token) > 32:
-        raise SystemExit("remote Chrome: token must be 16-32 characters")
-    if args.width < 320 or args.height < 200:
-        raise SystemExit("remote Chrome: framebuffer is too small")
+    validate_arguments(args)
+
+    ephemeral_profile, user_data_dir, profile_directory = (
+        resolve_profile_configuration(args)
+    )
+    kilix_home = resolve_kilix_home(args.kilix_home)
 
     source = Path(__file__).resolve().parent.parent
     serve = source / "build" / "kmx-serve"
@@ -152,13 +237,15 @@ def main():
     if not chrome:
         raise SystemExit("remote Chrome: google-chrome is not installed")
 
-    # The user explicitly wants a clean Chrome slate.  Chrome's process tree
+    # Validate every path and profile choice before reaching this destructive
+    # boundary. Chrome's process tree
     # uses `chrome` for the browser and renderer processes, so clear all of it
     # and prove it reached zero before creating the private profile.
-    existing = processes_matching(lambda comm, _cmd: comm == "chrome")
+    existing = processes_matching(lambda comm, _argv: comm == "chrome")
     print(f"remote Chrome: pre-existing chrome processes={len(existing)}", flush=True)
-    terminate_pids(existing)
-    remaining = processes_matching(lambda comm, _cmd: comm == "chrome")
+    unresolved = terminate_pids(existing)
+    remaining = processes_matching(lambda comm, _argv: comm == "chrome")
+    remaining = sorted(set(remaining) | set(unresolved))
     if remaining:
         raise SystemExit(
             "remote Chrome: could not stop pre-existing processes: "
@@ -166,31 +253,9 @@ def main():
         )
     print("remote Chrome: chrome processes after cleanup=0", flush=True)
 
-    ephemeral_profile = args.user_data_dir is None
     if ephemeral_profile:
-        user_data_dir = Path(f"/tmp/kmx-remote-chrome-{args.token}")
         if user_data_dir.exists():
             shutil.rmtree(user_data_dir)
-    else:
-        user_data_dir = Path(args.user_data_dir).expanduser().resolve()
-        if not user_data_dir.is_dir():
-            raise SystemExit(
-                f"remote Chrome: user-data directory does not exist: {user_data_dir}"
-            )
-
-    profile_directory = None
-    if args.profile_number is not None:
-        if args.profile_number < 0:
-            raise SystemExit("remote Chrome: profile number cannot be negative")
-        profile_directory = (
-            "Default" if args.profile_number == 0
-            else f"Profile {args.profile_number}"
-        )
-        selected_profile = user_data_dir / profile_directory
-        if not selected_profile.is_dir():
-            raise SystemExit(
-                f"remote Chrome: profile does not exist: {selected_profile}"
-            )
 
     local_state = user_data_dir / "Local State"
     saved_profile_state = (
@@ -220,7 +285,7 @@ def main():
             str(args.width),
             str(args.height),
             "--kilix-home",
-            args.kilix_home,
+            str(kilix_home),
         ]
     )
     command = [
@@ -276,11 +341,20 @@ def main():
             except subprocess.TimeoutExpired:
                 server.kill()
                 server.wait()
-        profile_text = str(user_data_dir)
+        profile_argument = f"--user-data-dir={user_data_dir}"
         owned = processes_matching(
-            lambda _comm, cmdline: profile_text in cmdline
+            lambda comm, argv: comm == "chrome" and profile_argument in argv
         )
-        terminate_pids(owned)
+        unresolved = terminate_pids(owned)
+        remaining = processes_matching(
+            lambda comm, argv: comm == "chrome" and profile_argument in argv
+        )
+        remaining = sorted(set(remaining) | set(unresolved))
+        if remaining:
+            raise SystemExit(
+                "remote Chrome: could not stop session processes: "
+                + ",".join(str(pid) for pid in remaining)
+            )
         if ephemeral_profile and user_data_dir.exists():
             shutil.rmtree(user_data_dir)
         elif not ephemeral_profile:

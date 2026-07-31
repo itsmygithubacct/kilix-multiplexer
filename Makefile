@@ -1,5 +1,6 @@
 CC ?= cc
 AR ?= ar
+PYTHON ?= python3
 BUILD_DIR ?= build
 PREFIX ?= /usr/local
 
@@ -33,6 +34,7 @@ SERVE := $(BUILD_DIR)/kmx-serve
 SHAPE := $(BUILD_DIR)/kmx-shape
 ATTACH := $(BUILD_DIR)/kmx-attach
 FLOOD := $(BUILD_DIR)/flood-input
+INPUT_TEST := $(BUILD_DIR)/test-input-transform
 
 .PHONY: all clean test sanitize fuzz backpressure churn check-vendor install
 
@@ -79,11 +81,14 @@ $(BUILD_DIR)/kmx_tls.o: tools/kmx_tls.c tools/kmx_tls.h | $(BUILD_DIR)
 $(SERVE): $(BUILD_DIR)/kmx_serve.o $(BUILD_DIR)/kmx_pixel.o $(BUILD_DIR)/kmx_tap.o $(BUILD_DIR)/kmx_tls.o $(STATIC_LIB)
 	$(CC) $(LDFLAGS) -o "$@" $(BUILD_DIR)/kmx_serve.o $(BUILD_DIR)/kmx_pixel.o $(BUILD_DIR)/kmx_tap.o $(BUILD_DIR)/kmx_tls.o $(STATIC_LIB) $(LDLIBS) -lutil -lssl -lcrypto
 
-$(BUILD_DIR)/kmx_attach.o: tools/kmx_attach.c tools/kmx_tls.h include/kilix_mux.h | $(BUILD_DIR)
+$(BUILD_DIR)/kmx_attach.o: tools/kmx_attach.c tools/kmx_tls.h tools/kmx_input_transform.h include/kilix_mux.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Itools -c "$<" -o "$@"
 
-$(ATTACH): $(BUILD_DIR)/kmx_attach.o $(BUILD_DIR)/kmx_tls.o $(STATIC_LIB)
-	$(CC) $(LDFLAGS) -o "$@" $(BUILD_DIR)/kmx_attach.o $(BUILD_DIR)/kmx_tls.o $(STATIC_LIB) $(LDLIBS) -lssl -lcrypto
+$(BUILD_DIR)/kmx_input_transform.o: tools/kmx_input_transform.c tools/kmx_input_transform.h include/kilix_mux.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Itools -c "$<" -o "$@"
+
+$(ATTACH): $(BUILD_DIR)/kmx_attach.o $(BUILD_DIR)/kmx_input_transform.o $(BUILD_DIR)/kmx_tls.o $(STATIC_LIB)
+	$(CC) $(LDFLAGS) -o "$@" $(BUILD_DIR)/kmx_attach.o $(BUILD_DIR)/kmx_input_transform.o $(BUILD_DIR)/kmx_tls.o $(STATIC_LIB) $(LDLIBS) -lssl -lcrypto
 
 $(BUILD_DIR)/test_mux.o: tests/test_mux.c include/kilix_mux.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c "$<" -o "$@"
@@ -96,6 +101,12 @@ $(BUILD_DIR)/test_tap.o: tests/test_tap.c tools/kmx_tap.h | $(BUILD_DIR)
 
 $(TAP_TEST): $(BUILD_DIR)/test_tap.o $(BUILD_DIR)/kmx_tap.o
 	$(CC) $(LDFLAGS) -o "$@" $(BUILD_DIR)/test_tap.o $(BUILD_DIR)/kmx_tap.o
+
+$(BUILD_DIR)/test_input_transform.o: tests/test_input_transform.c tools/kmx_input_transform.h include/kilix_mux.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Itools -c "$<" -o "$@"
+
+$(INPUT_TEST): $(BUILD_DIR)/test_input_transform.o $(BUILD_DIR)/kmx_input_transform.o $(STATIC_LIB)
+	$(CC) $(LDFLAGS) -o "$@" $(BUILD_DIR)/test_input_transform.o $(BUILD_DIR)/kmx_input_transform.o $(STATIC_LIB) $(LDLIBS)
 
 $(BUILD_DIR)/flood_input.o: tests/flood_input.c include/kilix_mux.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c "$<" -o "$@"
@@ -115,9 +126,12 @@ backpressure: $(SERVE) $(FLOOD)
 churn:
 	tests/churn.sh
 
-test: $(TEST) $(TAP_TEST)
+test: $(TEST) $(TAP_TEST) $(INPUT_TEST)
 	$(TEST_ENVIRONMENT) "$(TEST)"
 	$(TEST_ENVIRONMENT) "$(TAP_TEST)"
+	$(TEST_ENVIRONMENT) "$(INPUT_TEST)"
+	$(PYTHON) tests/test_remote_chrome.py
+	$(PYTHON) tests/test_pixel_input.py
 
 TEST_ENVIRONMENT ?=
 

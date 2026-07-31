@@ -78,6 +78,32 @@ that helper makes the session view-only. Presenter discovery is likewise local
 and session-scoped: applications pay only a one-second socket existence check
 until a server is actually waiting.
 
+## Remote Chrome pixel pane
+
+`tools/kmx_remote_chrome.py` is an optional Linux SSH-command helper for one
+interactive Chrome pixel pane. It starts the server on loopback for carriage
+through an SSH tunnel, gives Chrome a private X display, fits its window to the
+framebuffer, and routes authenticated controller input through XTest. The
+helper and `kmx-serve` must come from the same built checkout.
+
+Its lifecycle rule is deliberately strict: after validating the requested
+profile, Kilix source root, required programs, dimensions, port, and token, it
+stops every live process named `chrome` that it can see and refuses to start
+unless the live count reaches zero. Do not use it when another Chrome session
+must remain running.
+
+Pass `--kilix-home KILIX_SOURCE_ROOT`, or set `KILIX_HOME`; there is no
+working-directory-dependent fallback. With no `--user-data-dir`, the helper
+uses and removes an ephemeral profile. To use saved logins, pass an existing
+Chrome user-data directory and optionally `--profile-number N`: zero selects
+`Default`, and a positive number selects `Profile N`. The helper snapshots and
+restores Chrome's general `last_used` and `last_active_profiles` selection so
+that the per-session choice does not become the usual profile.
+
+Keep the SSH destination, checkout locations, Chrome data location, chosen
+profile, launch wrappers, and logs in operator-owned configuration outside
+this checkout, as described above.
+
 ## What it costs
 
 Measured by `tools/bench.sh` at 24×80, against the raw PTY byte count a

@@ -21,9 +21,12 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("width", type=int)
     parser.add_argument("height", type=int)
+    configured_home = os.environ.get("KILIX_HOME")
     parser.add_argument(
         "--kilix-home",
-        default=os.environ.get("KILIX_HOME", "kilix"),
+        default=configured_home,
+        required=not configured_home,
+        help="Kilix source root (or set KILIX_HOME)",
     )
     return parser.parse_args()
 
@@ -81,6 +84,18 @@ def write_pipe(fd, data):
         view = view[written:]
 
 
+def dispatch_event(injector, event, width, height):
+    kind = event.get("kind")
+    if kind == "key":
+        event_type = event.get("event", 1)
+        if event_type != 2:
+            injector.key(event["key"], event_type)
+    elif kind == "paste":
+        injector.paste(event.get("text", ""))
+    elif kind == "mouse":
+        injector.mouse(event, (0, 0, width, height))
+
+
 def main():
     args = parse_args()
     if args.width < 1 or args.height < 1:
@@ -131,15 +146,7 @@ def main():
                 break
             write_pipe(write_fd, chunk)
             for event in term.read_input():
-                kind = event.get("kind")
-                if kind == "key":
-                    event_type = event.get("event", 1)
-                    if event_type != 2:
-                        injector.key(event["key"], event_type)
-                elif kind == "paste":
-                    injector.paste(event.get("text", ""))
-                elif kind == "mouse":
-                    injector.mouse(event, (0, 0, args.width, args.height))
+                dispatch_event(injector, event, args.width, args.height)
     finally:
         injector.release_all()
         os.close(write_fd)
