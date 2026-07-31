@@ -330,9 +330,13 @@ Stated plainly rather than left to be discovered.
       the other decoders audited for the same shape (they bound the 64-bit
       value first, which is the correct order)
 - [x] Re-soaked against the fix — 47.9M executions in 15 minutes, clean
-- [ ] A longer soak still, hours rather than minutes. The longest run so far is
-      12.7M executions in three minutes on the current tree, plus the 47.9M
-      re-soak above; nothing has been run for hours.
+- [x] A longer soak, hours rather than minutes (2026-07-30): **566,133,758
+      executions over four hours**, against the tree including the slot-eviction
+      and persistent-identity changes. No crash, leak, timeout or
+      out-of-memory; coverage rose from 852 to 861 and settled. That is roughly
+      forty-four times the previous longest run. It found nothing, which is a
+      weaker result than the 25-minute soak that found a real bug — but it is
+      the first run long enough that finding nothing means something.
 
 ## If you are reviewing this
 
