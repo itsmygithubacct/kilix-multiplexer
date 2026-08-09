@@ -16,6 +16,8 @@
  * changing the plane's shape. */
 #include "kilix_mux.h"
 
+#include "rate.h"
+
 #include <stdlib.h>
 #include <string.h>
 
@@ -179,10 +181,8 @@ kmx_motion_offer(
      * frame, not queuing it: by the time there is room, a newer frame will
      * have arrived and this one would be stale. */
     if (motion->budget) {
-        if (now_millis - motion->window_start >= 1000) {
-            motion->window_start = now_millis;
-            motion->window_bytes = 0;
-        }
+        rate_window_advance(&motion->window_start, &motion->window_bytes,
+                            motion->budget, now_millis);
         if (motion->window_bytes >= motion->budget) {
             motion->dropped++;
             return KMX_OK;

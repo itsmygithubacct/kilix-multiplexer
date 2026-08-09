@@ -16,6 +16,8 @@
  * codec choice without changing the plane's shape. */
 #include "kilix_mux.h"
 
+#include "rate.h"
+
 #include <stdlib.h>
 #include <string.h>
 
@@ -130,10 +132,8 @@ kmx_audio_offer(
     *produced = false;
 
     if (audio->budget) {
-        if (timestamp_millis - audio->window_start >= 1000) {
-            audio->window_start = timestamp_millis;
-            audio->window_bytes = 0;
-        }
+        rate_window_advance(&audio->window_start, &audio->window_bytes,
+                            audio->budget, timestamp_millis);
         if (audio->window_bytes >= audio->budget) {
             /* Dropped, not held.  Holding it would delay everything behind it
              * and still arrive too late to play. */

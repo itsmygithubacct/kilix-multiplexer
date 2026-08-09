@@ -150,6 +150,9 @@ struct kmx_sync {
     kmx_grid current;
     kmx_grid acked;
     bool acked_valid;
+    /* The highest sequence the baseline has been moved to.  Acknowledgements
+     * are cumulative, so this only ever moves forward; see kmx_sync_ack_at. */
+    uint64_t acked_sequence;
     sent_state history[KMX_SENT_HISTORY];
     uint64_t next_sequence;
     uint64_t last_send_millis;
@@ -262,6 +265,13 @@ kmx_sync_reset_baseline(kmx_sync *sync) {
     if (!sync) return;
     sync->acked_valid = false;
     sync->last_send_millis = 0;
+    /* Everything sent so far belongs to whoever was attached before.  Moving
+     * the floor up to the last issued sequence means a late acknowledgement
+     * from that session cannot install a baseline the newly attached client
+     * has never held, while every sequence issued from here on still
+     * advances normally. */
+    sync->acked_sequence =
+        sync->next_sequence ? sync->next_sequence - 1 : 0;
     for (index = 0; index < KMX_SENT_HISTORY; index++) {
         sync->history[index].used = false;
     }
@@ -394,6 +404,19 @@ kmx_sync_ack_at(kmx_sync *sync, uint64_t sequence, uint64_t now_millis) {
     sent_state *slot;
     if (!sync) return KMX_ERR_INVALID;
     if (sequence == 0 || sequence >= sync->next_sequence) return KMX_ERR_INVALID;
+    /* Acknowledgements are cumulative, so one that does not advance the
+     * baseline has nothing to say.  Applying it anyway would move the baseline
+     * BACKWARD, and that is not merely wasteful: the next diff would be
+     * computed against a state the receiver has already moved past, so any
+     * cell that changed and changed back between the two would match the old
+     * baseline, be omitted from the diff, and leave the receiver displaying
+     * the intermediate value permanently.
+     *
+     * A duplicate or reordered acknowledgement is ordinary traffic, not an
+     * error, so this is a no-op rather than a failure.  Its round trip is not
+     * folded into the estimate either; a duplicate's arrival time says nothing
+     * about how long the original took. */
+    if (sequence <= sync->acked_sequence) return KMX_OK;
     slot = history_slot(sync, sequence);
     /* An acknowledgement for a state that has aged out of the ring is not an
      * error; the baseline simply stays where it is and the next message is a
@@ -404,6 +427,7 @@ kmx_sync_ack_at(kmx_sync *sync, uint64_t sequence, uint64_t now_millis) {
     }
     if (kmx_grid_copy(&sync->acked, &slot->state) != KMX_OK) return KMX_ERR_MEMORY;
     sync->acked_valid = true;
+    sync->acked_sequence = sequence;
     return KMX_OK;
 }
 

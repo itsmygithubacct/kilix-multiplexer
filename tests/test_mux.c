@@ -1669,6 +1669,239 @@ test_pacing_stays_quick_on_a_fast_link(void) {
     kmx_sync_free(sync);
 }
 
+/* A cumulative acknowledgement never moves the baseline backward.
+ *
+ * A duplicate or reordered ack is ordinary traffic. Applying one anyway makes
+ * the sender diff against a state the receiver has already moved past, so any
+ * cell that changed and changed back is omitted from the diff and the receiver
+ * keeps the intermediate value permanently. This drives a real sender and
+ * receiver through exactly that shape. */
+static void
+test_sync_ignores_a_stale_acknowledgement(void) {
+    kmx_sync *sync = NULL;
+    kmx_receiver *receiver = NULL;
+    kmx_buffer out;
+    kmx_sync_info info;
+    bool produced = false;
+    uint64_t seq = 0;
+    uint64_t first = 0;
+    uint64_t second = 0;
+
+    CHECK(kmx_sync_create(&sync, 24, 80) == KMX_OK);
+    CHECK(kmx_receiver_create(&receiver, 24, 80) == KMX_OK);
+    kmx_sync_set_interval(sync, KMX_SEND_INTERVAL_MIN_MS);
+
+    /* State A: "AAAA" at the top left. */
+    CHECK(kmx_sync_feed(sync, "\033[2J\033[1;1HAAAA", 15) == KMX_OK);
+    kmx_buffer_init(&out);
+    CHECK(kmx_sync_poll(sync, 1000, &out, &produced, &info) == KMX_OK);
+    CHECK(produced);
+    first = info.sequence;
+    CHECK(kmx_receiver_apply(receiver, out.data, out.size, &seq) == KMX_OK);
+    kmx_buffer_free(&out);
+    CHECK(kmx_sync_ack_at(sync, first, 1010) == KMX_OK);
+
+    /* State B: the same cells now read "BBBB". */
+    CHECK(kmx_sync_feed(sync, "\033[1;1HBBBB", 10) == KMX_OK);
+    kmx_buffer_init(&out);
+    CHECK(kmx_sync_poll(sync, 2000, &out, &produced, &info) == KMX_OK);
+    CHECK(produced);
+    second = info.sequence;
+    CHECK(kmx_receiver_apply(receiver, out.data, out.size, &seq) == KMX_OK);
+    kmx_buffer_free(&out);
+    CHECK(kmx_sync_ack_at(sync, second, 2010) == KMX_OK);
+
+    /* A late duplicate of the FIRST ack. Not an error, and not an instruction
+     * to forget what the second one established. */
+    CHECK(kmx_sync_ack_at(sync, first, 2020) == KMX_OK);
+
+    /* State C: the cells revert to "AAAA" while something else also changes. */
+    CHECK(kmx_sync_feed(sync, "\033[1;1HAAAA\033[5;1Hmarker", 23) == KMX_OK);
+    kmx_buffer_init(&out);
+    CHECK(kmx_sync_poll(sync, 3000, &out, &produced, &info) == KMX_OK);
+    CHECK(produced);
+    CHECK(kmx_receiver_apply(receiver, out.data, out.size, &seq) == KMX_OK);
+    kmx_buffer_free(&out);
+
+    /* The receiver must be showing exactly what the sender has. */
+    CHECK(kmx_grid_equal(kmx_sync_current(sync), kmx_receiver_grid(receiver)));
+
+    kmx_receiver_free(receiver);
+    kmx_sync_free(sync);
+}
+
+/* Attaching a client forgets the baseline, and a late acknowledgement from
+ * whoever was attached before must not install one the new client never held. */
+static void
+test_sync_reset_baseline_ignores_earlier_acks(void) {
+    kmx_sync *sync = NULL;
+    kmx_receiver *receiver = NULL;
+    kmx_buffer out;
+    kmx_sync_info info;
+    bool produced = false;
+    uint64_t seq = 0;
+    uint64_t first = 0;
+
+    CHECK(kmx_sync_create(&sync, 24, 80) == KMX_OK);
+    kmx_sync_set_interval(sync, KMX_SEND_INTERVAL_MIN_MS);
+
+    CHECK(kmx_sync_feed(sync, "\033[2J\033[1;1Hbefore", 17) == KMX_OK);
+    kmx_buffer_init(&out);
+    CHECK(kmx_sync_poll(sync, 1000, &out, &produced, &info) == KMX_OK);
+    CHECK(produced);
+    first = info.sequence;
+    kmx_buffer_free(&out);
+
+    /* A new client attaches: it holds nothing. */
+    kmx_sync_reset_baseline(sync);
+    CHECK(kmx_receiver_create(&receiver, 24, 80) == KMX_OK);
+
+    /* The previous client's acknowledgement arrives late. */
+    CHECK(kmx_sync_ack_at(sync, first, 1500) == KMX_OK);
+
+    CHECK(kmx_sync_feed(sync, "\033[1;1Hafter ", 12) == KMX_OK);
+    kmx_buffer_init(&out);
+    CHECK(kmx_sync_poll(sync, 2000, &out, &produced, &info) == KMX_OK);
+    CHECK(produced);
+    /* The new client holds nothing, so this has to be a full repaint. */
+    CHECK(info.from_scratch);
+    CHECK(kmx_receiver_apply(receiver, out.data, out.size, &seq) == KMX_OK);
+    kmx_buffer_free(&out);
+
+    CHECK(kmx_grid_equal(kmx_sync_current(sync), kmx_receiver_grid(receiver)));
+    kmx_receiver_free(receiver);
+    kmx_sync_free(sync);
+}
+
+/* The documented ceiling is a rate, and a sliding window that forgets what it
+ * overspent does not bound one. A plane must send its first frame whole or it
+ * shows nothing, so the startup burst is expected; what must hold is the
+ * steady-state rate once the plane has been running. */
+static void
+test_motion_ceiling_bounds_the_steady_rate(void) {
+    enum { W = 320, H = 240, BUDGET = 1024, WINDOWS = 40 };
+    kmx_motion *motion = NULL;
+    kmx_buffer out;
+    unsigned char *frame;
+    size_t steady = 0;
+    size_t largest = 0;
+    size_t i;
+
+    frame = malloc((size_t)W * (size_t)H * 3u);
+    CHECK(frame != NULL);
+    for (i = 0; i < (size_t)W * (size_t)H * 3u; i++) {
+        frame[i] = (unsigned char)((i * 2654435761u) >> 13);
+    }
+    CHECK(kmx_motion_create(&motion, BUDGET) == KMX_OK);
+
+    for (i = 0; i < WINDOWS; i++) {
+        bool produced = false;
+        size_t j;
+        for (j = 0; j < (size_t)W * 3u * 8u; j++) {
+            frame[j] = (unsigned char)(frame[j] + 17u);
+        }
+        kmx_buffer_init(&out);
+        CHECK(kmx_motion_offer(motion, frame, W, H,
+                               1000 + (uint64_t)i * 1000u, &out, &produced,
+                               NULL) == KMX_OK);
+        if (produced) {
+            if (out.size > largest) largest = out.size;
+            if (i >= WINDOWS / 2) steady += out.size;
+        }
+        kmx_buffer_free(&out);
+    }
+
+    /* A limiter that does not fragment a payload can be in debt by at most the
+     * one item it last admitted. */
+    CHECK(steady <= (size_t)BUDGET * (WINDOWS / 2) + largest);
+    /* And it must actually be limiting: a run this far over budget has to have
+     * refused something. */
+    CHECK(kmx_motion_dropped(motion) > 0);
+
+    kmx_motion_free(motion);
+    free(frame);
+}
+
+static void
+test_audio_ceiling_bounds_the_steady_rate(void) {
+    enum { BUDGET = 512, BLOCK = 4096, WINDOWS = 40 };
+    kmx_audio *audio = NULL;
+    kmx_buffer out;
+    unsigned char *pcm;
+    size_t steady = 0;
+    size_t largest = 0;
+    size_t i;
+
+    pcm = malloc(BLOCK);
+    CHECK(pcm != NULL);
+    for (i = 0; i < BLOCK; i++) pcm[i] = (unsigned char)((i * 2654435761u) >> 11);
+    CHECK(kmx_audio_create(&audio, 48000, 2, BUDGET) == KMX_OK);
+
+    for (i = 0; i < WINDOWS; i++) {
+        bool produced = false;
+        size_t j;
+        for (j = 0; j < BLOCK; j++) pcm[j] = (unsigned char)(pcm[j] + 29u);
+        kmx_buffer_init(&out);
+        CHECK(kmx_audio_offer(audio, pcm, BLOCK, 1000 + (uint64_t)i * 1000u,
+                              &out, &produced, NULL) == KMX_OK);
+        if (produced) {
+            if (out.size > largest) largest = out.size;
+            if (i >= WINDOWS / 2) steady += out.size;
+        }
+        kmx_buffer_free(&out);
+    }
+
+    CHECK(steady <= (size_t)BUDGET * (WINDOWS / 2) + largest);
+    CHECK(kmx_audio_dropped(audio) > 0);
+
+    kmx_audio_free(audio);
+    free(pcm);
+}
+
+/* An idle plane must not accumulate credit it can spend as one burst: the
+ * window repays what was overspent, it does not bank an unused allowance. */
+static void
+test_motion_idle_does_not_bank_allowance(void) {
+    enum { W = 64, H = 64, BUDGET = 64 };
+    kmx_motion *motion = NULL;
+    kmx_buffer out;
+    unsigned char *frame;
+    bool produced = false;
+    size_t i;
+
+    frame = malloc((size_t)W * (size_t)H * 3u);
+    CHECK(frame != NULL);
+    /* Incompressible, so a frame reliably costs more than this budget; a
+     * uniform frame would compress to less and never exercise the gate. */
+    for (i = 0; i < (size_t)W * (size_t)H * 3u; i++) {
+        frame[i] = (unsigned char)((i * 2654435761u) >> 15);
+    }
+    CHECK(kmx_motion_create(&motion, BUDGET) == KMX_OK);
+
+    /* One frame, then a long quiet period. */
+    kmx_buffer_init(&out);
+    CHECK(kmx_motion_offer(motion, frame, W, H, 1000, &out, &produced, NULL) ==
+          KMX_OK);
+    CHECK(produced);
+    kmx_buffer_free(&out);
+
+    /* After a hundred idle seconds the account is clear, not in credit, so the
+     * very next frame is admitted and the one after it is still governed. */
+    for (i = 0; i < 4; i++) {
+        frame[i * 3u] = (unsigned char)(0x80u + i);
+        kmx_buffer_init(&out);
+        CHECK(kmx_motion_offer(motion, frame, W, H, 101000 + (uint64_t)i, &out,
+                               &produced, NULL) == KMX_OK);
+        kmx_buffer_free(&out);
+    }
+    /* Four frames offered inside one millisecond window: the budget is spent
+     * by the first of them, so at least one must have been refused. */
+    CHECK(kmx_motion_dropped(motion) > 0);
+
+    kmx_motion_free(motion);
+    free(frame);
+}
+
 int
 main(void) {
     RUN(test_grid_basics);
@@ -1715,6 +1948,11 @@ main(void) {
     RUN(test_audio_reports_gaps);
     RUN(test_audio_drops_rather_than_buffers);
     RUN(test_audio_sink_rejects_malformed_input);
+    RUN(test_sync_ignores_a_stale_acknowledgement);
+    RUN(test_sync_reset_baseline_ignores_earlier_acks);
+    RUN(test_motion_ceiling_bounds_the_steady_rate);
+    RUN(test_audio_ceiling_bounds_the_steady_rate);
+    RUN(test_motion_idle_does_not_bank_allowance);
     RUN(test_pacing_follows_the_round_trip);
     RUN(test_pacing_stays_quick_on_a_fast_link);
     puts("all kilix-multiplexer tests passed");
