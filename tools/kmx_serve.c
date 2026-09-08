@@ -1501,6 +1501,7 @@ main(int argc, char **argv) {
                     bool produced = false;
                     if (item->fd < 0 || !item->audio) continue;
                     if (item->audio_encodec || audio_mode == KMX_AUDIO_ENCODEC) continue;
+                    if (item->audio_caps_seen && item->audio_selection.codecs != KMX_AUDIO_CODEC_PCM) continue;
                     if (item->handshaking) continue;
                     if (require_token && !item->greeted) continue;
                     kmx_buffer_init(&message);

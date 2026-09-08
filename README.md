@@ -68,6 +68,9 @@ An optional EnCodec build adds `--audio-codec auto|encodec|pcm` and
 legacy peers, missing installed mono models and incompatible rate offers.
 `encodec` requires the exact mono profile locally and at the peer; an old peer
 that cannot select it is refused. `pcm` always selects the existing PCM plane.
+After a capability refusal, that connection receives no audio; its other
+planes may continue. PCM fallback applies only to a legacy peer or an explicit
+PCM selection.
 The two endpoints must select the same bitrate. The stereo file profile is
 not a live KMX capability.
 
