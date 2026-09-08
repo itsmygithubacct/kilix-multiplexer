@@ -106,7 +106,10 @@ existing sink with `KMX_AUDIO_RATE=24000` and `KMX_AUDIO_CHANNELS=1`.
 The encoder is shared across clients at the selected rate. Output packets are
 opaque native KMA2 and are never passed through zstd. Queue overflow or work
 older than 250 ms abandons the global epoch and resumes at the next one-second
-source boundary with native RESET/DISCONTINUITY flags. A client whose own
+source boundary with native RESET/DISCONTINUITY flags. That age starts at the
+first contributing input offer and includes accumulation, inference and output
+queue residence. Advancing a broken boundary invalidates already queued and
+in-flight encoder work. A client whose own
 application backlog is full or stale abandons only its own epoch. Codec calls,
 RTF, queue drops and discontinuities are reported at shutdown; `--dump` also
 reports selected codec and verified packet PTS/epoch/flags. KMX's existing
@@ -115,6 +118,10 @@ not a measured TLS wire-rate claim.
 
 `make test` includes bounded capability/refusal controls. An optional real
 native check is `build-encodec/test-encodec --development-assets /absolute/graphs`.
+With the same native build options, build `build-encodec/test-encodec-age` and
+run it with `/absolute/graphs` to check total acquisition age at all three
+capture rates and recovery after queued or in-flight epoch invalidation.
+This test injects scheduling delays around actual native calls.
 `tests/encodec_transport.py` checks actual capture, decoder/sink bytes, PTS,
 TLS and both legacy directions using synthetic PCM; its arguments select
 exact binaries, local graphs and a new evidence directory. These functional

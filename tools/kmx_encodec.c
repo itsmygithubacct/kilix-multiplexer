@@ -123,6 +123,12 @@ static void drain_event(int fd) {
     while (read(fd, &value, sizeof value) == (ssize_t)sizeof value) {}
 }
 
+static uint64_t generation_now(const kmx_encodec *codec) {
+    /* The encoder's monotonic broken boundary also invalidates queued and
+     * in-flight work atomically. A decoder has a separate reconnect counter. */
+    return codec->encode ? atomic_load(&codec->broken_until) : atomic_load(&codec->generation);
+}
+
 static void break_epoch(kmx_encodec *codec, uint64_t pts_ms) {
     uint64_t boundary = pts_ms > UINT64_MAX - 1000u ? UINT64_MAX : (pts_ms / 1000u + 1u) * 1000u;
     uint64_t previous = atomic_load(&codec->broken_until);
@@ -174,17 +180,19 @@ static long resample(kmx_encodec *codec, const codec_input *input, float *out) {
 
 static void *worker(void *opaque) {
     kmx_encodec *codec = opaque;
-    uint64_t generation = atomic_load(&codec->generation), next_capture = 0, next_pts = 0;
+    uint64_t generation = generation_now(codec), next_capture = 0, next_pts = 0;
+    uint64_t accumulated_offered_ms = 0;
     bool started = false, waiting = true;
     int16_t accumulated[KMX_ENCODEC_SAMPLES];
     size_t used = 0;
     while (!atomic_load(&codec->stop)) {
         uint64_t tail = atomic_load_explicit(&codec->in_tail, memory_order_relaxed);
         codec_input input;
-        uint64_t current_generation = atomic_load(&codec->generation);
+        uint64_t current_generation = generation_now(codec);
         if (generation != current_generation) {
             generation = current_generation;
             if (codec->decoder) kenc_decoder_reset(codec->decoder);
+            else { started = false; used = 0; }
             waiting = true;
         }
         /* Output capacity never expands. Stop consuming input until the
@@ -205,7 +213,9 @@ static void *worker(void *opaque) {
         }
         input = codec->input[tail % SLOTS];
         atomic_store_explicit(&codec->in_tail, tail + 1, memory_order_release);
-        if (input.generation != generation) continue;
+        if (input.generation != generation) {
+            atomic_fetch_add(&codec->input_drops, 1); continue;
+        }
         if (codec->encode) {
             float converted[CAPTURE_MAX_FRAMES];
             long frames, at;
@@ -239,6 +249,7 @@ static void *worker(void *opaque) {
                 if (!isfinite(value)) value = 0;
                 if (value > 32767.0f) value = 32767.0f;
                 if (value < -32768.0f) value = -32768.0f;
+                if (!used) accumulated_offered_ms = input.offered_ms;
                 accumulated[used++] = (int16_t)lrintf(value);
                 if (used == KMX_ENCODEC_SAMPLES) {
                     kmx_encodec_output output = {0};
@@ -249,13 +260,13 @@ static void *worker(void *opaque) {
                     atomic_fetch_add(&codec->inference_ns, nanoseconds() - began);
                     atomic_fetch_add(&codec->calls, 1);
                     used = 0;
-                    if (result != KENC_OK || milliseconds() - input.offered_ms > KMX_ENCODEC_STALE_MS ||
+                    if (result != KENC_OK || milliseconds() - accumulated_offered_ms > KMX_ENCODEC_STALE_MS ||
                         kenc_packet_metadata_read(&metadata, output.packet, output.size, &codec->options) != KENC_OK) {
                         break_epoch(codec, input.pts_ms); started = false;
                         atomic_fetch_add(&codec->output_drops, 1); break;
                     }
                     output.pts_ms = metadata.packet.pts_ms; output.flags = metadata.packet.flags;
-                    output.epoch = metadata.epoch; output.created_ms = milliseconds();
+                    output.epoch = metadata.epoch; output.created_ms = accumulated_offered_ms;
                     if (!publish(codec, &output, generation)) { started = false; break; }
                     next_pts += 40;
                 }
@@ -392,7 +403,7 @@ static bool offer(kmx_encodec *codec, const void *bytes, size_t size, uint64_t p
     }
     input = &codec->input[head % SLOTS];
     memcpy(input->bytes, bytes, size); input->size = size; input->pts_ms = pts_ms;
-    input->offered_ms = milliseconds(); input->generation = atomic_load(&codec->generation);
+    input->offered_ms = milliseconds(); input->generation = generation_now(codec);
     atomic_store_explicit(&codec->in_head, head + 1, memory_order_release);
     notify(codec->input_event);
     return true;
@@ -418,8 +429,10 @@ bool kmx_encodec_receive(kmx_encodec *codec, kmx_encodec_output *output) {
         current = codec->output[tail % SLOTS];
         atomic_store_explicit(&codec->out_tail, tail + 1, memory_order_release);
         notify(codec->input_event);
-        if (current.generation != atomic_load(&codec->generation) ||
-            (codec->encode && current.value.pts_ms < atomic_load(&codec->broken_until))) continue;
+        if (current.generation != generation_now(codec) ||
+            (codec->encode && current.value.pts_ms < atomic_load(&codec->broken_until))) {
+            atomic_fetch_add(&codec->output_drops, 1); continue;
+        }
         if (milliseconds() - current.value.created_ms > KMX_ENCODEC_STALE_MS) {
             atomic_fetch_add(&codec->output_drops, 1);
             if (codec->encode) break_epoch(codec, current.value.pts_ms);

@@ -143,6 +143,10 @@ churn:
 $(ENCODEC_TEST): tests/test_encodec.c $(BUILD_DIR)/kmx_encodec.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Itools $(LDFLAGS) -o "$@" tests/test_encodec.c $(BUILD_DIR)/kmx_encodec.o $(CODEC_LIBS) -lm
 
+# Explicit local graph input is required to run this scheduling regression.
+$(BUILD_DIR)/test-encodec-age: tests/test_encodec_age.c $(BUILD_DIR)/kmx_encodec.o
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Itools $(LDFLAGS) -Wl,--wrap=kenc_encoder_push_s16 -o "$@" tests/test_encodec_age.c $(BUILD_DIR)/kmx_encodec.o $(CODEC_LIBS) -lm
+
 test: $(TEST) $(TAP_TEST) $(INPUT_TEST) $(ENCODEC_TEST)
 	$(TEST_ENVIRONMENT) "$(TEST)"
 	$(TEST_ENVIRONMENT) "$(TAP_TEST)"
