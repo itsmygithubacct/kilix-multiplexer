@@ -21,6 +21,7 @@
 #include "kmx_pixel.h"
 #include "kmx_tap.h"
 #include "kmx_tls.h"
+#include "kmx_encodec.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -116,6 +117,14 @@ typedef struct {
     uint64_t settle_by;
     kmx_motion *motion;   /* per client: what IT has been shown */
     kmx_audio *audio;     /* per client: its own rate allowance */
+    bool audio_caps_seen;
+    bool audio_encodec;
+    bool audio_wait_reset;
+    kmx_audio_caps audio_offer;
+    kmx_audio_caps audio_selection;
+    uint64_t audio_window;
+    size_t audio_spent;
+    uint64_t audio_pending_since;
     int rows;
     int cols;
     kmx_sync *sync[KMX_MAX_PANES];
@@ -219,6 +228,7 @@ client_flush(client *item) {
     }
     item->out_offset = 0;
     item->out.size = 0;
+    item->audio_pending_since = 0;
     return 0;
 }
 
@@ -527,6 +537,8 @@ usage(void) {
           "  observer stays read-only; input uses the separate helper command.\n"
           "  --tap-socket receives presenter RGB frames for the named session.\n"
           "  --audio-source runs a command that writes raw 16-bit PCM to stdout.\n"
+          "  --audio-codec auto|encodec|pcm and --audio-bitrate 3|6|12 select audio.\n"
+          "  EnCodec requires admitted 24 kHz graphs; capture supports 24/44.1/48 kHz.\n"
           "  --lan requires a token; one is generated and printed if not given.\n"
           "  A reachable bind encrypts by default and prints a fingerprint the\n"
         "  client must be given.  That identity persists under XDG_STATE_HOME so\n"
@@ -577,6 +589,14 @@ main(int argc, char **argv) {
     size_t audio_block_bytes = 0;
     size_t audio_filled = 0;
     uint64_t audio_clock = 0;
+    kmx_audio_mode audio_mode = KMX_AUDIO_AUTO;
+    unsigned audio_bitrate = 6;
+    const char *development_audio_assets = NULL;
+    kmx_encodec *audio_codec = NULL;
+    unsigned char *audio_codec_block = NULL;
+    size_t audio_codec_filled = 0;
+    size_t encodec_client_drops = 0;
+    int exit_code = 0;
     char *const *single = NULL;
     size_t command_count = 0;
     bool vertical = false;
@@ -673,6 +693,12 @@ main(int argc, char **argv) {
             audio_channels = atoi(argv[++index]);
         } else if (strcmp(argv[index], "--audio-budget") == 0 && index + 1 < argc) {
             audio_budget = (uint32_t)strtoul(argv[++index], NULL, 10);
+        } else if (strcmp(argv[index], "--audio-codec") == 0 && index + 1 < argc) {
+            if (kmx_audio_mode_parse(argv[++index], &audio_mode)) { usage(); return 2; }
+        } else if (strcmp(argv[index], "--audio-bitrate") == 0 && index + 1 < argc) {
+            if (kmx_audio_bitrate_parse(argv[++index], &audio_bitrate)) { usage(); return 2; }
+        } else if (strcmp(argv[index], "--development-encodec-assets") == 0 && index + 1 < argc) {
+            development_audio_assets = argv[++index];
         } else if (strcmp(argv[index], "--lan") == 0) {
             allow_public = true;
         } else if (strcmp(argv[index], "--tls") == 0) {
@@ -722,7 +748,8 @@ main(int argc, char **argv) {
          (command_count != 0 || single || pixel_command)) ||
         (input_command && !broker_session && !pixel_command) ||
         (tap_path && (!tap_session || !*tap_session)) ||
-        (tap_session_given && !tap_path)) {
+        (tap_session_given && !tap_path) ||
+        (audio_mode == KMX_AUDIO_ENCODEC && !audio_command)) {
         usage();
         return 2;
     }
@@ -964,6 +991,21 @@ main(int argc, char **argv) {
                 audio_rate, audio_channels);
     }
 
+    if (audio_command && audio_mode != KMX_AUDIO_PCM) {
+        if (development_audio_assets) fprintf(stderr, "kmx-serve: DEVELOPMENT graph path; no installed admission\n");
+        audio_codec = kmx_encodec_open(true, audio_bitrate, audio_rate, audio_channels,
+                                      getenv("KILIX_CONTENT_ROOT"), development_audio_assets);
+        if (audio_codec) {
+            audio_codec_block = malloc(audio_block_bytes * 2u);
+            if (!audio_codec_block) { kmx_encodec_close(audio_codec); audio_codec = NULL; }
+        }
+        if (!audio_codec) {
+            fprintf(stderr, "kmx-serve: EnCodec unavailable; %s\n",
+                    audio_mode == KMX_AUDIO_ENCODEC ? "explicit selection refused" : "PCM fallback selected");
+            if (audio_mode == KMX_AUDIO_ENCODEC) { stop_requested = 1; exit_code = 1; }
+        } else fprintf(stderr, "kmx-serve: EnCodec 24 kHz mono warmed, %u kb/s, two threads\n", audio_bitrate);
+    }
+
     signal(SIGPIPE, SIG_IGN);
     signal(SIGINT, handle_stop);
     signal(SIGTERM, handle_stop);
@@ -971,7 +1013,7 @@ main(int argc, char **argv) {
     while (!stop_requested) {
         /* +4 for audio, the private-display frame pipe, and both ends of the
          * presenter tap. */
-        struct pollfd descriptors[1 + KMX_MAX_CLIENTS + KMX_MAX_PANES + 4];
+        struct pollfd descriptors[1 + KMX_MAX_CLIENTS + KMX_MAX_PANES + 5];
         nfds_t descriptor_count = 0;
         size_t client_at[KMX_MAX_CLIENTS];
         size_t pane_at[KMX_MAX_PANES];
@@ -1024,6 +1066,13 @@ main(int argc, char **argv) {
 
         if (audio_fd >= 0) {
             descriptors[descriptor_count].fd = audio_fd;
+            descriptors[descriptor_count].events = POLLIN;
+            descriptors[descriptor_count].revents = 0;
+            descriptor_count++;
+        }
+
+        if (audio_codec) {
+            descriptors[descriptor_count].fd = kmx_encodec_event_fd(audio_codec);
             descriptors[descriptor_count].events = POLLIN;
             descriptors[descriptor_count].revents = 0;
             descriptor_count++;
@@ -1250,7 +1299,8 @@ main(int argc, char **argv) {
                         break;
                     }
                     item->greeted = true;
-                    item->settle_by = 0;
+                    item->settle_by = audio_mode == KMX_AUDIO_ENCODEC && !item->audio_caps_seen ?
+                        now_millis() + 2000u : 0;
                     /* A peer's dimensions drive layout arithmetic and pane
                      * sizing, so they are bounded here rather than trusted to
                      * be sane. */
@@ -1268,6 +1318,26 @@ main(int argc, char **argv) {
                     /* Nothing is accepted before a valid greeting. */
                     client_release(item, count);
                     break;
+                } else if (type == KMX_MSG_AUDIO_CAPS) {
+                    kmx_audio_caps offered;
+                    unsigned char reply[KMX_AUDIO_CAPS_BYTES];
+                    if (!item->greeted || kmx_audio_caps_read(&offered, payload, size) || offered.kind != 0 ||
+                        (item->audio_caps_seen && (offered.codecs != item->audio_offer.codecs ||
+                         offered.rates != item->audio_offer.rates || offered.maximum != item->audio_offer.maximum))) {
+                        client_release(item, count); break;
+                    }
+                    if (!item->audio_caps_seen) {
+                        item->audio_caps_seen = true;
+                        item->audio_offer = offered;
+                        item->audio_selection = kmx_audio_choose(&offered, audio_codec != NULL, audio_bitrate, audio_mode);
+                        item->audio_encodec = item->audio_selection.codecs == KMX_AUDIO_CODEC_ENCODEC;
+                        item->audio_wait_reset = true;
+                    }
+                    item->settle_by = 0;
+                    kmx_audio_caps_write(reply, &item->audio_selection);
+                    if (client_queue(item, KMX_MSG_AUDIO_CAPS, reply, sizeof reply)) {
+                        client_release(item, count); break;
+                    }
                 } else if (type == KMX_MSG_INPUT) {
                     /* Enforced here, not in the client: a viewer that chose to
                      * send input still cannot reach the pane. */
@@ -1400,7 +1470,9 @@ main(int argc, char **argv) {
             stop_helper(&panes[0].input_child);
         }
 
-        while (audio_fd >= 0) {
+        {
+        unsigned audio_reads = 0;
+        while (audio_fd >= 0 && audio_reads++ < 8u) {
             /* Deliberately not named `count`: that is the pane count in this
              * scope, and shadowing it here would hand the wrong value to
              * client_release. */
@@ -1411,11 +1483,24 @@ main(int argc, char **argv) {
                 audio_filled += (size_t)received;
                 if (audio_filled < audio_block_bytes) continue;
                 audio_filled = 0;
+                if (audio_codec) {
+                    memcpy(audio_codec_block + audio_codec_filled, audio_block, audio_block_bytes);
+                    audio_codec_filled += audio_block_bytes;
+                    if (audio_codec_filled == audio_block_bytes * 2u) {
+                        bool wanted = false;
+                        for (which = 0; which < KMX_MAX_CLIENTS; which++)
+                            if (clients[which].fd >= 0 && clients[which].audio_encodec) wanted = true;
+                        if (wanted) (void)kmx_encodec_offer_pcm(audio_codec, audio_codec_block,
+                                                              audio_codec_filled, audio_clock - 20u);
+                        audio_codec_filled = 0;
+                    }
+                }
                 for (which = 0; which < KMX_MAX_CLIENTS; which++) {
                     client *item = &clients[which];
                     kmx_buffer message;
                     bool produced = false;
                     if (item->fd < 0 || !item->audio) continue;
+                    if (item->audio_encodec || audio_mode == KMX_AUDIO_ENCODEC) continue;
                     if (item->handshaking) continue;
                     if (require_token && !item->greeted) continue;
                     kmx_buffer_init(&message);
@@ -1439,6 +1524,32 @@ main(int argc, char **argv) {
             close(audio_fd);
             audio_fd = -1;
             break;
+        }
+        }
+
+        if (audio_codec) {
+            kmx_encodec_output output;
+            while (kmx_encodec_receive(audio_codec, &output)) {
+                for (which = 0; which < KMX_MAX_CLIENTS; which++) {
+                    client *item = &clients[which];
+                    size_t framed = output.size + (output.size + 1u >= 128u ? 3u : 2u);
+                    if (item->fd < 0 || !item->greeted || !item->audio_encodec) continue;
+                    if (item->audio_wait_reset && !(output.flags & 1u)) { encodec_client_drops++; continue; }
+                    if (item->audio_window != output.pts_ms / 1000u) {
+                        item->audio_window = output.pts_ms / 1000u; item->audio_spent = 0;
+                    }
+                    /* A slow peer abandons only its own epoch. Existing
+                     * terminal/motion bytes retain their framing and order. */
+                    if (item->out.size - item->out_offset > 16384u ||
+                        (item->audio_pending_since && now_millis() - item->audio_pending_since > KMX_ENCODEC_STALE_MS) ||
+                        (audio_budget && (framed > audio_budget || item->audio_spent > audio_budget - framed)) ||
+                        client_queue(item, KMX_MSG_AUDIO, output.packet, output.size)) {
+                        item->audio_wait_reset = true; encodec_client_drops++; continue;
+                    }
+                    if (!item->audio_pending_since) item->audio_pending_since = now_millis();
+                    item->audio_wait_reset = false; item->audio_spent += framed;
+                }
+            }
         }
 
         if (pixel_running) {
@@ -1677,6 +1788,15 @@ main(int argc, char **argv) {
         waitpid(audio_child, NULL, 0);
     }
     free(audio_block);
+    free(audio_codec_block);
+    if (audio_codec) {
+        kmx_encodec_stats stats = kmx_encodec_statistics(audio_codec);
+        fprintf(stderr, "kmx-serve: encodec calls=%llu rtf=%.6f input_drops=%llu output_drops=%llu discontinuities=%llu client_drops=%zu\n",
+            (unsigned long long)stats.calls, stats.calls ? (double)stats.inference_ns / ((double)stats.calls * 40000000.0) : 0.0,
+            (unsigned long long)stats.input_drops, (unsigned long long)stats.output_drops,
+            (unsigned long long)stats.discontinuities, encodec_client_drops);
+        kmx_encodec_close(audio_codec);
+    }
     if (frames_dropped || blocks_dropped) {
         fprintf(stderr,
             "kmx-serve: dropped %zu video frame(s) and %zu audio block(s) that "
@@ -1694,5 +1814,5 @@ main(int argc, char **argv) {
     if (listener >= 0) close(listener);
     kmx_tls_server_free(tls);
     kmx_endpoint_cleanup(&endpoint);
-    return 0;
+    return exit_code;
 }

@@ -16,6 +16,16 @@ CFLAGS += -std=c11 -Wall -Wextra -Wpedantic -Werror -fPIC
 LDFLAGS ?=
 LDLIBS += -lzstd -lz -lm
 
+# Optional installed EnCodec consumer. The supplied native library must be
+# built with ONNX=1 CONTENT=1 and an exact reviewed CONTENT_SOURCE/COMMIT.
+ENCODEC ?= 0
+ENCODEC_CFLAGS ?= $(shell pkg-config --cflags kilix-encodec 2>/dev/null)
+ENCODEC_LIBS ?= $(shell pkg-config --libs kilix-encodec 2>/dev/null)
+ifeq ($(ENCODEC),1)
+CPPFLAGS += -DKMX_HAVE_ENCODEC=1 $(ENCODEC_CFLAGS)
+CODEC_LIBS := $(ENCODEC_LIBS) -lsamplerate -pthread
+endif
+
 # Vendored verbatim; built with the upstream project's own warning posture
 # rather than ours, so our -Werror never depends on someone else's code.
 VTERM_CFLAGS := -O2 -std=c99 -fPIC -w
@@ -35,6 +45,7 @@ SHAPE := $(BUILD_DIR)/kmx-shape
 ATTACH := $(BUILD_DIR)/kmx-attach
 FLOOD := $(BUILD_DIR)/flood-input
 INPUT_TEST := $(BUILD_DIR)/test-input-transform
+ENCODEC_TEST := $(BUILD_DIR)/test-encodec
 
 .PHONY: all clean test sanitize fuzz backpressure churn check-vendor install
 
@@ -60,7 +71,7 @@ $(BUILD_DIR)/kmx_bench.o: tools/kmx_bench.c include/kilix_mux.h | $(BUILD_DIR)
 $(BENCH): $(BUILD_DIR)/kmx_bench.o $(STATIC_LIB)
 	$(CC) $(LDFLAGS) -o "$@" $(BUILD_DIR)/kmx_bench.o $(STATIC_LIB) $(LDLIBS) -lutil
 
-$(BUILD_DIR)/kmx_serve.o: tools/kmx_serve.c tools/kmx_pixel.h tools/kmx_tap.h include/kilix_mux.h | $(BUILD_DIR)
+$(BUILD_DIR)/kmx_serve.o: tools/kmx_serve.c tools/kmx_pixel.h tools/kmx_tap.h tools/kmx_encodec.h include/kilix_mux.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Itools -c "$<" -o "$@"
 
 $(BUILD_DIR)/kmx_pixel.o: tools/kmx_pixel.c tools/kmx_pixel.h | $(BUILD_DIR)
@@ -78,17 +89,20 @@ $(SHAPE): $(BUILD_DIR)/kmx_shape.o
 $(BUILD_DIR)/kmx_tls.o: tools/kmx_tls.c tools/kmx_tls.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Itools -c "$<" -o "$@"
 
-$(SERVE): $(BUILD_DIR)/kmx_serve.o $(BUILD_DIR)/kmx_pixel.o $(BUILD_DIR)/kmx_tap.o $(BUILD_DIR)/kmx_tls.o $(STATIC_LIB)
-	$(CC) $(LDFLAGS) -o "$@" $(BUILD_DIR)/kmx_serve.o $(BUILD_DIR)/kmx_pixel.o $(BUILD_DIR)/kmx_tap.o $(BUILD_DIR)/kmx_tls.o $(STATIC_LIB) $(LDLIBS) -lutil -lssl -lcrypto
+$(BUILD_DIR)/kmx_encodec.o: tools/kmx_encodec.c tools/kmx_encodec.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Itools -c "$<" -o "$@"
 
-$(BUILD_DIR)/kmx_attach.o: tools/kmx_attach.c tools/kmx_tls.h tools/kmx_input_transform.h include/kilix_mux.h | $(BUILD_DIR)
+$(SERVE): $(BUILD_DIR)/kmx_serve.o $(BUILD_DIR)/kmx_pixel.o $(BUILD_DIR)/kmx_tap.o $(BUILD_DIR)/kmx_tls.o $(BUILD_DIR)/kmx_encodec.o $(STATIC_LIB)
+	$(CC) $(LDFLAGS) -o "$@" $(BUILD_DIR)/kmx_serve.o $(BUILD_DIR)/kmx_pixel.o $(BUILD_DIR)/kmx_tap.o $(BUILD_DIR)/kmx_tls.o $(BUILD_DIR)/kmx_encodec.o $(STATIC_LIB) $(LDLIBS) $(CODEC_LIBS) -lutil -lssl -lcrypto
+
+$(BUILD_DIR)/kmx_attach.o: tools/kmx_attach.c tools/kmx_tls.h tools/kmx_input_transform.h tools/kmx_encodec.h include/kilix_mux.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Itools -c "$<" -o "$@"
 
 $(BUILD_DIR)/kmx_input_transform.o: tools/kmx_input_transform.c tools/kmx_input_transform.h include/kilix_mux.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Itools -c "$<" -o "$@"
 
-$(ATTACH): $(BUILD_DIR)/kmx_attach.o $(BUILD_DIR)/kmx_input_transform.o $(BUILD_DIR)/kmx_tls.o $(STATIC_LIB)
-	$(CC) $(LDFLAGS) -o "$@" $(BUILD_DIR)/kmx_attach.o $(BUILD_DIR)/kmx_input_transform.o $(BUILD_DIR)/kmx_tls.o $(STATIC_LIB) $(LDLIBS) -lssl -lcrypto
+$(ATTACH): $(BUILD_DIR)/kmx_attach.o $(BUILD_DIR)/kmx_input_transform.o $(BUILD_DIR)/kmx_tls.o $(BUILD_DIR)/kmx_encodec.o $(STATIC_LIB)
+	$(CC) $(LDFLAGS) -o "$@" $(BUILD_DIR)/kmx_attach.o $(BUILD_DIR)/kmx_input_transform.o $(BUILD_DIR)/kmx_tls.o $(BUILD_DIR)/kmx_encodec.o $(STATIC_LIB) $(LDLIBS) $(CODEC_LIBS) -lssl -lcrypto
 
 $(BUILD_DIR)/test_mux.o: tests/test_mux.c include/kilix_mux.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c "$<" -o "$@"
@@ -126,10 +140,14 @@ backpressure: $(SERVE) $(FLOOD)
 churn:
 	tests/churn.sh
 
-test: $(TEST) $(TAP_TEST) $(INPUT_TEST)
+$(ENCODEC_TEST): tests/test_encodec.c $(BUILD_DIR)/kmx_encodec.o
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Itools $(LDFLAGS) -o "$@" tests/test_encodec.c $(BUILD_DIR)/kmx_encodec.o $(CODEC_LIBS) -lm
+
+test: $(TEST) $(TAP_TEST) $(INPUT_TEST) $(ENCODEC_TEST)
 	$(TEST_ENVIRONMENT) "$(TEST)"
 	$(TEST_ENVIRONMENT) "$(TAP_TEST)"
 	$(TEST_ENVIRONMENT) "$(INPUT_TEST)"
+	$(TEST_ENVIRONMENT) "$(ENCODEC_TEST)"
 	$(PYTHON) tests/test_remote_chrome.py
 	$(PYTHON) tests/test_pixel_input.py
 

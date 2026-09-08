@@ -63,6 +63,62 @@ on the attaching Kilix terminal. Audio is sent to `pacat` or `aplay` when one
 is available; `--audio-output COMMAND` selects another raw signed-16-bit PCM
 sink and `--no-audio` disables playback.
 
+An optional EnCodec build adds `--audio-codec auto|encodec|pcm` and
+`--audio-bitrate 3|6|12` to both programs. The default `auto` keeps PCM for
+legacy peers, missing installed mono models and incompatible rate offers.
+`encodec` requires the exact mono profile locally and at the peer; an old peer
+that cannot select it is refused. `pcm` always selects the existing PCM plane.
+The two endpoints must select the same bitrate. The stereo file profile is
+not a live KMX capability.
+
+Normal admission uses `KILIX_CONTENT_ROOT`, or the account's NSS home with
+`.local/gpu_terminal/kilix/data/desktop-apps`. Each process checks actual
+packaged catalog membership, receipts and the complete installed population
+through the native provider's embedded F100 adapter, then passes its sealed
+graph descriptors to the strict native loader. Model loading and warm-up
+finish before capability negotiation. KMX performs no download and does not
+substitute a graph directory or an environment-based readiness claim.
+
+Build the optional tools with `ENCODEC=1`, `ENCODEC_CFLAGS` and
+`ENCODEC_LIBS` selecting the reviewed native provider built with `ONNX=1
+CONTENT=1` and an exact `CONTENT_SOURCE`/`CONTENT_COMMIT`. The build also needs
+libsamplerate and pthreads. Use a separate `BUILD_DIR=build-encodec` when
+switching build modes. The default build retains no native codec dependency.
+
+For local development and oracle tests only,
+`--development-encodec-assets /absolute/graphs` explicitly uses native byte
+validation without installed admission. It prints a development notice and
+is never selected automatically. This path grants no receipt, model supply
+decision or release qualification. Normal desktop launchers do not use it.
+
+EnCodec inference uses two ORT threads in an owned worker thread, with two
+fixed 40 ms input slots and two fixed output slots. Capture conversion also
+runs there: 24/44.1/48 kHz interleaved PCM16 with one to eight channels is
+averaged with headroom and resampled to 24 kHz mono, accumulating exactly
+960 samples. Ordinary codec epochs preserve resampler state. Capture gaps
+reset it. The first output sample retains its session PTS; resampler and
+capture accumulation add delivery delay. Decoded mono is passed to the
+existing sink with `KMX_AUDIO_RATE=24000` and `KMX_AUDIO_CHANNELS=1`.
+
+The encoder is shared across clients at the selected rate. Output packets are
+opaque native KMA2 and are never passed through zstd. Queue overflow or work
+older than 250 ms abandons the global epoch and resumes at the next one-second
+source boundary with native RESET/DISCONTINUITY flags. A client whose own
+application backlog is full or stale abandons only its own epoch. Codec calls,
+RTF, queue drops and discontinuities are reported at shutdown; `--dump` also
+reports selected codec and verified packet PTS/epoch/flags. KMX's existing
+socket flushing coalesces audio with other queued traffic. Token bitrate is
+not a measured TLS wire-rate claim.
+
+`make test` includes bounded capability/refusal controls. An optional real
+native check is `build-encodec/test-encodec --development-assets /absolute/graphs`.
+`tests/encodec_transport.py` checks actual capture, decoder/sink bytes, PTS,
+TLS and both legacy directions using synthetic PCM; its arguments select
+exact binaries, local graphs and a new evidence directory. These functional
+controls do not establish listening, consumer timing, multi-client wire
+capacity, memory fit or soak qualification. Motion still has no presentation
+timestamp, so this audio feature makes no A/V synchronization claim.
+
 For a broker-owned Kilix pane, the installed frontend supplies the bookkeeping:
 
 ```sh
@@ -246,9 +302,10 @@ The native build uses zstd, zlib and OpenSSL. `Xvfb` and `ffmpeg` are
 optional standalone pixel-pane dependencies. Live attachment expects the
 protocol-v2 `kitty-pty-broker` executable and the local presenter tap that
 Kilix pins; neither is copied into this repository. There is no transport
-library, video encoder or audio codec dependency — the motion and audio planes
-carry lossless rectangles and PCM under zstd. Adding a lossy codec later is a
-codec choice, not a change of shape.
+library or video encoder dependency. The default audio build carries PCM
+under zstd. The optional EnCodec build additionally uses `libkilix-encodec`,
+its ONNX Runtime dependency, libsamplerate and pthreads as described above;
+the legacy PCM transport remains available.
 
 ## License
 

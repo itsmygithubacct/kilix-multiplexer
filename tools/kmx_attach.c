@@ -17,11 +17,13 @@
 #include "endpoint.h"
 #include "kmx_input_transform.h"
 #include "kmx_tls.h"
+#include "kmx_encodec.h"
 
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
+#include <spawn.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,6 +39,13 @@
 
 static volatile sig_atomic_t resize_pending;
 static volatile sig_atomic_t stop_pending;
+extern char **environ;
+
+static uint64_t now_millis(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t)now.tv_sec * 1000u + (uint64_t)now.tv_nsec / 1000000u;
+}
 
 static void
 handle_resize(int signal_number) {
@@ -153,6 +162,12 @@ send_hello(int fd, int rows, int cols, bool view_only, const char *token) {
         size += length;
     }
     return send_message(fd, KMX_MSG_HELLO, payload, size);
+}
+
+static int send_audio_offer(int fd, const kmx_audio_caps *caps) {
+    unsigned char payload[KMX_AUDIO_CAPS_BYTES];
+    kmx_audio_caps_write(payload, caps);
+    return send_message(fd, KMX_MSG_AUDIO_CAPS, payload, sizeof payload);
 }
 
 /* The loop polls this descriptor, so it has to be non-blocking.
@@ -378,6 +393,14 @@ audio_output_start(
 ) {
     int pipe_fds[2];
     pid_t child;
+    posix_spawn_file_actions_t actions;
+    posix_spawnattr_t attributes;
+    char rate[48], channel_count[48];
+    char **environment;
+    size_t count = 0, copied = 0, index;
+    int status, null_fd;
+    const char *selected;
+    char *arguments[4];
     if (!output || output->attempted) return;
     output->attempted = true;
     if ((command && strcmp(command, "none") == 0) || (!command && dump)) {
@@ -394,43 +417,44 @@ audio_output_start(
         output->disabled = true;
         return;
     }
-    child = fork();
-    if (child < 0) {
-        close(pipe_fds[0]);
-        close(pipe_fds[1]);
-        output->disabled = true;
-        return;
+    /* Inference owns threads. Use spawn file actions instead of running
+     * allocator/environment/shell setup inside a post-fork child. Only stdio
+     * reaches the sink; model, queue and authenticated socket FDs stay private. */
+    while (environ[count]) count++;
+    environment = calloc(count + 3u, sizeof *environment);
+    null_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
+    if (!environment || null_fd < 0) {
+        free(environment); if (null_fd >= 0) close(null_fd);
+        close(pipe_fds[0]); close(pipe_fds[1]); output->disabled = true; return;
     }
-    if (child == 0) {
-        char rate[32];
-        char channel_count[16];
-        int null_fd = open("/dev/null", O_WRONLY);
-        snprintf(rate, sizeof rate, "%u", sample_rate);
-        snprintf(channel_count, sizeof channel_count, "%u", channels);
-        setenv("KMX_AUDIO_RATE", rate, 1);
-        setenv("KMX_AUDIO_CHANNELS", channel_count, 1);
-        close(pipe_fds[1]);
-        if (dup2(pipe_fds[0], STDIN_FILENO) < 0) _exit(127);
-        close(pipe_fds[0]);
-        if (null_fd >= 0) {
-            (void)dup2(null_fd, STDOUT_FILENO);
-            (void)dup2(null_fd, STDERR_FILENO);
-            if (null_fd > STDERR_FILENO) close(null_fd);
+    for (index = 0; index < count; index++)
+        if (strncmp(environ[index], "KMX_AUDIO_RATE=", 15) && strncmp(environ[index], "KMX_AUDIO_CHANNELS=", 19))
+            environment[copied++] = environ[index];
+    snprintf(rate, sizeof rate, "KMX_AUDIO_RATE=%u", sample_rate);
+    snprintf(channel_count, sizeof channel_count, "KMX_AUDIO_CHANNELS=%u", channels);
+    environment[copied++] = rate; environment[copied++] = channel_count;
+    selected = command ? command : command_exists("pacat") ?
+        "exec pacat --playback --raw --format=s16le --rate \"$KMX_AUDIO_RATE\" --channels \"$KMX_AUDIO_CHANNELS\" --latency-msec=100" :
+        "exec aplay -q -t raw -f S16_LE -r \"$KMX_AUDIO_RATE\" -c \"$KMX_AUDIO_CHANNELS\"";
+    arguments[0] = (char *)"sh"; arguments[1] = (char *)"-c";
+    arguments[2] = (char *)selected; arguments[3] = NULL;
+    status = posix_spawn_file_actions_init(&actions);
+    if (!status) {
+        status = posix_spawnattr_init(&attributes);
+        if (!status) {
+            status = posix_spawn_file_actions_adddup2(&actions, pipe_fds[0], STDIN_FILENO);
+            if (!status) status = posix_spawn_file_actions_adddup2(&actions, null_fd, STDOUT_FILENO);
+            if (!status) status = posix_spawn_file_actions_adddup2(&actions, null_fd, STDERR_FILENO);
+            if (!status) status = posix_spawn_file_actions_addclosefrom_np(&actions, 3);
+            if (!status) status = posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETPGROUP);
+            if (!status) status = posix_spawnattr_setpgroup(&attributes, 0);
+            if (!status) status = posix_spawn(&child, "/bin/sh", &actions, &attributes, arguments, environment);
+            posix_spawnattr_destroy(&attributes);
         }
-        if (command) {
-            execl("/bin/sh", "sh", "-c", command, (char *)NULL);
-        } else if (command_exists("pacat")) {
-            execlp(
-                "pacat", "pacat", "--playback", "--raw",
-                "--format=s16le", "--rate", rate, "--channels", channel_count,
-                "--latency-msec=100", (char *)NULL);
-        } else {
-            execlp(
-                "aplay", "aplay", "-q", "-t", "raw", "-f", "S16_LE",
-                "-r", rate, "-c", channel_count, (char *)NULL);
-        }
-        _exit(127);
+        posix_spawn_file_actions_destroy(&actions);
     }
+    free(environment); close(null_fd);
+    if (status) { close(pipe_fds[0]); close(pipe_fds[1]); output->disabled = true; return; }
     close(pipe_fds[0]);
     output->fd = pipe_fds[1];
     output->child = child;
@@ -490,17 +514,20 @@ audio_output_stop(audio_output *output) {
     if (output->fd >= 0) close(output->fd);
     output->fd = -1;
     if (output->child > 0) {
-        int attempt;
-        pid_t reaped = 0;
-        for (attempt = 0; attempt < 20 && reaped == 0; attempt++) {
-            struct timespec pause = {.tv_sec = 0, .tv_nsec = 10000000};
-            reaped = waitpid(output->child, NULL, WNOHANG);
-            if (reaped == 0) nanosleep(&pause, NULL);
+        int attempt, phase;
+        siginfo_t state = {0};
+        /* Keep the leader unreaped until its process group is signaled. Its
+         * PID then cannot be reused as another process group's identity. */
+        for (phase = 0; phase < 2 && !state.si_pid; phase++) {
+            if (phase) kill(-output->child, SIGTERM);
+            for (attempt = 0; attempt < 20; attempt++) {
+                struct timespec pause = {.tv_sec = 0, .tv_nsec = 10000000};
+                if (waitid(P_PID, (id_t)output->child, &state, WEXITED | WNOHANG | WNOWAIT) == 0 && state.si_pid) break;
+                nanosleep(&pause, NULL);
+            }
         }
-        if (reaped == 0) {
-            kill(output->child, SIGTERM);
-            (void)waitpid(output->child, NULL, 0);
-        }
+        kill(-output->child, SIGKILL);
+        while (waitpid(output->child, NULL, 0) < 0 && errno == EINTR) {}
         output->child = -1;
     }
 }
@@ -516,6 +543,13 @@ main(int argc, char **argv) {
     const char *token = NULL;
     const char *fingerprint = NULL;
     const char *audio_output_command = NULL;
+    kmx_audio_mode audio_mode = KMX_AUDIO_AUTO;
+    unsigned audio_bitrate = 6;
+    const char *development_audio_assets = NULL;
+    kmx_encodec *audio_codec = NULL;
+    kmx_audio_caps audio_offer = {0}, audio_selection = {0};
+    bool audio_selected = false, audio_encodec = false;
+    uint64_t audio_select_deadline = 0;
     kmx_tls_client *tls_client = NULL;
     kmx_tls_session *tls = NULL;
     int reconnect_seconds = 30;
@@ -598,12 +632,19 @@ main(int argc, char **argv) {
             audio_output_command = argv[++index];
         } else if (strcmp(argv[index], "--no-audio") == 0) {
             audio_output_command = "none";
+        } else if (strcmp(argv[index], "--audio-codec") == 0 && index + 1 < argc) {
+            if (kmx_audio_mode_parse(argv[++index], &audio_mode)) return 2;
+        } else if (strcmp(argv[index], "--audio-bitrate") == 0 && index + 1 < argc) {
+            if (kmx_audio_bitrate_parse(argv[++index], &audio_bitrate)) return 2;
+        } else if (strcmp(argv[index], "--development-encodec-assets") == 0 && index + 1 < argc) {
+            development_audio_assets = argv[++index];
         } else {
             fprintf(stderr, "usage: kmx-attach --socket PATH [--no-predict]"
                             " [--view] [--token TOKEN]\n"
                             "       [--tls-fingerprint HEX] [--reconnect N]"
                             "       [--dump] [--send TEXT] [--seconds N]\n"
                             "       [--audio-output COMMAND|--no-audio]"
+                            " [--audio-codec auto|encodec|pcm] [--audio-bitrate 3|6|12]"
                             " [--pixel-input]\n");
             return 2;
         }
@@ -621,9 +662,21 @@ main(int argc, char **argv) {
         fprintf(stderr, "kmx-attach: cannot make sense of '%s'\n", socket_path);
         return 2;
     }
+    if (audio_mode != KMX_AUDIO_PCM) {
+        if (development_audio_assets) fprintf(stderr, "kmx-attach: DEVELOPMENT graph path; no installed admission\n");
+        audio_codec = kmx_encodec_open(false, audio_bitrate, 24000, 1,
+                                      getenv("KILIX_CONTENT_ROOT"), development_audio_assets);
+        if (!audio_codec) {
+            fprintf(stderr, "kmx-attach: EnCodec unavailable; %s\n",
+                audio_mode == KMX_AUDIO_ENCODEC ? "explicit selection refused" : "PCM fallback selected");
+            if (audio_mode == KMX_AUDIO_ENCODEC) return 1;
+        }
+    }
+
     fd = kmx_endpoint_connect(&endpoint);
     if (fd < 0) {
         fprintf(stderr, "kmx-attach: connect: %s\n", strerror(errno));
+        kmx_encodec_close(audio_codec);
         return 1;
     }
     kmx_endpoint_tune(fd, &endpoint);
@@ -633,6 +686,7 @@ main(int argc, char **argv) {
             fprintf(stderr, "kmx-attach: a fingerprint is %d hex characters\n",
                     KMX_TLS_FINGERPRINT_HEX);
             close(fd);
+            kmx_encodec_close(audio_codec);
             return 2;
         }
         {
@@ -651,6 +705,7 @@ main(int argc, char **argv) {
                 "kmx-attach: the server did not present the expected "
                 "certificate\n");
             close(fd);
+            kmx_encodec_close(audio_codec);
             return 1;
         }
         {
@@ -670,11 +725,19 @@ main(int argc, char **argv) {
         kmx_audio_sink_create(&audio) != KMX_OK ||
         kmx_grid_init(&screen, rows, cols) != KMX_OK) {
         fprintf(stderr, "kmx-attach: out of memory\n");
+        kmx_encodec_close(audio_codec);
         return 1;
     }
     kmx_framer_init(&framer);
 
-    send_hello(fd, rows, cols, view_only, token);
+    audio_offer.codecs = audio_mode == KMX_AUDIO_ENCODEC ? 0 : KMX_AUDIO_CODEC_PCM;
+    if (audio_codec) audio_offer.codecs |= KMX_AUDIO_CODEC_ENCODEC;
+    audio_offer.rates = audio_codec ? kmx_audio_rate_bit(audio_bitrate) : 0;
+    audio_offer.maximum = KMX_ENCODEC_PACKET_MAX;
+    if (send_hello(fd, rows, cols, view_only, token) || send_audio_offer(fd, &audio_offer)) {
+        stop_pending = 1; exit_code = 1;
+    }
+    audio_select_deadline = now_millis() + 2000u;
     if (!view_only) send_dimensions(fd, KMX_MSG_RESIZE, rows, cols);
 
     if (!dump && isatty(STDIN_FILENO) && tcgetattr(STDIN_FILENO, &saved) == 0) {
@@ -705,7 +768,7 @@ main(int argc, char **argv) {
     started_at = time(NULL);
 
     while (!stop_pending) {
-        struct pollfd descriptors[2];
+        struct pollfd descriptors[3];
         int ready;
         bool redraw = false;
 
@@ -726,12 +789,19 @@ main(int argc, char **argv) {
         descriptors[1].fd = STDIN_FILENO;
         descriptors[1].events = dump ? 0 : POLLIN;
         descriptors[1].revents = 0;
-        ready = poll(descriptors, 2, 50);
+        descriptors[2].fd = kmx_encodec_event_fd(audio_codec);
+        descriptors[2].events = POLLIN;
+        descriptors[2].revents = 0;
+        ready = poll(descriptors, 3, 50);
         if (ready < 0) {
             if (errno == EINTR) continue;
             break;
         }
         if (run_seconds > 0 && time(NULL) - started_at >= run_seconds) break;
+        if (audio_mode == KMX_AUDIO_ENCODEC && !audio_selected && now_millis() > audio_select_deadline) {
+            fprintf(stderr, "kmx-attach: peer did not select the requested EnCodec profile\n");
+            exit_code = 1; break;
+        }
         if (send_text && !sent_once) {
             sent_once = true;
             /* Sent even as a viewer, deliberately: the point of the test is
@@ -820,7 +890,13 @@ main(int argc, char **argv) {
                 kmx_predictor_reset(predictor);
                 kmx_render_invalidate(render);
                 layout.pane_count = 0;
+                kmx_encodec_restart(audio_codec);
+                audio_output_stop(&player);
+                memset(&player, 0, sizeof player); player.fd = player.child = -1;
+                audio_selected = audio_encodec = false;
                 send_hello(fd, rows, cols, view_only, token);
+                if (send_audio_offer(fd, &audio_offer)) { exit_code = 1; break; }
+                audio_select_deadline = now_millis() + 2000u;
                 if (!view_only) send_dimensions(fd, KMX_MSG_RESIZE, rows, cols);
                 continue;
             }
@@ -928,7 +1004,37 @@ main(int argc, char **argv) {
                             stop_pending = 1;
                         }
                     }
+                } else if (type == KMX_MSG_AUDIO_CAPS) {
+                    kmx_audio_caps selection;
+                    if (kmx_audio_caps_read(&selection, payload, size) || selection.kind != 1 ||
+                        !(selection.codecs & audio_offer.codecs) ||
+                        (selection.codecs == KMX_AUDIO_CODEC_ENCODEC &&
+                         (!audio_codec || selection.rates != audio_offer.rates)) ||
+                        (audio_selected && (selection.codecs != audio_selection.codecs ||
+                         selection.rates != audio_selection.rates || selection.maximum != audio_selection.maximum))) {
+                        fprintf(stderr, "kmx-attach: incompatible audio selection refused\n");
+                        exit_code = 1; stop_pending = 1; break;
+                    }
+                    if (!audio_selected) {
+                        audio_selected = true; audio_selection = selection;
+                        audio_encodec = selection.codecs == KMX_AUDIO_CODEC_ENCODEC;
+                        if (audio_encodec && player.attempted) {
+                            audio_output_stop(&player);
+                            memset(&player, 0, sizeof player); player.fd = player.child = -1;
+                        }
+                        if (dump) {
+                            printf("KMX_AUDIO_CODEC %s bitrate=%u threads=%u\n", audio_encodec ? "encodec-24k-mono-v1" : "pcm-s16le-zstd-v1",
+                                   audio_encodec ? audio_bitrate : 0u, audio_encodec ? 2u : 0u);
+                            fflush(stdout);
+                        }
+                    }
+                } else if (type == KMX_MSG_AUDIO && audio_encodec) {
+                    if (size < 4 || size > KMX_ENCODEC_PACKET_MAX || memcmp(payload, "KMA\2", 4)) {
+                        exit_code = 1; stop_pending = 1; break;
+                    }
+                    (void)kmx_encodec_offer_packet(audio_codec, payload, size);
                 } else if (type == KMX_MSG_AUDIO) {
+                    if (audio_mode == KMX_AUDIO_ENCODEC) { exit_code = 1; stop_pending = 1; break; }
                     if (kmx_audio_sink_apply(audio, payload, size) == KMX_OK) {
                         size_t block = 0;
                         uint64_t when = 0;
@@ -958,6 +1064,28 @@ main(int argc, char **argv) {
                     stop_pending = 1;
                 }
                 kmx_framer_consume(&framer);
+            }
+        }
+
+        if (audio_codec) {
+            kmx_encodec_output output;
+            while (kmx_encodec_receive(audio_codec, &output)) {
+                unsigned char pcm[KMX_ENCODEC_SAMPLES * 2u];
+                size_t sample;
+                if (!audio_encodec) continue;
+                for (sample = 0; sample < output.size / 2u; sample++) {
+                    uint16_t value = (uint16_t)output.pcm[sample];
+                    pcm[sample * 2u] = (unsigned char)value;
+                    pcm[sample * 2u + 1u] = (unsigned char)(value >> 8);
+                }
+                blocks_seen++;
+                audio_output_start(&player, audio_output_command, 24000, 1, dump);
+                audio_output_offer(&player, pcm, output.size);
+                if (dump) {
+                    printf("KMX_AUDIO %zu #%lu at=%llu epoch=%llu flags=%u\n", output.size, blocks_seen,
+                        (unsigned long long)output.pts_ms, (unsigned long long)output.epoch, output.flags);
+                    fflush(stdout);
+                }
             }
         }
 
@@ -1065,6 +1193,14 @@ main(int argc, char **argv) {
     kmx_predictor_free(predictor);
     kmx_render_free(render);
     audio_output_stop(&player);
+    if (audio_codec) {
+        kmx_encodec_stats stats = kmx_encodec_statistics(audio_codec);
+        fprintf(stderr, "kmx-attach: encodec calls=%llu rtf=%.6f input_drops=%llu output_drops=%llu discontinuities=%llu\n",
+            (unsigned long long)stats.calls, stats.calls ? (double)stats.inference_ns / ((double)stats.calls * 40000000.0) : 0.0,
+            (unsigned long long)stats.input_drops, (unsigned long long)stats.output_drops,
+            (unsigned long long)stats.discontinuities);
+        kmx_encodec_close(audio_codec);
+    }
     if (player.dropped) {
         fprintf(stderr, "kmx-attach: dropped %zu audio block(s) at playback\n",
                 player.dropped);
