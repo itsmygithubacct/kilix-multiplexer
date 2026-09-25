@@ -24,6 +24,7 @@
 #include "kmx_encodec.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <pty.h>
@@ -39,6 +40,27 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+
+static int
+parse_dimension(const char *text, int *out) {
+    char *end = NULL;
+    long value;
+    if (!text || !*text) return -1;
+    errno = 0;
+    value = strtol(text, &end, 10);
+    if (errno != 0 || end == text || *end || value < 1 || value > KMX_MAX_DIMENSION) {
+        return -1;
+    }
+    *out = (int)value;
+    return 0;
+}
+
+static bool
+dimensions_ok(int rows, int cols) {
+    if (rows < 1 || cols < 1) return false;
+    if (rows > KMX_MAX_DIMENSION || cols > KMX_MAX_DIMENSION) return false;
+    return (long long)rows * (long long)cols <= (long long)KMX_MAX_CELLS;
+}
 
 #define KMX_MAX_CLIENTS 8
 
@@ -649,9 +671,15 @@ main(int argc, char **argv) {
         if (strcmp(argv[index], "--socket") == 0 && index + 1 < argc) {
             socket_path = argv[++index];
         } else if (strcmp(argv[index], "--rows") == 0 && index + 1 < argc) {
-            rows = atoi(argv[++index]);
+            if (parse_dimension(argv[++index], &rows) != 0) {
+                fprintf(stderr, "kmx-serve: rows must be 1..%d\n", KMX_MAX_DIMENSION);
+                return 2;
+            }
         } else if (strcmp(argv[index], "--cols") == 0 && index + 1 < argc) {
-            cols = atoi(argv[++index]);
+            if (parse_dimension(argv[++index], &cols) != 0) {
+                fprintf(stderr, "kmx-serve: cols must be 1..%d\n", KMX_MAX_DIMENSION);
+                return 2;
+            }
         } else if (strcmp(argv[index], "--listen") == 0 && index + 1 < argc) {
             socket_path = argv[++index];
         } else if (strcmp(argv[index], "--broker-session") == 0 && index + 1 < argc) {
@@ -741,7 +769,7 @@ main(int argc, char **argv) {
         }
     }
     if (!tap_session) tap_session = broker_session;
-    if (!socket_path || rows <= 0 || cols <= 0 ||
+    if (!socket_path || !dimensions_ok(rows, cols) ||
         (command_count == 0 && !single && !pixel_command && !broker_session) ||
         (broker_session && (!broker_runtime || !*broker_runtime)) ||
         (broker_session &&
@@ -1306,8 +1334,7 @@ main(int argc, char **argv) {
                      * be sane. */
                     item->rows = (payload[0] << 8) | payload[1];
                     item->cols = (payload[2] << 8) | payload[3];
-                    if (item->rows < 1 || item->rows > KMX_MAX_DIMENSION ||
-                        item->cols < 1 || item->cols > KMX_MAX_DIMENSION) {
+                    if (!dimensions_ok(item->rows, item->cols)) {
                         client_release(item, count);
                         break;
                     }
@@ -1361,8 +1388,7 @@ main(int argc, char **argv) {
                 } else if (type == KMX_MSG_RESIZE && size == 4 && item->control) {
                     int wanted_r = (payload[0] << 8) | payload[1];
                     int wanted_c = (payload[2] << 8) | payload[3];
-                    if (wanted_r < 1 || wanted_r > KMX_MAX_DIMENSION ||
-                        wanted_c < 1 || wanted_c > KMX_MAX_DIMENSION) {
+                    if (!dimensions_ok(wanted_r, wanted_c)) {
                         client_release(item, count);
                         break;
                     }

@@ -14,6 +14,7 @@
 #include "kilix_mux.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <poll.h>
 #include <pty.h>
 #include <signal.h>
@@ -26,6 +27,20 @@
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
+
+static int
+parse_dimension(const char *text, int *out) {
+    char *end = NULL;
+    long value;
+    if (!text || !*text) return -1;
+    errno = 0;
+    value = strtol(text, &end, 10);
+    if (errno != 0 || end == text || *end || value < 1 || value > KMX_MAX_DIMENSION) {
+        return -1;
+    }
+    *out = (int)value;
+    return 0;
+}
 
 static uint64_t
 now_millis(void) {
@@ -75,9 +90,15 @@ main(int argc, char **argv) {
 
     while (index < argc && strcmp(argv[index], "--") != 0) {
         if (strcmp(argv[index], "--rows") == 0 && index + 1 < argc) {
-            rows = atoi(argv[++index]);
+            if (parse_dimension(argv[++index], &rows) != 0) {
+                fprintf(stderr, "kmx-bench: rows must be 1..%d\n", KMX_MAX_DIMENSION);
+                return 2;
+            }
         } else if (strcmp(argv[index], "--cols") == 0 && index + 1 < argc) {
-            cols = atoi(argv[++index]);
+            if (parse_dimension(argv[++index], &cols) != 0) {
+                fprintf(stderr, "kmx-bench: cols must be 1..%d\n", KMX_MAX_DIMENSION);
+                return 2;
+            }
         } else if (strcmp(argv[index], "--interval") == 0 && index + 1 < argc) {
             interval = atoi(argv[++index]);
         } else if (strcmp(argv[index], "--label") == 0 && index + 1 < argc) {
@@ -93,8 +114,10 @@ main(int argc, char **argv) {
         return 2;
     }
     index++;
-    if (rows <= 0 || cols <= 0) {
-        usage();
+    if (rows < 1 || cols < 1 || rows > KMX_MAX_DIMENSION || cols > KMX_MAX_DIMENSION ||
+        (long long)rows * (long long)cols > (long long)KMX_MAX_CELLS) {
+        fprintf(stderr, "kmx-bench: %d by %d exceeds the %d cell limit\n",
+                rows, cols, KMX_MAX_CELLS);
         return 2;
     }
 

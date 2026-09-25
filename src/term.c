@@ -79,10 +79,21 @@ on_apc(VTermStringFragment frag, void *user) {
     return 1;
 }
 
+/* libvterm indexes the screen with a signed `row * cols + col`, and the
+ * grid refuses anything above these same limits. Both have to be applied
+ * before vterm_new(), which treats the size as an allocation instruction. */
+static bool
+term_dimensions_ok(int rows, int cols) {
+    if (rows <= 0 || cols <= 0) return false;
+    if (rows > KMX_MAX_DIMENSION || cols > KMX_MAX_DIMENSION) return false;
+    return (long long)rows * (long long)cols <= (long long)KMX_MAX_CELLS;
+}
+
 kmx_result
 kmx_term_create(kmx_term **out, int rows, int cols) {
     kmx_term *term;
     if (!out || rows <= 0 || cols <= 0) return KMX_ERR_INVALID;
+    if (!term_dimensions_ok(rows, cols)) return KMX_ERR_LIMIT;
     term = calloc(1, sizeof *term);
     if (!term) return KMX_ERR_MEMORY;
     term->vt = vterm_new(rows, cols);
@@ -126,6 +137,7 @@ kmx_term_feed(kmx_term *term, const void *data, size_t size) {
 kmx_result
 kmx_term_resize(kmx_term *term, int rows, int cols) {
     if (!term || rows <= 0 || cols <= 0) return KMX_ERR_INVALID;
+    if (!term_dimensions_ok(rows, cols)) return KMX_ERR_LIMIT;
     vterm_set_size(term->vt, rows, cols);
     vterm_screen_flush_damage(term->screen);
     return KMX_OK;

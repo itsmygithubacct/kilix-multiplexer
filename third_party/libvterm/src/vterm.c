@@ -1,5 +1,6 @@
 #include "vterm_internal.h"
 
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -27,6 +28,16 @@ static VTermAllocatorFunctions default_allocator = {
   .free   = &default_free,
 };
 
+static int dimensions_fit(int rows, int cols)
+{
+  if(rows < 1 || cols < 1)
+    return 0;
+  /* Callers index with signed int. Refuse a product that would wrap. */
+  if((size_t)rows > (size_t)INT_MAX / (size_t)cols)
+    return 0;
+  return 1;
+}
+
 VTerm *vterm_new(int rows, int cols)
 {
   return vterm_build(&(const struct VTermBuilder){
@@ -52,8 +63,13 @@ VTerm *vterm_build(const struct VTermBuilder *builder)
 {
   const VTermAllocatorFunctions *allocator = DEFAULT(builder->allocator, &default_allocator);
 
+  if(!dimensions_fit(builder->rows, builder->cols))
+    return NULL;
+
   /* Need to bootstrap using the allocator function directly */
   VTerm *vt = (*allocator->malloc)(sizeof(VTerm), builder->allocdata);
+  if(!vt)
+    return NULL;
 
   vt->allocator = allocator;
   vt->allocdata = builder->allocdata;
@@ -115,7 +131,7 @@ void vterm_get_size(const VTerm *vt, int *rowsp, int *colsp)
 
 void vterm_set_size(VTerm *vt, int rows, int cols)
 {
-  if(rows < 1 || cols < 1)
+  if(!dimensions_fit(rows, cols))
     return;
 
   vt->rows = rows;

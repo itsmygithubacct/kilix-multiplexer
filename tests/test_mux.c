@@ -274,6 +274,19 @@ test_small_change_is_a_small_message(void) {
 }
 
 static void
+test_term_rejects_dimensions_libvterm_would_misindex(void) {
+    kmx_term *term = NULL;
+    CHECK(kmx_term_create(&term, 0, 80) == KMX_ERR_INVALID);
+    CHECK(kmx_term_create(&term, KMX_MAX_DIMENSION + 1, 1) == KMX_ERR_LIMIT);
+    /* 2000 by 2000 is inside the per-axis cap and past the cell cap. */
+    CHECK(kmx_term_create(&term, KMX_MAX_DIMENSION, KMX_MAX_DIMENSION) == KMX_ERR_LIMIT);
+    CHECK(kmx_term_create(&term, 24, 80) == KMX_OK);
+    CHECK(kmx_term_resize(term, 50000, 50000) == KMX_ERR_LIMIT);
+    CHECK(kmx_term_resize(term, 40, 120) == KMX_OK);
+    kmx_term_free(term);
+}
+
+static void
 test_resize(void) {
     harness h;
     harness_init(&h, 10, 40);
@@ -1912,6 +1925,7 @@ main(void) {
     RUN(test_roundtrip_randomised);
     RUN(test_stale_receiver_catches_up_in_one_message);
     RUN(test_small_change_is_a_small_message);
+    RUN(test_term_rejects_dimensions_libvterm_would_misindex);
     RUN(test_resize);
     RUN(test_graphics_captured_in_wire_order);
     RUN(test_graphics_split_across_feeds);
