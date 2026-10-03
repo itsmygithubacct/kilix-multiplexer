@@ -24,6 +24,16 @@ static void capabilities(void) {
     CHECK(kmx_audio_bitrate_parse("3", &bitrate) == 0 && bitrate == 3);
     CHECK(kmx_audio_bitrate_parse("6", &bitrate) == 0 && bitrate == 6);
     CHECK(kmx_audio_bitrate_parse("12", &bitrate) == 0 && bitrate == 12);
+    {
+        unsigned threads = 99;
+        const char *invalid_threads[] = {"", "1", "3", "04", "+4", "4 ", "8"};
+        for (i = 0; i < sizeof invalid_threads / sizeof *invalid_threads; i++)
+            CHECK(kmx_audio_threads_parse(invalid_threads[i], &threads) == -1 && threads == 99);
+        CHECK(kmx_audio_threads_parse("2", &threads) == 0 && threads == 2);
+        CHECK(kmx_audio_threads_parse("4", &threads) == 0 && threads == 4);
+        CHECK(kmx_audio_threads_parse(NULL, &threads) == -1 && threads == 4);
+        CHECK(kmx_audio_threads_parse("4", NULL) == -1);
+    }
     for (codecs = 0; codecs < 256; codecs++) for (rates = 0; rates < 8; rates++) for (i = 0; i < 3; i++) {
         kmx_audio_caps offer = {0, (uint8_t)codecs, (uint8_t)rates, KMX_ENCODEC_PACKET_MAX};
         kmx_audio_caps chosen = kmx_audio_choose(&offer, true, supported[i], KMX_AUDIO_AUTO);
@@ -77,15 +87,17 @@ static void wait_output(kmx_encodec *codec, kmx_encodec_output *output) {
 }
 
 static void native(const char *assets) {
-    unsigned rates[] = {3,6,12}, which, i;
+    unsigned rates[] = {3,6,12}, which, i, thread_count;
     unsigned char pcm[KMX_ENCODEC_SAMPLES * 2u];
     for (i = 0; i < KMX_ENCODEC_SAMPLES; i++) {
         int16_t value = (int16_t)(((i * 31u) % 4000u) - 2000);
         pcm[i*2u] = (unsigned char)value; pcm[i*2u+1u] = (unsigned char)((uint16_t)value >> 8);
     }
-    for (which = 0; which < 3; which++) {
-        kmx_encodec *encoder = kmx_encodec_open(true, rates[which], 24000, 1, NULL, assets);
-        kmx_encodec *decoder = kmx_encodec_open(false, rates[which], 24000, 1, NULL, assets);
+    for (thread_count = 2; thread_count <= 4; thread_count += 2) for (which = 0; which < 3; which++) {
+        kmx_encodec *encoder = thread_count == 2 ? kmx_encodec_open(true, rates[which], 24000, 1, NULL, assets) :
+            kmx_encodec_open_with_threads(true, rates[which], 24000, 1, NULL, assets, thread_count);
+        kmx_encodec *decoder = thread_count == 2 ? kmx_encodec_open(false, rates[which], 24000, 1, NULL, assets) :
+            kmx_encodec_open_with_threads(false, rates[which], 24000, 1, NULL, assets, thread_count);
         kenc_model *model = NULL;
         kenc_decoder *reference = NULL;
         kenc_options options = kenc_options_default();
@@ -125,6 +137,7 @@ static void native(const char *assets) {
     }
     CHECK(kmx_encodec_open(true, 6, 32000, 1, NULL, assets) == NULL);
     CHECK(kmx_encodec_open(true, 6, 24000, 9, NULL, assets) == NULL);
+    CHECK(kmx_encodec_open_with_threads(true, 6, 24000, 1, NULL, assets, 3) == NULL);
     {
         kmx_encodec *encoder = kmx_encodec_open(true, 6, 24000, 1, NULL, assets);
         kmx_encodec_output packet;

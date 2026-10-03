@@ -94,7 +94,11 @@ validation without installed admission. It prints a development notice and
 is never selected automatically. This path grants no receipt, model supply
 decision or release qualification. Normal desktop launchers do not use it.
 
-EnCodec inference uses two ORT threads in an owned worker thread, with two
+EnCodec inference uses two ORT threads by default. Both programs accept
+`--audio-threads 4` to explicitly allocate four inference threads, including
+the inference caller, for the mono codec. This requires a native EnCodec
+runtime supporting that allocation. Each endpoint selects its own local
+budget; it changes no audio negotiation or wire format. The owned worker has two
 fixed 40 ms input slots and two fixed output slots. Capture conversion also
 runs there: 24/44.1/48 kHz interleaved PCM16 with one to eight channels is
 averaged with headroom and resampled to 24 kHz mono, accumulating exactly

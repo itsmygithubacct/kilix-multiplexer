@@ -25,6 +25,14 @@ uint8_t kmx_audio_rate_bit(unsigned bitrate) {
     return bitrate == 3 ? 1 : bitrate == 6 ? 2 : bitrate == 12 ? 4 : 0;
 }
 
+int kmx_audio_threads_parse(const char *text, unsigned *threads) {
+    if (!text || !threads) return -1;
+    if (strcmp(text, "2") == 0) *threads = 2;
+    else if (strcmp(text, "4") == 0) *threads = 4;
+    else return -1;
+    return 0;
+}
+
 void kmx_audio_caps_write(unsigned char out[KMX_AUDIO_CAPS_BYTES], const kmx_audio_caps *caps) {
     memcpy(out, "KAC1", 4);
     out[4] = caps->kind; out[5] = caps->codecs; out[6] = caps->rates; out[7] = 0;
@@ -304,8 +312,8 @@ static void *worker(void *opaque) {
     return NULL;
 }
 
-kmx_encodec *kmx_encodec_open(bool encode, unsigned bitrate, int capture_rate,
-    int capture_channels, const char *content_root, const char *development_assets) {
+kmx_encodec *kmx_encodec_open_with_threads(bool encode, unsigned bitrate, int capture_rate,
+    int capture_channels, const char *content_root, const char *development_assets, unsigned threads) {
     kmx_encodec *codec = NULL;
     kenc_model *model = NULL;
     kenc_installed_assets *assets = NULL;
@@ -318,7 +326,7 @@ kmx_encodec *kmx_encodec_open(bool encode, unsigned bitrate, int capture_rate,
     char root[PATH_MAX], passwd_buffer[16384];
     struct passwd account, *found = NULL;
     int error;
-    if (!kmx_audio_rate_bit(bitrate) || (encode &&
+    if ((threads != 2 && threads != 4) || !kmx_audio_rate_bit(bitrate) || (encode &&
         ((capture_rate != 24000 && capture_rate != 44100 && capture_rate != 48000) ||
          capture_channels < 1 || capture_channels > 8))) return NULL;
     codec = calloc(1, sizeof *codec);
@@ -332,7 +340,7 @@ kmx_encodec *kmx_encodec_open(bool encode, unsigned bitrate, int capture_rate,
     atomic_init(&codec->discontinuities, 0);
     codec->input_event = codec->output_event = -1;
     codec->encode = encode; codec->rate = capture_rate; codec->channels = capture_channels;
-    codec->options = kenc_options_default(); codec->options.threads = 2;
+    codec->options = kenc_options_default(); codec->options.threads = (uint8_t)threads;
     codec->options.codebooks = (uint8_t)(bitrate * 4u / 3u);
     if (development_assets) {
         if (kenc_model_load(&model, development_assets) != KENC_OK) goto fail;
@@ -454,10 +462,10 @@ kmx_encodec_stats kmx_encodec_statistics(const kmx_encodec *codec) {
         atomic_load(&codec->input_drops), atomic_load(&codec->output_drops), atomic_load(&codec->discontinuities)};
 }
 #else
-kmx_encodec *kmx_encodec_open(bool encode, unsigned bitrate, int capture_rate,
-    int capture_channels, const char *content_root, const char *development_assets) {
+kmx_encodec *kmx_encodec_open_with_threads(bool encode, unsigned bitrate, int capture_rate,
+    int capture_channels, const char *content_root, const char *development_assets, unsigned threads) {
     (void)encode; (void)bitrate; (void)capture_rate; (void)capture_channels;
-    (void)content_root; (void)development_assets; return NULL;
+    (void)content_root; (void)development_assets; (void)threads; return NULL;
 }
 void kmx_encodec_close(kmx_encodec *codec) { (void)codec; }
 int kmx_encodec_event_fd(const kmx_encodec *codec) { (void)codec; return -1; }
@@ -471,3 +479,9 @@ bool kmx_encodec_receive(kmx_encodec *codec, kmx_encodec_output *output) { (void
 void kmx_encodec_restart(kmx_encodec *codec) { (void)codec; }
 kmx_encodec_stats kmx_encodec_statistics(const kmx_encodec *codec) { (void)codec; return (kmx_encodec_stats){0}; }
 #endif
+
+kmx_encodec *kmx_encodec_open(bool encode, unsigned bitrate, int capture_rate,
+    int capture_channels, const char *content_root, const char *development_assets) {
+    return kmx_encodec_open_with_threads(encode, bitrate, capture_rate,
+        capture_channels, content_root, development_assets, 2);
+}

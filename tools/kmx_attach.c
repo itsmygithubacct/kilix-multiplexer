@@ -545,6 +545,7 @@ main(int argc, char **argv) {
     const char *audio_output_command = NULL;
     kmx_audio_mode audio_mode = KMX_AUDIO_AUTO;
     unsigned audio_bitrate = 6;
+    unsigned audio_threads = 2;
     const char *development_audio_assets = NULL;
     kmx_encodec *audio_codec = NULL;
     kmx_audio_caps audio_offer = {0}, audio_selection = {0};
@@ -636,6 +637,8 @@ main(int argc, char **argv) {
             if (kmx_audio_mode_parse(argv[++index], &audio_mode)) return 2;
         } else if (strcmp(argv[index], "--audio-bitrate") == 0 && index + 1 < argc) {
             if (kmx_audio_bitrate_parse(argv[++index], &audio_bitrate)) return 2;
+        } else if (strcmp(argv[index], "--audio-threads") == 0 && index + 1 < argc) {
+            if (kmx_audio_threads_parse(argv[++index], &audio_threads)) return 2;
         } else if (strcmp(argv[index], "--development-encodec-assets") == 0 && index + 1 < argc) {
             development_audio_assets = argv[++index];
         } else {
@@ -645,6 +648,7 @@ main(int argc, char **argv) {
                             "       [--dump] [--send TEXT] [--seconds N]\n"
                             "       [--audio-output COMMAND|--no-audio]"
                             " [--audio-codec auto|encodec|pcm] [--audio-bitrate 3|6|12]"
+                            " [--audio-threads 2|4]"
                             " [--pixel-input]\n");
             return 2;
         }
@@ -664,8 +668,8 @@ main(int argc, char **argv) {
     }
     if (audio_mode != KMX_AUDIO_PCM) {
         if (development_audio_assets) fprintf(stderr, "kmx-attach: DEVELOPMENT graph path; no installed admission\n");
-        audio_codec = kmx_encodec_open(false, audio_bitrate, 24000, 1,
-                                      getenv("KILIX_CONTENT_ROOT"), development_audio_assets);
+        audio_codec = kmx_encodec_open_with_threads(false, audio_bitrate, 24000, 1,
+                                      getenv("KILIX_CONTENT_ROOT"), development_audio_assets, audio_threads);
         if (!audio_codec) {
             fprintf(stderr, "kmx-attach: EnCodec unavailable; %s\n",
                 audio_mode == KMX_AUDIO_ENCODEC ? "explicit selection refused" : "PCM fallback selected");
@@ -1024,7 +1028,7 @@ main(int argc, char **argv) {
                         }
                         if (dump) {
                             printf("KMX_AUDIO_CODEC %s bitrate=%u threads=%u\n", audio_encodec ? "encodec-24k-mono-v1" : "pcm-s16le-zstd-v1",
-                                   audio_encodec ? audio_bitrate : 0u, audio_encodec ? 2u : 0u);
+                                   audio_encodec ? audio_bitrate : 0u, audio_encodec ? audio_threads : 0u);
                             fflush(stdout);
                         }
                     }

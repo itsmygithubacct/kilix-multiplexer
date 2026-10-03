@@ -560,6 +560,7 @@ usage(void) {
           "  --tap-socket receives presenter RGB frames for the named session.\n"
           "  --audio-source runs a command that writes raw 16-bit PCM to stdout.\n"
           "  --audio-codec auto|encodec|pcm and --audio-bitrate 3|6|12 select audio.\n"
+          "  --audio-threads 2|4 allocates inference threads (default 2, including caller).\n"
           "  EnCodec requires admitted 24 kHz graphs; capture supports 24/44.1/48 kHz.\n"
           "  --lan requires a token; one is generated and printed if not given.\n"
           "  A reachable bind encrypts by default and prints a fingerprint the\n"
@@ -613,6 +614,7 @@ main(int argc, char **argv) {
     uint64_t audio_clock = 0;
     kmx_audio_mode audio_mode = KMX_AUDIO_AUTO;
     unsigned audio_bitrate = 6;
+    unsigned audio_threads = 2;
     const char *development_audio_assets = NULL;
     kmx_encodec *audio_codec = NULL;
     unsigned char *audio_codec_block = NULL;
@@ -725,6 +727,8 @@ main(int argc, char **argv) {
             if (kmx_audio_mode_parse(argv[++index], &audio_mode)) { usage(); return 2; }
         } else if (strcmp(argv[index], "--audio-bitrate") == 0 && index + 1 < argc) {
             if (kmx_audio_bitrate_parse(argv[++index], &audio_bitrate)) { usage(); return 2; }
+        } else if (strcmp(argv[index], "--audio-threads") == 0 && index + 1 < argc) {
+            if (kmx_audio_threads_parse(argv[++index], &audio_threads)) { usage(); return 2; }
         } else if (strcmp(argv[index], "--development-encodec-assets") == 0 && index + 1 < argc) {
             development_audio_assets = argv[++index];
         } else if (strcmp(argv[index], "--lan") == 0) {
@@ -1021,8 +1025,8 @@ main(int argc, char **argv) {
 
     if (audio_command && audio_mode != KMX_AUDIO_PCM) {
         if (development_audio_assets) fprintf(stderr, "kmx-serve: DEVELOPMENT graph path; no installed admission\n");
-        audio_codec = kmx_encodec_open(true, audio_bitrate, audio_rate, audio_channels,
-                                      getenv("KILIX_CONTENT_ROOT"), development_audio_assets);
+        audio_codec = kmx_encodec_open_with_threads(true, audio_bitrate, audio_rate, audio_channels,
+                                      getenv("KILIX_CONTENT_ROOT"), development_audio_assets, audio_threads);
         if (audio_codec) {
             audio_codec_block = malloc(audio_block_bytes * 2u);
             if (!audio_codec_block) { kmx_encodec_close(audio_codec); audio_codec = NULL; }
@@ -1031,7 +1035,7 @@ main(int argc, char **argv) {
             fprintf(stderr, "kmx-serve: EnCodec unavailable; %s\n",
                     audio_mode == KMX_AUDIO_ENCODEC ? "explicit selection refused" : "PCM fallback selected");
             if (audio_mode == KMX_AUDIO_ENCODEC) { stop_requested = 1; exit_code = 1; }
-        } else fprintf(stderr, "kmx-serve: EnCodec 24 kHz mono warmed, %u kb/s, two threads\n", audio_bitrate);
+        } else fprintf(stderr, "kmx-serve: EnCodec 24 kHz mono warmed, %u kb/s, %u threads\n", audio_bitrate, audio_threads);
     }
 
     signal(SIGPIPE, SIG_IGN);

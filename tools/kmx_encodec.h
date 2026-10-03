@@ -24,6 +24,7 @@ typedef struct {
 
 int kmx_audio_mode_parse(const char *text, kmx_audio_mode *mode);
 int kmx_audio_bitrate_parse(const char *text, unsigned *bitrate);
+int kmx_audio_threads_parse(const char *text, unsigned *threads);
 uint8_t kmx_audio_rate_bit(unsigned bitrate);
 void kmx_audio_caps_write(unsigned char out[KMX_AUDIO_CAPS_BYTES], const kmx_audio_caps *caps);
 int kmx_audio_caps_read(kmx_audio_caps *out, const void *data, size_t size);
@@ -51,6 +52,10 @@ typedef struct {
  * After opening, only the owned worker invokes inference/resampling. */
 kmx_encodec *kmx_encodec_open(bool encode, unsigned bitrate, int capture_rate,
     int capture_channels, const char *content_root, const char *development_assets);
+/* Explicit CPU allocation for the mono codec, including its inference caller.
+ * The legacy open function retains two threads. This accepts only two or four. */
+kmx_encodec *kmx_encodec_open_with_threads(bool encode, unsigned bitrate, int capture_rate,
+    int capture_channels, const char *content_root, const char *development_assets, unsigned threads);
 void kmx_encodec_close(kmx_encodec *codec);
 int kmx_encodec_event_fd(const kmx_encodec *codec);
 /* Each encoder offer is exactly 40 ms of interleaved little-endian PCM16.
