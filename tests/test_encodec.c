@@ -89,8 +89,10 @@ static void wait_output(kmx_encodec *codec, kmx_encodec_output *output) {
 static void native(const char *assets) {
     unsigned rates[] = {3,6,12}, which, i, thread_count;
     unsigned char pcm[KMX_ENCODEC_SAMPLES * 2u];
+    int16_t reference_pcm[KMX_ENCODEC_SAMPLES];
     for (i = 0; i < KMX_ENCODEC_SAMPLES; i++) {
         int16_t value = (int16_t)(((i * 31u) % 4000u) - 2000);
+        reference_pcm[i] = value;
         pcm[i*2u] = (unsigned char)value; pcm[i*2u+1u] = (unsigned char)((uint16_t)value >> 8);
     }
     for (thread_count = 2; thread_count <= 4; thread_count += 2) for (which = 0; which < 3; which++) {
@@ -100,26 +102,40 @@ static void native(const char *assets) {
             kmx_encodec_open_with_threads(false, rates[which], 24000, 1, NULL, assets, thread_count);
         kenc_model *model = NULL;
         kenc_decoder *reference = NULL;
+        kenc_encoder *reference_encoder = NULL;
         kenc_options options = kenc_options_default();
         kmx_encodec_output packet, output;
         CHECK(encoder && decoder);
         options.codebooks = (uint8_t)(rates[which] * 4u / 3u); options.threads = 2;
         CHECK(kenc_model_load(&model, assets) == KENC_OK);
         CHECK(kenc_decoder_create(&reference, model, &options) == KENC_OK);
+        CHECK(kenc_encoder_create(&reference_encoder, model, &options) == KENC_OK);
         for (i = 0; i < 27; i++) {
             int16_t expected[KMX_ENCODEC_SAMPLES];
             size_t samples = 0;
             kenc_packet_info info;
+            unsigned char expected_packet[KMX_ENCODEC_PACKET_MAX];
+            size_t expected_size = 0;
             CHECK(kmx_encodec_offer_pcm(encoder, pcm, sizeof pcm, i * 40u));
             wait_output(encoder, &packet);
             CHECK(packet.pts_ms == i * 40u && packet.size <= KMX_ENCODEC_PACKET_MAX);
+            CHECK(kenc_encoder_push_s16(reference_encoder, reference_pcm, KMX_ENCODEC_SAMPLES,
+                i * 40u, expected_packet, sizeof expected_packet, &expected_size) == KENC_OK);
+            CHECK(expected_size == packet.size && memcmp(expected_packet, packet.packet, packet.size) == 0);
             CHECK(kmx_encodec_offer_packet(decoder, packet.packet, packet.size));
             wait_output(decoder, &output);
             CHECK(kenc_decoder_pull_s16(reference, packet.packet, packet.size, expected,
                                        KMX_ENCODEC_SAMPLES, &samples, &info) == KENC_OK);
             CHECK(samples == KMX_ENCODEC_SAMPLES && output.size == sizeof expected);
             CHECK(output.pts_ms == info.pts_ms && output.flags == info.flags);
-            CHECK(memcmp(expected, output.pcm, sizeof expected) == 0);
+            if (thread_count == 2) CHECK(memcmp(expected, output.pcm, sizeof expected) == 0);
+            else {
+                /* Parallel reduction can cross a PCM16 rounding boundary.
+                 * Keep exact packet parity and a one-LSB waveform bound. */
+                unsigned sample;
+                for (sample = 0; sample < KMX_ENCODEC_SAMPLES; sample++)
+                    CHECK(abs((int)expected[sample] - (int)output.pcm[sample]) <= 1);
+            }
         }
         CHECK(kmx_encodec_statistics(encoder).input_drops == 0);
         CHECK(kmx_encodec_statistics(decoder).input_drops == 0);
@@ -132,7 +148,7 @@ static void native(const char *assets) {
         CHECK(kmx_encodec_offer_packet(decoder, packet.packet, packet.size));
         wait_output(decoder, &output);
         CHECK(output.pts_ms == 2000);
-        kenc_decoder_free(reference); kenc_model_free(model);
+        kenc_encoder_free(reference_encoder); kenc_decoder_free(reference); kenc_model_free(model);
         kmx_encodec_close(encoder); kmx_encodec_close(decoder);
     }
     CHECK(kmx_encodec_open(true, 6, 32000, 1, NULL, assets) == NULL);
