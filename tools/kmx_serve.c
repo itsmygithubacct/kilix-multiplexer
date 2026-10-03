@@ -141,6 +141,9 @@ typedef struct {
     kmx_audio *audio;     /* per client: its own rate allowance */
     bool audio_caps_seen;
     bool audio_encodec;
+    bool audio_profile_seen;
+    uint32_t audio_profile_offer;
+    uint32_t audio_profile;
     bool audio_wait_reset;
     kmx_audio_caps audio_offer;
     kmx_audio_caps audio_selection;
@@ -616,10 +619,12 @@ main(int argc, char **argv) {
     unsigned audio_bitrate = 6;
     unsigned audio_threads = 2;
     const char *development_audio_assets = NULL;
-    kmx_encodec *audio_codec = NULL;
+    /* Exactly one prewarmed shared context per epoch profile, independent of
+     * the number or arrival order of clients. No inference runs in poll. */
+    kmx_encodec *audio_codecs[2] = {NULL, NULL};
     unsigned char *audio_codec_block = NULL;
     size_t audio_codec_filled = 0;
-    size_t encodec_client_drops = 0;
+    size_t encodec_client_drops[2] = {0, 0};
     int exit_code = 0;
     char *const *single = NULL;
     size_t command_count = 0;
@@ -1025,17 +1030,24 @@ main(int argc, char **argv) {
 
     if (audio_command && audio_mode != KMX_AUDIO_PCM) {
         if (development_audio_assets) fprintf(stderr, "kmx-serve: DEVELOPMENT graph path; no installed admission\n");
-        audio_codec = kmx_encodec_open_with_threads(true, audio_bitrate, audio_rate, audio_channels,
-                                      getenv("KILIX_CONTENT_ROOT"), development_audio_assets, audio_threads);
-        if (audio_codec) {
+        audio_codecs[0] = kmx_encodec_open_profile(true, audio_bitrate, audio_rate, audio_channels,
+                                      getenv("KILIX_CONTENT_ROOT"), development_audio_assets, audio_threads, 0);
+        if (audio_codecs[0]) {
+            audio_codecs[1] = kmx_encodec_open_profile(true, audio_bitrate, audio_rate, audio_channels,
+                                      getenv("KILIX_CONTENT_ROOT"), development_audio_assets, audio_threads, 1);
             audio_codec_block = malloc(audio_block_bytes * 2u);
-            if (!audio_codec_block) { kmx_encodec_close(audio_codec); audio_codec = NULL; }
+            if (!audio_codec_block) {
+                for (unsigned profile = 0; profile < 2; profile++) {
+                    kmx_encodec_close(audio_codecs[profile]); audio_codecs[profile] = NULL;
+                }
+            }
         }
-        if (!audio_codec) {
+        if (!audio_codecs[0]) {
             fprintf(stderr, "kmx-serve: EnCodec unavailable; %s\n",
                     audio_mode == KMX_AUDIO_ENCODEC ? "explicit selection refused" : "PCM fallback selected");
             if (audio_mode == KMX_AUDIO_ENCODEC) { stop_requested = 1; exit_code = 1; }
-        } else fprintf(stderr, "kmx-serve: EnCodec 24 kHz mono warmed, %u kb/s, %u threads\n", audio_bitrate, audio_threads);
+        } else fprintf(stderr, "kmx-serve: EnCodec 24 kHz mono warmed, %u kb/s, %u threads, profiles=C0%s\n",
+                       audio_bitrate, audio_threads, audio_codecs[1] ? ",C5-R4" : "");
     }
 
     signal(SIGPIPE, SIG_IGN);
@@ -1045,7 +1057,7 @@ main(int argc, char **argv) {
     while (!stop_requested) {
         /* +4 for audio, the private-display frame pipe, and both ends of the
          * presenter tap. */
-        struct pollfd descriptors[1 + KMX_MAX_CLIENTS + KMX_MAX_PANES + 5];
+        struct pollfd descriptors[1 + KMX_MAX_CLIENTS + KMX_MAX_PANES + 6];
         nfds_t descriptor_count = 0;
         size_t client_at[KMX_MAX_CLIENTS];
         size_t pane_at[KMX_MAX_PANES];
@@ -1103,8 +1115,8 @@ main(int argc, char **argv) {
             descriptor_count++;
         }
 
-        if (audio_codec) {
-            descriptors[descriptor_count].fd = kmx_encodec_event_fd(audio_codec);
+        for (unsigned profile = 0; profile < 2; profile++) if (audio_codecs[profile]) {
+            descriptors[descriptor_count].fd = kmx_encodec_event_fd(audio_codecs[profile]);
             descriptors[descriptor_count].events = POLLIN;
             descriptors[descriptor_count].revents = 0;
             descriptor_count++;
@@ -1349,6 +1361,15 @@ main(int argc, char **argv) {
                     /* Nothing is accepted before a valid greeting. */
                     client_release(item, count);
                     break;
+                } else if (type == KMX_MSG_AUDIO_PROFILE) {
+                    kmx_audio_profile offered;
+                    if (!item->greeted || item->audio_caps_seen ||
+                        kmx_audio_profile_read(&offered, payload, size) || offered.kind != 0 ||
+                        (item->audio_profile_seen && offered.value != item->audio_profile_offer)) {
+                        client_release(item, count); break;
+                    }
+                    item->audio_profile_seen = true;
+                    item->audio_profile_offer = offered.value;
                 } else if (type == KMX_MSG_AUDIO_CAPS) {
                     kmx_audio_caps offered;
                     unsigned char reply[KMX_AUDIO_CAPS_BYTES];
@@ -1360,11 +1381,21 @@ main(int argc, char **argv) {
                     if (!item->audio_caps_seen) {
                         item->audio_caps_seen = true;
                         item->audio_offer = offered;
-                        item->audio_selection = kmx_audio_choose(&offered, audio_codec != NULL, audio_bitrate, audio_mode);
+                        item->audio_selection = kmx_audio_choose(&offered, audio_codecs[0] != NULL, audio_bitrate, audio_mode);
                         item->audio_encodec = item->audio_selection.codecs == KMX_AUDIO_CODEC_ENCODEC;
+                        item->audio_profile = kmx_audio_profile_choose(
+                            1u | (audio_codecs[1] ? 2u : 0u), item->audio_profile_offer);
                         item->audio_wait_reset = true;
                     }
                     item->settle_by = 0;
+                    if (item->audio_encodec && item->audio_profile_seen) {
+                        unsigned char marker[KMX_AUDIO_PROFILE_BYTES];
+                        kmx_audio_profile selected = {1, item->audio_profile};
+                        kmx_audio_profile_write(marker, &selected);
+                        if (client_queue(item, KMX_MSG_AUDIO_PROFILE, marker, sizeof marker)) {
+                            client_release(item, count); break;
+                        }
+                    }
                     kmx_audio_caps_write(reply, &item->audio_selection);
                     if (client_queue(item, KMX_MSG_AUDIO_CAPS, reply, sizeof reply)) {
                         client_release(item, count); break;
@@ -1513,15 +1544,18 @@ main(int argc, char **argv) {
                 audio_filled += (size_t)received;
                 if (audio_filled < audio_block_bytes) continue;
                 audio_filled = 0;
-                if (audio_codec) {
+                if (audio_codecs[0]) {
                     memcpy(audio_codec_block + audio_codec_filled, audio_block, audio_block_bytes);
                     audio_codec_filled += audio_block_bytes;
                     if (audio_codec_filled == audio_block_bytes * 2u) {
-                        bool wanted = false;
-                        for (which = 0; which < KMX_MAX_CLIENTS; which++)
-                            if (clients[which].fd >= 0 && clients[which].audio_encodec) wanted = true;
-                        if (wanted) (void)kmx_encodec_offer_pcm(audio_codec, audio_codec_block,
-                                                              audio_codec_filled, audio_clock - 20u);
+                        for (unsigned profile = 0; profile < 2; profile++) {
+                            bool wanted = false;
+                            for (which = 0; which < KMX_MAX_CLIENTS; which++)
+                                if (clients[which].fd >= 0 && clients[which].audio_encodec &&
+                                    clients[which].audio_profile == profile) wanted = true;
+                            if (wanted) (void)kmx_encodec_offer_pcm(audio_codecs[profile], audio_codec_block,
+                                                                  audio_codec_filled, audio_clock - 20u);
+                        }
                         audio_codec_filled = 0;
                     }
                 }
@@ -1558,14 +1592,14 @@ main(int argc, char **argv) {
         }
         }
 
-        if (audio_codec) {
+        for (unsigned profile = 0; profile < 2; profile++) if (audio_codecs[profile]) {
             kmx_encodec_output output;
-            while (kmx_encodec_receive(audio_codec, &output)) {
+            while (kmx_encodec_receive(audio_codecs[profile], &output)) {
                 for (which = 0; which < KMX_MAX_CLIENTS; which++) {
                     client *item = &clients[which];
                     size_t framed = output.size + (output.size + 1u >= 128u ? 3u : 2u);
-                    if (item->fd < 0 || !item->greeted || !item->audio_encodec) continue;
-                    if (item->audio_wait_reset && !(output.flags & 1u)) { encodec_client_drops++; continue; }
+                    if (item->fd < 0 || !item->greeted || !item->audio_encodec || item->audio_profile != profile) continue;
+                    if (item->audio_wait_reset && !(output.flags & 1u)) { encodec_client_drops[profile]++; continue; }
                     if (item->audio_window != output.pts_ms / 1000u) {
                         item->audio_window = output.pts_ms / 1000u; item->audio_spent = 0;
                     }
@@ -1575,7 +1609,7 @@ main(int argc, char **argv) {
                         (item->audio_pending_since && now_millis() - item->audio_pending_since > KMX_ENCODEC_STALE_MS) ||
                         (audio_budget && (framed > audio_budget || item->audio_spent > audio_budget - framed)) ||
                         client_queue(item, KMX_MSG_AUDIO, output.packet, output.size)) {
-                        item->audio_wait_reset = true; encodec_client_drops++; continue;
+                        item->audio_wait_reset = true; encodec_client_drops[profile]++; continue;
                     }
                     if (!item->audio_pending_since) item->audio_pending_since = now_millis();
                     item->audio_wait_reset = false; item->audio_spent += framed;
@@ -1820,14 +1854,24 @@ main(int argc, char **argv) {
     }
     free(audio_block);
     free(audio_codec_block);
-    if (audio_codec) {
-        kmx_encodec_stats stats = kmx_encodec_statistics(audio_codec);
-        fprintf(stderr, "kmx-serve: encodec calls=%llu rtf=%.6f input_drops=%llu output_drops=%llu discontinuities=%llu client_drops=%zu\n",
+    bool had_audio_codec = audio_codecs[0] != NULL;
+    kmx_encodec_stats audio_total = {0};
+    for (unsigned profile = 0; profile < 2; profile++) if (audio_codecs[profile]) {
+        kmx_encodec_stats stats = kmx_encodec_statistics(audio_codecs[profile]);
+        audio_total.calls += stats.calls; audio_total.inference_ns += stats.inference_ns;
+        audio_total.input_drops += stats.input_drops; audio_total.output_drops += stats.output_drops;
+        audio_total.discontinuities += stats.discontinuities;
+        fprintf(stderr, "kmx-serve: encodec_profile calls=%llu rtf=%.6f input_drops=%llu output_drops=%llu discontinuities=%llu client_drops=%zu profile=%s\n",
             (unsigned long long)stats.calls, stats.calls ? (double)stats.inference_ns / ((double)stats.calls * 40000000.0) : 0.0,
             (unsigned long long)stats.input_drops, (unsigned long long)stats.output_drops,
-            (unsigned long long)stats.discontinuities, encodec_client_drops);
-        kmx_encodec_close(audio_codec);
+            (unsigned long long)stats.discontinuities, encodec_client_drops[profile], profile ? "C5-R4" : "C0");
+        kmx_encodec_close(audio_codecs[profile]);
     }
+    if (had_audio_codec) fprintf(stderr, "kmx-serve: encodec calls=%llu rtf=%.6f input_drops=%llu output_drops=%llu discontinuities=%llu client_drops=%zu\n",
+        (unsigned long long)audio_total.calls,
+        audio_total.calls ? (double)audio_total.inference_ns / ((double)audio_total.calls * 40000000.0) : 0.0,
+        (unsigned long long)audio_total.input_drops, (unsigned long long)audio_total.output_drops,
+        (unsigned long long)audio_total.discontinuities, encodec_client_drops[0] + encodec_client_drops[1]);
     if (frames_dropped || blocks_dropped) {
         fprintf(stderr,
             "kmx-serve: dropped %zu video frame(s) and %zu audio block(s) that "

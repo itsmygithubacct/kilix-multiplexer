@@ -74,6 +74,23 @@ PCM selection.
 The two endpoints must select the same bitrate. The stereo file profile is
 not a live KMX capability.
 
+New EnCodec peers negotiate the epoch-start profile separately from the existing
+audio capability bytes. Both advertise C0 and, when its context is ready,
+C5-R4; C5-R4 is selected only when both advertise it. A KAC1-only EnCodec peer
+gets C0 on both sides. Legacy PCM peers keep PCM. Each endpoint prewarms at
+most two fixed native contexts before accepting audio, so profile selection
+does not run model loading or inference inside the connection event loop.
+
+The optional post-HELLO `AUDIO_PROFILE` message (type13) is exactly12 bytes:
+`KEP1`, kind (0 offer,1 selection), three reserved zero bytes, then a big-endian
+uint32 value. Offers use capability bits0=C0 and1=C5-R4; C0 is required and
+unknown offer bits are ignored. Selection values are markers0=C0 or1=C5-R4;
+unknown or unadvertised markers are refused. The offer precedes KAC1. Only a
+peer that offered the extension receives a selected marker, before its KAC1
+selection. Missing marker means C0. Changed duplicates and profile offers after
+KAC1 are refused; identical KAC1 duplicates retain the committed selection.
+KAC1's size, reserved zeros and strict codec/rate validation are unchanged.
+
 Normal admission uses `KILIX_CONTENT_ROOT`, or the account's NSS home with
 `.local/gpu_terminal/kilix/data/desktop-apps`. Each process checks actual
 packaged catalog membership, receipts and the complete installed population
@@ -85,7 +102,7 @@ substitute a graph directory or an environment-based readiness claim.
 Build the optional tools with `ENCODEC=1`, `ENCODEC_CFLAGS` and
 `ENCODEC_LIBS` selecting the reviewed native provider built with `ONNX=1
 CONTENT=1` and an exact `CONTENT_SOURCE`/`CONTENT_COMMIT`. The build also needs
-libsamplerate and pthreads. Use a separate `BUILD_DIR=build-encodec` when
+native epoch-profile setters, libsamplerate and pthreads. Use a separate `BUILD_DIR=build-encodec` when
 switching build modes. The default build retains no native codec dependency.
 
 For local development and oracle tests only,
@@ -107,9 +124,15 @@ reset it. The first output sample retains its session PTS; resampler and
 capture accumulation add delivery delay. Decoded mono is passed to the
 existing sink with `KMX_AUDIO_RATE=24000` and `KMX_AUDIO_CHANNELS=1`.
 
-The encoder is shared across clients at the selected rate. Output packets are
+One encoder is shared across clients at each selected epoch profile and rate.
+A late C0 client never changes or resets the shared C5-R4 context; both
+contexts receive the same source PTS and route packets only to matching clients.
+Late clients wait for that profile's next RESET. Idle contexts receive no
+capture work. These fixed contexts add memory and mixed-profile CPU cost;
+functional checks alone do not qualify that additional resource budget.
+Output packets are
 opaque native KMA2 and are never passed through zstd. Queue overflow or work
-older than 250 ms abandons the global epoch and resumes at the next one-second
+older than 250 ms abandons only the affected profile's shared epoch and resumes at the next one-second
 source boundary with native RESET/DISCONTINUITY flags. That age starts at the
 first contributing input offer and includes accumulation, inference and output
 queue residence. Advancing a broken boundary invalidates already queued and
@@ -119,6 +142,14 @@ RTF, queue drops and discontinuities are reported at shutdown; `--dump` also
 reports selected codec and verified packet PTS/epoch/flags. KMX's existing
 socket flushing coalesces audio with other queued traffic. Token bitrate is
 not a measured TLS wire-rate claim.
+
+Each profile has a separate shutdown counter row; one aggregate row includes
+every context, including earlier profiles used before a reconnect. Client
+decoder input backpressure retains a complete packet in the existing bounded
+framer until an input slot is free and temporarily pauses socket reads. It
+resumes from the codec event without requiring another network read. Retained
+packets keep the oldest contributing read's timestamp, so waiting does not
+refresh the 250ms age budget. Codec input/output slots remain two each.
 
 `make test` includes bounded capability/refusal controls. An optional real
 native check is `build-encodec/test-encodec --development-assets /absolute/graphs`.
@@ -132,6 +163,9 @@ exact binaries, local graphs and a new evidence directory. These functional
 controls do not establish listening, consumer timing, multi-client wire
 capacity, memory fit or soak qualification. Motion still has no presentation
 timestamp, so this audio feature makes no A/V synchronization claim.
+`tests/encodec_profiles.py` separately checks actual extension ordering,
+duplicates, C0 fallback and bounded malformed-message refusals. Omitting its
+`--assets` argument uses already-admitted installed assets.
 
 For a broker-owned Kilix pane, the installed frontend supplies the bookkeeping:
 

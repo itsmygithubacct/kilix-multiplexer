@@ -18,6 +18,7 @@
 #include "kmx_input_transform.h"
 #include "kmx_tls.h"
 #include "kmx_encodec.h"
+#include "kmx_read_clock.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -168,6 +169,14 @@ static int send_audio_offer(int fd, const kmx_audio_caps *caps) {
     unsigned char payload[KMX_AUDIO_CAPS_BYTES];
     kmx_audio_caps_write(payload, caps);
     return send_message(fd, KMX_MSG_AUDIO_CAPS, payload, sizeof payload);
+}
+
+static int send_audio_profile_offer(int fd, uint32_t profiles) {
+    unsigned char payload[KMX_AUDIO_PROFILE_BYTES];
+    kmx_audio_profile offer = {0, profiles};
+    if (!profiles) return 0;
+    kmx_audio_profile_write(payload, &offer);
+    return send_message(fd, KMX_MSG_AUDIO_PROFILE, payload, sizeof payload);
 }
 
 /* The loop polls this descriptor, so it has to be non-blocking.
@@ -548,8 +557,13 @@ main(int argc, char **argv) {
     unsigned audio_threads = 2;
     const char *development_audio_assets = NULL;
     kmx_encodec *audio_codec = NULL;
+    kmx_encodec *audio_codecs[2] = {NULL, NULL};
+    uint32_t audio_profiles = 0, audio_profile = 0;
+    bool audio_profile_selected = false;
     kmx_audio_caps audio_offer = {0}, audio_selection = {0};
     bool audio_selected = false, audio_encodec = false;
+    bool audio_backpressure = false;
+    kmx_read_clock read_clock = {0};
     uint64_t audio_select_deadline = 0;
     kmx_tls_client *tls_client = NULL;
     kmx_tls_session *tls = NULL;
@@ -670,6 +684,13 @@ main(int argc, char **argv) {
         if (development_audio_assets) fprintf(stderr, "kmx-attach: DEVELOPMENT graph path; no installed admission\n");
         audio_codec = kmx_encodec_open_with_threads(false, audio_bitrate, 24000, 1,
                                       getenv("KILIX_CONTENT_ROOT"), development_audio_assets, audio_threads);
+        audio_codecs[0] = audio_codec;
+        if (audio_codec) {
+            audio_profiles = KMX_AUDIO_PROFILE_BIT(KMX_AUDIO_PROFILE_C0);
+            audio_codecs[1] = kmx_encodec_open_profile(false, audio_bitrate, 24000, 1,
+                                      getenv("KILIX_CONTENT_ROOT"), development_audio_assets, audio_threads, 1);
+            if (audio_codecs[1]) audio_profiles |= KMX_AUDIO_PROFILE_BIT(KMX_AUDIO_PROFILE_C5_R4);
+        }
         if (!audio_codec) {
             fprintf(stderr, "kmx-attach: EnCodec unavailable; %s\n",
                 audio_mode == KMX_AUDIO_ENCODEC ? "explicit selection refused" : "PCM fallback selected");
@@ -680,7 +701,7 @@ main(int argc, char **argv) {
     fd = kmx_endpoint_connect(&endpoint);
     if (fd < 0) {
         fprintf(stderr, "kmx-attach: connect: %s\n", strerror(errno));
-        kmx_encodec_close(audio_codec);
+        for (unsigned profile = 0; profile < 2; profile++) kmx_encodec_close(audio_codecs[profile]);
         return 1;
     }
     kmx_endpoint_tune(fd, &endpoint);
@@ -690,7 +711,7 @@ main(int argc, char **argv) {
             fprintf(stderr, "kmx-attach: a fingerprint is %d hex characters\n",
                     KMX_TLS_FINGERPRINT_HEX);
             close(fd);
-            kmx_encodec_close(audio_codec);
+            for (unsigned profile = 0; profile < 2; profile++) kmx_encodec_close(audio_codecs[profile]);
             return 2;
         }
         {
@@ -709,7 +730,7 @@ main(int argc, char **argv) {
                 "kmx-attach: the server did not present the expected "
                 "certificate\n");
             close(fd);
-            kmx_encodec_close(audio_codec);
+            for (unsigned profile = 0; profile < 2; profile++) kmx_encodec_close(audio_codecs[profile]);
             return 1;
         }
         {
@@ -729,7 +750,7 @@ main(int argc, char **argv) {
         kmx_audio_sink_create(&audio) != KMX_OK ||
         kmx_grid_init(&screen, rows, cols) != KMX_OK) {
         fprintf(stderr, "kmx-attach: out of memory\n");
-        kmx_encodec_close(audio_codec);
+        for (unsigned profile = 0; profile < 2; profile++) kmx_encodec_close(audio_codecs[profile]);
         return 1;
     }
     kmx_framer_init(&framer);
@@ -738,7 +759,8 @@ main(int argc, char **argv) {
     if (audio_codec) audio_offer.codecs |= KMX_AUDIO_CODEC_ENCODEC;
     audio_offer.rates = audio_codec ? kmx_audio_rate_bit(audio_bitrate) : 0;
     audio_offer.maximum = KMX_ENCODEC_PACKET_MAX;
-    if (send_hello(fd, rows, cols, view_only, token) || send_audio_offer(fd, &audio_offer)) {
+    if (send_hello(fd, rows, cols, view_only, token) ||
+        send_audio_profile_offer(fd, audio_profiles) || send_audio_offer(fd, &audio_offer)) {
         stop_pending = 1; exit_code = 1;
     }
     audio_select_deadline = now_millis() + 2000u;
@@ -787,8 +809,8 @@ main(int argc, char **argv) {
             kmx_render_invalidate(render);
         }
 
-        descriptors[0].fd = fd;
-        descriptors[0].events = POLLIN;
+        descriptors[0].fd = audio_backpressure ? -1 : fd;
+        descriptors[0].events = audio_backpressure ? 0 : POLLIN;
         descriptors[0].revents = 0;
         descriptors[1].fd = STDIN_FILENO;
         descriptors[1].events = dump ? 0 : POLLIN;
@@ -796,7 +818,17 @@ main(int argc, char **argv) {
         descriptors[2].fd = kmx_encodec_event_fd(audio_codec);
         descriptors[2].events = POLLIN;
         descriptors[2].revents = 0;
-        ready = poll(descriptors, 3, 50);
+        {
+            kmx_message_type pending_type;
+            const unsigned char *pending_payload;
+            size_t pending_size;
+            bool complete = false;
+            kmx_result pending_result = kmx_framer_next(&framer, &complete, &pending_type,
+                                                       &pending_payload, &pending_size);
+            bool processable = pending_result != KMX_OK ||
+                (complete && (!audio_backpressure || kmx_encodec_packet_ready(audio_codec)));
+            ready = poll(descriptors, 3, processable ? 0 : 50);
+        }
         if (ready < 0) {
             if (errno == EINTR) continue;
             break;
@@ -816,7 +848,7 @@ main(int argc, char **argv) {
             }
         }
 
-        if (descriptors[0].revents & (POLLIN | POLLHUP | POLLERR)) {
+        if (!audio_backpressure && (descriptors[0].revents & (POLLIN | POLLHUP | POLLERR))) {
             ssize_t count;
             if (tls) {
                 count = kmx_tls_read(tls, buffer, sizeof buffer);
@@ -891,21 +923,32 @@ main(int argc, char **argv) {
                 }
                 kmx_framer_free(&framer);
                 kmx_framer_init(&framer);
+                memset(&read_clock, 0, sizeof read_clock); audio_backpressure = false;
                 kmx_predictor_reset(predictor);
                 kmx_render_invalidate(render);
                 layout.pane_count = 0;
-                kmx_encodec_restart(audio_codec);
+                for (unsigned profile = 0; profile < 2; profile++) kmx_encodec_restart(audio_codecs[profile]);
+                audio_codec = audio_codecs[0];
+                audio_profile = KMX_AUDIO_PROFILE_C0;
+                audio_profile_selected = false;
                 audio_output_stop(&player);
                 memset(&player, 0, sizeof player); player.fd = player.child = -1;
                 audio_selected = audio_encodec = false;
-                send_hello(fd, rows, cols, view_only, token);
-                if (send_audio_offer(fd, &audio_offer)) { exit_code = 1; break; }
+                if (send_hello(fd, rows, cols, view_only, token) ||
+                    send_audio_profile_offer(fd, audio_profiles) || send_audio_offer(fd, &audio_offer)) {
+                    exit_code = 1; break;
+                }
                 audio_select_deadline = now_millis() + 2000u;
                 if (!view_only) send_dimensions(fd, KMX_MSG_RESIZE, rows, cols);
                 continue;
             }
+            /* Conservatively attribute retained bytes to the oldest read.
+             * Backpressure never refreshes a packet's 250ms age budget. */
+            kmx_read_clock_push(&read_clock, framer.pending.size, now_millis());
             if (kmx_framer_push(&framer, buffer, (size_t)count) != KMX_OK) break;
-            while (true) {
+        }
+        audio_backpressure = false;
+        while (true) {
                 kmx_message_type type;
                 const unsigned char *payload;
                 size_t size;
@@ -1008,10 +1051,22 @@ main(int argc, char **argv) {
                             stop_pending = 1;
                         }
                     }
+                } else if (type == KMX_MSG_AUDIO_PROFILE) {
+                    kmx_audio_profile selection;
+                    if (!audio_profiles || kmx_audio_profile_read(&selection, payload, size) ||
+                        selection.kind != 1 || !(audio_profiles & KMX_AUDIO_PROFILE_BIT(selection.value)) ||
+                        (audio_profile_selected && selection.value != audio_profile) ||
+                        (audio_selected && (!audio_profile_selected || !audio_encodec))) {
+                        fprintf(stderr, "kmx-attach: incompatible audio profile refused\n");
+                        exit_code = 1; stop_pending = 1; break;
+                    }
+                    audio_profile_selected = true;
+                    audio_profile = selection.value;
                 } else if (type == KMX_MSG_AUDIO_CAPS) {
                     kmx_audio_caps selection;
                     if (kmx_audio_caps_read(&selection, payload, size) || selection.kind != 1 ||
                         !(selection.codecs & audio_offer.codecs) ||
+                        (audio_profile_selected && selection.codecs != KMX_AUDIO_CODEC_ENCODEC) ||
                         (selection.codecs == KMX_AUDIO_CODEC_ENCODEC &&
                          (!audio_codec || selection.rates != audio_offer.rates)) ||
                         (audio_selected && (selection.codecs != audio_selection.codecs ||
@@ -1022,13 +1077,17 @@ main(int argc, char **argv) {
                     if (!audio_selected) {
                         audio_selected = true; audio_selection = selection;
                         audio_encodec = selection.codecs == KMX_AUDIO_CODEC_ENCODEC;
+                        /* An old server sends no marker: its selection uses
+                         * the already-prewarmed C0 decoder on both ends. */
+                        if (audio_encodec) audio_codec = audio_codecs[audio_profile];
                         if (audio_encodec && player.attempted) {
                             audio_output_stop(&player);
                             memset(&player, 0, sizeof player); player.fd = player.child = -1;
                         }
                         if (dump) {
-                            printf("KMX_AUDIO_CODEC %s bitrate=%u threads=%u\n", audio_encodec ? "encodec-24k-mono-v1" : "pcm-s16le-zstd-v1",
-                                   audio_encodec ? audio_bitrate : 0u, audio_encodec ? audio_threads : 0u);
+                            printf("KMX_AUDIO_CODEC %s bitrate=%u threads=%u profile=%s\n", audio_encodec ? "encodec-24k-mono-v1" : "pcm-s16le-zstd-v1",
+                                   audio_encodec ? audio_bitrate : 0u, audio_encodec ? audio_threads : 0u,
+                                   audio_encodec && audio_profile ? "C5-R4" : "C0");
                             fflush(stdout);
                         }
                     }
@@ -1036,7 +1095,13 @@ main(int argc, char **argv) {
                     if (size < 4 || size > KMX_ENCODEC_PACKET_MAX || memcmp(payload, "KMA\2", 4)) {
                         exit_code = 1; stop_pending = 1; break;
                     }
-                    (void)kmx_encodec_offer_packet(audio_codec, payload, size);
+                    /* Leave this complete frame in the existing bounded
+                     * framer while the two decoder input slots are full.
+                     * Resume on the codec event even without a socket read. */
+                    if (!kmx_encodec_packet_ready(audio_codec)) {
+                        audio_backpressure = true; break;
+                    }
+                    (void)kmx_encodec_offer_packet_at(audio_codec, payload, size, read_clock.earliest_ms);
                 } else if (type == KMX_MSG_AUDIO) {
                     if (audio_mode == KMX_AUDIO_ENCODEC) { exit_code = 1; stop_pending = 1; break; }
                     if (kmx_audio_sink_apply(audio, payload, size) == KMX_OK) {
@@ -1067,8 +1132,11 @@ main(int argc, char **argv) {
                     pane_ended = true;
                     stop_pending = 1;
                 }
-                kmx_framer_consume(&framer);
-            }
+                {
+                    size_t before = framer.pending.size;
+                    kmx_framer_consume(&framer);
+                    kmx_read_clock_consume(&read_clock, before - framer.pending.size);
+                }
         }
 
         if (audio_codec) {
@@ -1197,14 +1265,24 @@ main(int argc, char **argv) {
     kmx_predictor_free(predictor);
     kmx_render_free(render);
     audio_output_stop(&player);
-    if (audio_codec) {
-        kmx_encodec_stats stats = kmx_encodec_statistics(audio_codec);
-        fprintf(stderr, "kmx-attach: encodec calls=%llu rtf=%.6f input_drops=%llu output_drops=%llu discontinuities=%llu\n",
+    bool had_audio_codec = audio_codecs[0] != NULL;
+    kmx_encodec_stats audio_total = {0};
+    for (unsigned profile = 0; profile < 2; profile++) if (audio_codecs[profile]) {
+        kmx_encodec_stats stats = kmx_encodec_statistics(audio_codecs[profile]);
+        audio_total.calls += stats.calls; audio_total.inference_ns += stats.inference_ns;
+        audio_total.input_drops += stats.input_drops; audio_total.output_drops += stats.output_drops;
+        audio_total.discontinuities += stats.discontinuities;
+        fprintf(stderr, "kmx-attach: encodec_profile calls=%llu rtf=%.6f input_drops=%llu output_drops=%llu discontinuities=%llu profile=%s\n",
             (unsigned long long)stats.calls, stats.calls ? (double)stats.inference_ns / ((double)stats.calls * 40000000.0) : 0.0,
             (unsigned long long)stats.input_drops, (unsigned long long)stats.output_drops,
-            (unsigned long long)stats.discontinuities);
-        kmx_encodec_close(audio_codec);
+            (unsigned long long)stats.discontinuities, profile ? "C5-R4" : "C0");
+        kmx_encodec_close(audio_codecs[profile]);
     }
+    if (had_audio_codec) fprintf(stderr, "kmx-attach: encodec calls=%llu rtf=%.6f input_drops=%llu output_drops=%llu discontinuities=%llu\n",
+        (unsigned long long)audio_total.calls,
+        audio_total.calls ? (double)audio_total.inference_ns / ((double)audio_total.calls * 40000000.0) : 0.0,
+        (unsigned long long)audio_total.input_drops, (unsigned long long)audio_total.output_drops,
+        (unsigned long long)audio_total.discontinuities);
     if (player.dropped) {
         fprintf(stderr, "kmx-attach: dropped %zu audio block(s) at playback\n",
                 player.dropped);

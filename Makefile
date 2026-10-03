@@ -95,7 +95,7 @@ $(BUILD_DIR)/kmx_encodec.o: tools/kmx_encodec.c tools/kmx_encodec.h | $(BUILD_DI
 $(SERVE): $(BUILD_DIR)/kmx_serve.o $(BUILD_DIR)/kmx_pixel.o $(BUILD_DIR)/kmx_tap.o $(BUILD_DIR)/kmx_tls.o $(BUILD_DIR)/kmx_encodec.o $(STATIC_LIB)
 	$(CC) $(LDFLAGS) -o "$@" $(BUILD_DIR)/kmx_serve.o $(BUILD_DIR)/kmx_pixel.o $(BUILD_DIR)/kmx_tap.o $(BUILD_DIR)/kmx_tls.o $(BUILD_DIR)/kmx_encodec.o $(STATIC_LIB) $(LDLIBS) $(CODEC_LIBS) -lutil -lssl -lcrypto
 
-$(BUILD_DIR)/kmx_attach.o: tools/kmx_attach.c tools/kmx_tls.h tools/kmx_input_transform.h tools/kmx_encodec.h include/kilix_mux.h | $(BUILD_DIR)
+$(BUILD_DIR)/kmx_attach.o: tools/kmx_attach.c tools/kmx_tls.h tools/kmx_input_transform.h tools/kmx_encodec.h tools/kmx_read_clock.h include/kilix_mux.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Itools -c "$<" -o "$@"
 
 $(BUILD_DIR)/kmx_input_transform.o: tools/kmx_input_transform.c tools/kmx_input_transform.h include/kilix_mux.h | $(BUILD_DIR)
@@ -104,7 +104,7 @@ $(BUILD_DIR)/kmx_input_transform.o: tools/kmx_input_transform.c tools/kmx_input_
 $(ATTACH): $(BUILD_DIR)/kmx_attach.o $(BUILD_DIR)/kmx_input_transform.o $(BUILD_DIR)/kmx_tls.o $(BUILD_DIR)/kmx_encodec.o $(STATIC_LIB)
 	$(CC) $(LDFLAGS) -o "$@" $(BUILD_DIR)/kmx_attach.o $(BUILD_DIR)/kmx_input_transform.o $(BUILD_DIR)/kmx_tls.o $(BUILD_DIR)/kmx_encodec.o $(STATIC_LIB) $(LDLIBS) $(CODEC_LIBS) -lssl -lcrypto
 
-$(BUILD_DIR)/test_mux.o: tests/test_mux.c include/kilix_mux.h | $(BUILD_DIR)
+$(BUILD_DIR)/test_mux.o: tests/test_mux.c include/kilix_mux.h tools/kmx_read_clock.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c "$<" -o "$@"
 
 $(TEST): $(BUILD_DIR)/test_mux.o $(STATIC_LIB)
@@ -140,7 +140,7 @@ backpressure: $(SERVE) $(FLOOD)
 churn:
 	tests/churn.sh
 
-$(ENCODEC_TEST): tests/test_encodec.c $(BUILD_DIR)/kmx_encodec.o
+$(ENCODEC_TEST): tests/test_encodec.c tools/kmx_read_clock.h $(BUILD_DIR)/kmx_encodec.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Itools $(LDFLAGS) -o "$@" tests/test_encodec.c $(BUILD_DIR)/kmx_encodec.o $(CODEC_LIBS) -lm
 
 # Explicit local graph input is required to run this scheduling regression.

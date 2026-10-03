@@ -33,6 +33,36 @@ int kmx_audio_threads_parse(const char *text, unsigned *threads) {
     return 0;
 }
 
+void kmx_audio_profile_write(unsigned char out[KMX_AUDIO_PROFILE_BYTES], const kmx_audio_profile *profile) {
+    memcpy(out, "KEP1", 4);
+    out[4] = profile->kind; out[5] = out[6] = out[7] = 0;
+    out[8] = (unsigned char)(profile->value >> 24);
+    out[9] = (unsigned char)(profile->value >> 16);
+    out[10] = (unsigned char)(profile->value >> 8);
+    out[11] = (unsigned char)profile->value;
+}
+
+int kmx_audio_profile_read(kmx_audio_profile *out, const void *data, size_t size) {
+    const unsigned char *p = data;
+    kmx_audio_profile value;
+    if (!out || !p || size != KMX_AUDIO_PROFILE_BYTES || memcmp(p, "KEP1", 4) ||
+        p[4] > 1 || p[5] || p[6] || p[7]) return -1;
+    value.kind = p[4];
+    value.value = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
+                  ((uint32_t)p[10] << 8) | p[11];
+    /* Future capability bits are ignored; selected markers must be known.
+     * Every explicitly advertising peer must retain the C0 fallback. */
+    if ((!value.kind && !(value.value & KMX_AUDIO_PROFILE_BIT(KMX_AUDIO_PROFILE_C0))) ||
+        (value.kind && value.value > KMX_AUDIO_PROFILE_C5_R4)) return -1;
+    *out = value;
+    return 0;
+}
+
+uint32_t kmx_audio_profile_choose(uint32_t local, uint32_t peer) {
+    return (local & peer & KMX_AUDIO_PROFILE_BIT(KMX_AUDIO_PROFILE_C5_R4)) ?
+        KMX_AUDIO_PROFILE_C5_R4 : KMX_AUDIO_PROFILE_C0;
+}
+
 void kmx_audio_caps_write(unsigned char out[KMX_AUDIO_CAPS_BYTES], const kmx_audio_caps *caps) {
     memcpy(out, "KAC1", 4);
     out[4] = caps->kind; out[5] = caps->codecs; out[6] = caps->rates; out[7] = 0;
@@ -312,8 +342,9 @@ static void *worker(void *opaque) {
     return NULL;
 }
 
-kmx_encodec *kmx_encodec_open_with_threads(bool encode, unsigned bitrate, int capture_rate,
-    int capture_channels, const char *content_root, const char *development_assets, unsigned threads) {
+kmx_encodec *kmx_encodec_open_profile(bool encode, unsigned bitrate, int capture_rate,
+    int capture_channels, const char *content_root, const char *development_assets,
+    unsigned threads, uint32_t profile) {
     kmx_encodec *codec = NULL;
     kenc_model *model = NULL;
     kenc_installed_assets *assets = NULL;
@@ -326,7 +357,7 @@ kmx_encodec *kmx_encodec_open_with_threads(bool encode, unsigned bitrate, int ca
     char root[PATH_MAX], passwd_buffer[16384];
     struct passwd account, *found = NULL;
     int error;
-    if ((threads != 2 && threads != 4) || !kmx_audio_rate_bit(bitrate) || (encode &&
+    if (profile > KMX_AUDIO_PROFILE_C5_R4 || (threads != 2 && threads != 4) || !kmx_audio_rate_bit(bitrate) || (encode &&
         ((capture_rate != 24000 && capture_rate != 44100 && capture_rate != 48000) ||
          capture_channels < 1 || capture_channels > 8))) return NULL;
     codec = calloc(1, sizeof *codec);
@@ -358,6 +389,8 @@ kmx_encodec *kmx_encodec_open_with_threads(bool encode, unsigned bitrate, int ca
     }
     if (kenc_encoder_create(&warm_encoder, model, &codec->options) != KENC_OK ||
         kenc_decoder_create(&warm_decoder, model, &codec->options) != KENC_OK ||
+        kenc_encoder_set_epoch_start(warm_encoder, (kenc_epoch_start)profile) != KENC_OK ||
+        kenc_decoder_set_epoch_start(warm_decoder, (kenc_epoch_start)profile) != KENC_OK ||
         kenc_encoder_push_s16(warm_encoder, silence, KMX_ENCODEC_SAMPLES, 0, packet, sizeof packet, &written) != KENC_OK ||
         kenc_decoder_pull_s16(warm_decoder, packet, written, decoded, KMX_ENCODEC_SAMPLES, &samples, &info) != KENC_OK ||
         samples != KMX_ENCODEC_SAMPLES) goto fail;
@@ -398,7 +431,7 @@ void kmx_encodec_close(kmx_encodec *codec) {
 
 int kmx_encodec_event_fd(const kmx_encodec *codec) { return codec ? codec->output_event : -1; }
 
-static bool offer(kmx_encodec *codec, const void *bytes, size_t size, uint64_t pts_ms) {
+static bool offer(kmx_encodec *codec, const void *bytes, size_t size, uint64_t pts_ms, uint64_t offered_ms) {
     uint64_t head = atomic_load_explicit(&codec->in_head, memory_order_relaxed);
     codec_input *input;
     if (codec->encode && pts_ms < atomic_load(&codec->broken_until)) {
@@ -411,7 +444,7 @@ static bool offer(kmx_encodec *codec, const void *bytes, size_t size, uint64_t p
     }
     input = &codec->input[head % SLOTS];
     memcpy(input->bytes, bytes, size); input->size = size; input->pts_ms = pts_ms;
-    input->offered_ms = milliseconds(); input->generation = generation_now(codec);
+    input->offered_ms = offered_ms; input->generation = generation_now(codec);
     atomic_store_explicit(&codec->in_head, head + 1, memory_order_release);
     notify(codec->input_event);
     return true;
@@ -420,11 +453,20 @@ static bool offer(kmx_encodec *codec, const void *bytes, size_t size, uint64_t p
 bool kmx_encodec_offer_pcm(kmx_encodec *codec, const void *pcm, size_t bytes, uint64_t pts_ms) {
     if (!codec || !codec->encode || !pcm || pts_ms % 40u || pts_ms > UINT64_MAX - 1000u ||
         bytes != (size_t)(codec->rate / 25) * (size_t)codec->channels * 2u) return false;
-    return offer(codec, pcm, bytes, pts_ms);
+    return offer(codec, pcm, bytes, pts_ms, milliseconds());
 }
 bool kmx_encodec_offer_packet(kmx_encodec *codec, const void *packet, size_t bytes) {
+    return kmx_encodec_offer_packet_at(codec, packet, bytes, milliseconds());
+}
+bool kmx_encodec_packet_ready(const kmx_encodec *codec) {
+    return codec && !codec->encode &&
+        atomic_load_explicit(&codec->in_head, memory_order_relaxed) -
+        atomic_load_explicit(&codec->in_tail, memory_order_acquire) < SLOTS;
+}
+bool kmx_encodec_offer_packet_at(kmx_encodec *codec, const void *packet, size_t bytes, uint64_t received_ms) {
     if (!codec || codec->encode || !packet || !bytes || bytes > KMX_ENCODEC_PACKET_MAX) return false;
-    return offer(codec, packet, bytes, 0);
+    if (received_ms > milliseconds()) return false;
+    return offer(codec, packet, bytes, 0, received_ms);
 }
 
 bool kmx_encodec_receive(kmx_encodec *codec, kmx_encodec_output *output) {
@@ -462,10 +504,11 @@ kmx_encodec_stats kmx_encodec_statistics(const kmx_encodec *codec) {
         atomic_load(&codec->input_drops), atomic_load(&codec->output_drops), atomic_load(&codec->discontinuities)};
 }
 #else
-kmx_encodec *kmx_encodec_open_with_threads(bool encode, unsigned bitrate, int capture_rate,
-    int capture_channels, const char *content_root, const char *development_assets, unsigned threads) {
+kmx_encodec *kmx_encodec_open_profile(bool encode, unsigned bitrate, int capture_rate,
+    int capture_channels, const char *content_root, const char *development_assets,
+    unsigned threads, uint32_t profile) {
     (void)encode; (void)bitrate; (void)capture_rate; (void)capture_channels;
-    (void)content_root; (void)development_assets; (void)threads; return NULL;
+    (void)content_root; (void)development_assets; (void)threads; (void)profile; return NULL;
 }
 void kmx_encodec_close(kmx_encodec *codec) { (void)codec; }
 int kmx_encodec_event_fd(const kmx_encodec *codec) { (void)codec; return -1; }
@@ -475,10 +518,20 @@ bool kmx_encodec_offer_pcm(kmx_encodec *codec, const void *pcm, size_t bytes, ui
 bool kmx_encodec_offer_packet(kmx_encodec *codec, const void *packet, size_t bytes) {
     (void)codec; (void)packet; (void)bytes; return false;
 }
+bool kmx_encodec_packet_ready(const kmx_encodec *codec) { (void)codec; return false; }
+bool kmx_encodec_offer_packet_at(kmx_encodec *codec, const void *packet, size_t bytes, uint64_t received_ms) {
+    (void)codec; (void)packet; (void)bytes; (void)received_ms; return false;
+}
 bool kmx_encodec_receive(kmx_encodec *codec, kmx_encodec_output *output) { (void)codec; (void)output; return false; }
 void kmx_encodec_restart(kmx_encodec *codec) { (void)codec; }
 kmx_encodec_stats kmx_encodec_statistics(const kmx_encodec *codec) { (void)codec; return (kmx_encodec_stats){0}; }
 #endif
+
+kmx_encodec *kmx_encodec_open_with_threads(bool encode, unsigned bitrate, int capture_rate,
+    int capture_channels, const char *content_root, const char *development_assets, unsigned threads) {
+    return kmx_encodec_open_profile(encode, bitrate, capture_rate, capture_channels,
+        content_root, development_assets, threads, KMX_AUDIO_PROFILE_C0);
+}
 
 kmx_encodec *kmx_encodec_open(bool encode, unsigned bitrate, int capture_rate,
     int capture_channels, const char *content_root, const char *development_assets) {

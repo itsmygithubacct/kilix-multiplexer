@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include "kilix_mux.h"
+#include "../tools/kmx_read_clock.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -700,6 +701,51 @@ test_framer_rejects_absurd_lengths(void) {
     CHECK(kmx_framer_push(&framer, huge, sizeof huge) == KMX_OK);
     CHECK(kmx_framer_next(&framer, &ready, &type, &payload, &size) == KMX_ERR_LIMIT);
     kmx_framer_free(&framer);
+}
+
+static void
+test_fragmented_frame_receipt_clock(void) {
+    kmx_framer framer;
+    kmx_buffer stream;
+    kmx_read_clock clock = {0};
+    uint64_t arrivals[4096] = {0};
+    const size_t chunks[] = {3, 21, 2, 17, 1, 7};
+    size_t sent = 0, consumed = 0, read_number = 0, frames = 0;
+    kmx_buffer_init(&stream);
+    for (size_t i = 0; i < 100; i++)
+        CHECK(kmx_frame_encode(KMX_MSG_AUDIO, "abcdefghijkl", 12, &stream) == KMX_OK);
+    CHECK(stream.size < sizeof arrivals / sizeof *arrivals);
+    kmx_framer_init(&framer);
+    while (sent < stream.size) {
+        size_t take = chunks[read_number % (sizeof chunks / sizeof *chunks)];
+        uint64_t received = 1 + read_number++ * 200;
+        if (take > stream.size - sent) take = stream.size - sent;
+        for (size_t i = 0; i < take; i++) arrivals[sent + i] = received;
+        kmx_read_clock_push(&clock, framer.pending.size, received);
+        CHECK(kmx_framer_push(&framer, stream.data + sent, take) == KMX_OK);
+        sent += take;
+        while (true) {
+            bool ready = false;
+            kmx_message_type type;
+            const unsigned char *payload;
+            size_t size;
+            CHECK(kmx_framer_next(&framer, &ready, &type, &payload, &size) == KMX_OK);
+            if (!ready) break; /* incomplete records do not request zero-timeout polling */
+            CHECK(type == KMX_MSG_AUDIO && size == 12);
+            CHECK(clock.earliest_ms == arrivals[consumed]);
+            /* Holding a complete backpressured frame does not consume bytes
+             * or refresh its receipt clock; no new socket read occurs. */
+            CHECK(kmx_framer_next(&framer, &ready, &type, &payload, &size) == KMX_OK && ready);
+            CHECK(clock.earliest_ms == arrivals[consumed]);
+            size_t before = framer.pending.size;
+            kmx_framer_consume(&framer);
+            size_t removed = before - framer.pending.size;
+            kmx_read_clock_consume(&clock, removed);
+            consumed += removed; frames++;
+        }
+    }
+    CHECK(frames == 100 && consumed == stream.size && !framer.pending.size);
+    kmx_framer_free(&framer); kmx_buffer_free(&stream);
 }
 
 /* A cell that was never written and a cell holding a space are indistinguish-
@@ -1940,6 +1986,7 @@ main(void) {
     RUN(test_receiver_rejects_malformed_messages);
     RUN(test_framer_reassembles_messages);
     RUN(test_framer_rejects_absurd_lengths);
+    RUN(test_fragmented_frame_receipt_clock);
     RUN(test_render_reproduces_the_grid);
     RUN(test_predictor_echoes_and_withdraws);
     RUN(test_layout_arrange_fills_the_screen);

@@ -70,6 +70,35 @@ static void capabilities(void) {
     CHECK(kmx_encodec_offer_packet(NULL, bytes, sizeof bytes) == false);
     CHECK(kmx_encodec_receive(NULL, NULL) == false);
     kmx_encodec_close(NULL); kmx_encodec_restart(NULL);
+    {
+        kmx_audio_profile profile = {0, UINT32_C(0x80000003)}, parsed;
+        kmx_audio_profile_write(bytes, &profile);
+        CHECK(kmx_audio_profile_read(&parsed, bytes, KMX_AUDIO_PROFILE_BYTES) == 0);
+        CHECK(parsed.kind == 0 && parsed.value == profile.value);
+        CHECK(kmx_audio_profile_choose(3, parsed.value) == 1);
+        CHECK(kmx_audio_profile_choose(3, 0) == 0);
+        CHECK(kmx_audio_profile_choose(3, 1) == 0);
+        CHECK(kmx_audio_profile_choose(1, 3) == 0);
+        for (i = 0; i < KMX_AUDIO_PROFILE_BYTES; i++) {
+            memset(&parsed, 0x35, sizeof parsed);
+            kmx_audio_profile before = parsed;
+            CHECK(kmx_audio_profile_read(&parsed, bytes, i) == -1);
+            CHECK(memcmp(&parsed, &before, sizeof parsed) == 0);
+        }
+        CHECK(kmx_audio_profile_read(&parsed, bytes, KMX_AUDIO_PROFILE_BYTES + 1) == -1);
+        for (i = 0; i < 8; i++) {
+            unsigned char saved = bytes[i]; bytes[i] ^= 0x80;
+            CHECK(kmx_audio_profile_read(&parsed, bytes, KMX_AUDIO_PROFILE_BYTES) == -1);
+            bytes[i] = saved;
+        }
+        profile.value = 2; kmx_audio_profile_write(bytes, &profile);
+        CHECK(kmx_audio_profile_read(&parsed, bytes, KMX_AUDIO_PROFILE_BYTES) == -1);
+        profile.kind = 1;
+        for (i = 0; i < 3; i++) {
+            profile.value = i; kmx_audio_profile_write(bytes, &profile);
+            CHECK(kmx_audio_profile_read(&parsed, bytes, KMX_AUDIO_PROFILE_BYTES) == (i < 2 ? 0 : -1));
+        }
+    }
 }
 
 #ifdef KMX_HAVE_ENCODEC
@@ -87,7 +116,7 @@ static void wait_output(kmx_encodec *codec, kmx_encodec_output *output) {
 }
 
 static void native(const char *assets) {
-    unsigned rates[] = {3,6,12}, which, i, thread_count;
+    unsigned rates[] = {3,6,12}, which, i, thread_count, profile;
     unsigned char pcm[KMX_ENCODEC_SAMPLES * 2u];
     int16_t reference_pcm[KMX_ENCODEC_SAMPLES];
     for (i = 0; i < KMX_ENCODEC_SAMPLES; i++) {
@@ -95,10 +124,13 @@ static void native(const char *assets) {
         reference_pcm[i] = value;
         pcm[i*2u] = (unsigned char)value; pcm[i*2u+1u] = (unsigned char)((uint16_t)value >> 8);
     }
+    for (profile = 0; profile < 2; profile++)
     for (thread_count = 2; thread_count <= 4; thread_count += 2) for (which = 0; which < 3; which++) {
-        kmx_encodec *encoder = thread_count == 2 ? kmx_encodec_open(true, rates[which], 24000, 1, NULL, assets) :
+        kmx_encodec *encoder = profile ? kmx_encodec_open_profile(true, rates[which], 24000, 1, NULL, assets, thread_count, profile) :
+            thread_count == 2 ? kmx_encodec_open(true, rates[which], 24000, 1, NULL, assets) :
             kmx_encodec_open_with_threads(true, rates[which], 24000, 1, NULL, assets, thread_count);
-        kmx_encodec *decoder = thread_count == 2 ? kmx_encodec_open(false, rates[which], 24000, 1, NULL, assets) :
+        kmx_encodec *decoder = profile ? kmx_encodec_open_profile(false, rates[which], 24000, 1, NULL, assets, thread_count, profile) :
+            thread_count == 2 ? kmx_encodec_open(false, rates[which], 24000, 1, NULL, assets) :
             kmx_encodec_open_with_threads(false, rates[which], 24000, 1, NULL, assets, thread_count);
         kenc_model *model = NULL;
         kenc_decoder *reference = NULL;
@@ -110,6 +142,8 @@ static void native(const char *assets) {
         CHECK(kenc_model_load(&model, assets) == KENC_OK);
         CHECK(kenc_decoder_create(&reference, model, &options) == KENC_OK);
         CHECK(kenc_encoder_create(&reference_encoder, model, &options) == KENC_OK);
+        CHECK(kenc_encoder_set_epoch_start(reference_encoder, (kenc_epoch_start)profile) == KENC_OK);
+        CHECK(kenc_decoder_set_epoch_start(reference, (kenc_epoch_start)profile) == KENC_OK);
         {
             /* Match the adapter's admission warmup and first worker reset,
              * including the packet epoch number; no warmup state survives. */
@@ -129,6 +163,8 @@ static void native(const char *assets) {
             CHECK(kmx_encodec_offer_pcm(encoder, pcm, sizeof pcm, i * 40u));
             wait_output(encoder, &packet);
             CHECK(packet.pts_ms == i * 40u && packet.size <= KMX_ENCODEC_PACKET_MAX);
+            CHECK((packet.flags & KENC_PACKET_FLAG_EPOCH_PREROLL) ==
+                  ((profile && (packet.flags & KENC_PACKET_FLAG_RESET)) ? KENC_PACKET_FLAG_EPOCH_PREROLL : 0));
             CHECK(kenc_encoder_push_s16(reference_encoder, reference_pcm, KMX_ENCODEC_SAMPLES,
                 i * 40u, expected_packet, sizeof expected_packet, &expected_size) == KENC_OK);
             CHECK(expected_size == packet.size && memcmp(expected_packet, packet.packet, packet.size) == 0);
@@ -164,6 +200,7 @@ static void native(const char *assets) {
     CHECK(kmx_encodec_open(true, 6, 32000, 1, NULL, assets) == NULL);
     CHECK(kmx_encodec_open(true, 6, 24000, 9, NULL, assets) == NULL);
     CHECK(kmx_encodec_open_with_threads(true, 6, 24000, 1, NULL, assets, 3) == NULL);
+    CHECK(kmx_encodec_open_profile(true, 6, 24000, 1, NULL, assets, 4, 2) == NULL);
     {
         kmx_encodec *encoder = kmx_encodec_open(true, 6, 24000, 1, NULL, assets);
         kmx_encodec_output packet;
