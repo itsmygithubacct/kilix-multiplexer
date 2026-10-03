@@ -110,6 +110,16 @@ static void native(const char *assets) {
         CHECK(kenc_model_load(&model, assets) == KENC_OK);
         CHECK(kenc_decoder_create(&reference, model, &options) == KENC_OK);
         CHECK(kenc_encoder_create(&reference_encoder, model, &options) == KENC_OK);
+        {
+            /* Match the adapter's admission warmup and first worker reset,
+             * including the packet epoch number; no warmup state survives. */
+            int16_t silence[KMX_ENCODEC_SAMPLES] = {0};
+            unsigned char warm_packet[KMX_ENCODEC_PACKET_MAX];
+            size_t warm_size = 0;
+            CHECK(kenc_encoder_push_s16(reference_encoder, silence, KMX_ENCODEC_SAMPLES,
+                0, warm_packet, sizeof warm_packet, &warm_size) == KENC_OK);
+            kenc_encoder_reset(reference_encoder);
+        }
         for (i = 0; i < 27; i++) {
             int16_t expected[KMX_ENCODEC_SAMPLES];
             size_t samples = 0;
