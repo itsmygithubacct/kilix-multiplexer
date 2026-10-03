@@ -56,8 +56,77 @@ class Reader:
         raise AssertionError('message deadline')
 
 
-def case(options, root, name, preselection_frames):
+def handshake(reader, peer, deadline, frames):
+    kind, _ = reader.next(deadline)
+    assert kind == 1, ('first message is not HELLO', kind)
+    # The race, made deterministic: audio between HELLO and selection.
+    for body in frames:
+        peer.sendall(frame(11, body))
+    while True:
+        kind, body = reader.next(deadline)
+        if kind == 12:
+            assert body[:4] == b'KAC1' and body[4] == 0, body
+            assert body[5] & 2, ('attach did not offer EnCodec', body)
+            return body
+
+
+def select(peer, offer):
+    # Select EnCodec at the offered rate; no profile marker selects C0.
+    peer.sendall(frame(12, b'KAC1' + bytes([1, 2, offer[6], 0]) + offer[8:10] + b'\0\0'))
+
+
+def case(options, root, name, preselection_frames, mode='encodec', connections=1):
+    """Each connection: HELLO, the given AUDIO frames, then the selection.
+    After the last selection a malformed EnCodec frame must still be fatal."""
     directory = root / name
+    directory.mkdir()
+    codec_line = b'KMX_AUDIO_CODEC encodec-24k-mono-v1'
+    with tempfile.TemporaryDirectory(prefix='kmx-presel-', dir='/tmp') as temporary:
+        endpoint = Path(temporary) / 'session'
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(endpoint)); listener.listen(1)
+        command = [str(options.attach), '--socket', str(endpoint), '--view', '--dump',
+                   '--reconnect', '10' if connections > 1 else '0',
+                   '--audio-codec', mode, '--audio-threads', '4', '--audio-output', 'exec cat > /dev/null']
+        if options.assets:
+            command += ['--development-encodec-assets', str(options.assets)]
+        out = (directory / 'attach.out').open('wb'); err = (directory / 'attach.err').open('wb')
+        process = subprocess.Popen(command, stdout=out, stderr=err, start_new_session=True)
+        try:
+            listener.settimeout(30)
+            for connection in range(connections):
+                peer, _ = listener.accept()
+                reader = Reader(peer)
+                offer = handshake(reader, peer, time.monotonic() + 10, preselection_frames)
+                select(peer, offer)
+                wait_for(lambda: (directory / 'attach.out').read_bytes().count(codec_line) > connection,
+                         process, 10)
+                time.sleep(.5)
+                assert process.poll() is None, ('attach exited after selection', process.returncode)
+                if connection + 1 < connections:
+                    peer.close()           # a dropped link; the attach reconnects and renegotiates
+            # Strictness after selection is unchanged: a malformed EnCodec frame is fatal.
+            peer.sendall(frame(11, b'BAD!'))
+            process.wait(timeout=10)
+            peer.close()
+        finally:
+            stop(process); out.close(); err.close(); listener.close()
+    stderr = (directory / 'attach.err').read_text(errors='replace')
+    assert process.returncode == 1, ('malformed post-selection frame was not refused', process.returncode)
+    expected = len(preselection_frames) * connections if mode == 'encodec' else 0
+    if expected:
+        assert f'discarded {expected} audio block(s) received before the EnCodec selection' in stderr, stderr
+    else:
+        # auto mode offers PCM too, so pre-selection audio goes to the PCM sink as before.
+        assert 'received before the EnCodec selection' not in stderr, stderr
+    return dict(case=name, passed=True, mode=mode, connections=connections,
+                preselection_frames=len(preselection_frames), discarded=expected, returncode=process.returncode)
+
+
+def never_selected(options, root):
+    """Discarded audio must not extend the wait: with no selection the attach
+    still gives up at its selection deadline, with its existing message."""
+    directory = root / 'never-selected'
     directory.mkdir()
     with tempfile.TemporaryDirectory(prefix='kmx-presel-', dir='/tmp') as temporary:
         endpoint = Path(temporary) / 'session'
@@ -73,46 +142,39 @@ def case(options, root, name, preselection_frames):
             listener.settimeout(30)
             peer, _ = listener.accept()
             reader = Reader(peer)
-            deadline = time.monotonic() + 10
-            kind, _ = reader.next(deadline)
+            kind, _ = reader.next(time.monotonic() + 10)
             assert kind == 1, ('first message is not HELLO', kind)
-            # The race, made deterministic: audio between HELLO and selection.
-            for body in preselection_frames:
-                peer.sendall(frame(11, body))
-            offer = None
-            while offer is None:
-                kind, body = reader.next(deadline)
-                if kind == 12:
-                    offer = body
-            assert offer[:4] == b'KAC1' and offer[4] == 0, offer
-            assert offer[5] & 2, ('attach did not offer EnCodec', offer)
-            # Select EnCodec at the offered rate; no profile marker selects C0.
-            peer.sendall(frame(12, b'KAC1' + bytes([1, 2, offer[6], 0]) + offer[8:10] + b'\0\0'))
-            wait_for(lambda: b'KMX_AUDIO_CODEC encodec-24k-mono-v1' in (directory / 'attach.out').read_bytes(),
-                     process, 10)
-            time.sleep(.5)
-            assert process.poll() is None, ('attach exited after selection', process.returncode)
-            # Strictness after selection is unchanged: a malformed EnCodec frame is fatal.
-            peer.sendall(frame(11, b'BAD!'))
-            process.wait(timeout=10)
+            greeted = time.monotonic(); sent = 0
+            while process.poll() is None and time.monotonic() - greeted < 8:
+                try:
+                    peer.sendall(frame(11, b'\0' * 64)); sent += 1
+                except (BrokenPipeError, ConnectionResetError):
+                    break
+                time.sleep(.05)
+            process.wait(timeout=5)
+            elapsed = time.monotonic() - greeted
             peer.close()
         finally:
             stop(process); out.close(); err.close(); listener.close()
     stderr = (directory / 'attach.err').read_text(errors='replace')
-    assert process.returncode == 1, ('malformed post-selection frame was not refused', process.returncode)
-    expected = len(preselection_frames)
-    if expected:
-        assert f'discarded {expected} audio block(s) received before the EnCodec selection' in stderr, stderr
-    else:
-        assert 'received before the EnCodec selection' not in stderr, stderr
-    return dict(case=name, passed=True, preselection_frames=expected, returncode=process.returncode)
+    assert process.returncode == 1, process.returncode
+    assert 'peer did not select the requested EnCodec profile' in stderr, stderr
+    assert 1.5 <= elapsed <= 4.0, ('selection deadline not honoured', elapsed)
+    assert 'received before the EnCodec selection' in stderr, stderr
+    assert b'KMX_AUDIO_CODEC' not in (directory / 'attach.out').read_bytes()
+    return dict(case='never-selected', passed=True, frames_sent=sent, exit_after_hello_s=round(elapsed, 3),
+                returncode=process.returncode)
 
 
 def run(options):
     options.evidence.mkdir(parents=True, exist_ok=False)
-    rows = [case(options, options.evidence, 'none', []),
-            case(options, options.evidence, 'one-pcm-block', [b'\0' * 64]),
-            case(options, options.evidence, 'three-blocks', [b'\0' * 64, b'KMA\2' + b'\0' * 12, b'x'])]
+    root = options.evidence
+    rows = [case(options, root, 'none', []),
+            case(options, root, 'one-pcm-block', [b'\0' * 64]),
+            case(options, root, 'three-blocks', [b'\0' * 64, b'KMA\2' + b'\0' * 12, b'x']),
+            case(options, root, 'reconnect-renegotiates', [b'\0' * 64], connections=2),
+            case(options, root, 'auto-mode-unchanged', [b'\0' * 64], mode='auto'),
+            never_selected(options, root)]
     result = dict(rows=rows, passed=True,
                   attach_sha256=hashlib.sha256(options.attach.read_bytes()).hexdigest(),
                   scope='bounded pre-selection audio handling only; no audio, timing or release qualification')
