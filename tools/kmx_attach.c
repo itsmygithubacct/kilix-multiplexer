@@ -588,6 +588,7 @@ main(int argc, char **argv) {
     kmx_audio_sink *audio = NULL;
     unsigned long frames_seen = 0;
     unsigned long blocks_seen = 0;
+    unsigned long preselection_audio_discarded = 0;
     audio_output player;
     kmx_framer framer;
     kmx_grid screen;
@@ -1102,6 +1103,14 @@ main(int argc, char **argv) {
                         audio_backpressure = true; break;
                     }
                     (void)kmx_encodec_offer_packet_at(audio_codec, payload, size, read_clock.earliest_ms);
+                } else if (type == KMX_MSG_AUDIO && audio_mode == KMX_AUDIO_ENCODEC && !audio_selected) {
+                    /* A server in auto mode sends legacy PCM to every greeted
+                     * peer whose AUDIO_CAPS offer it has not yet read. Over TLS
+                     * the HELLO and the offer can arrive in separate reads, so
+                     * a block can precede the selection. Before selection that
+                     * is a race, not a protocol violation: discard and count it.
+                     * The selection deadline above still bounds the wait. */
+                    preselection_audio_discarded++;
                 } else if (type == KMX_MSG_AUDIO) {
                     if (audio_mode == KMX_AUDIO_ENCODEC) { exit_code = 1; stop_pending = 1; break; }
                     if (kmx_audio_sink_apply(audio, payload, size) == KMX_OK) {
@@ -1283,6 +1292,10 @@ main(int argc, char **argv) {
         audio_total.calls ? (double)audio_total.inference_ns / ((double)audio_total.calls * 40000000.0) : 0.0,
         (unsigned long long)audio_total.input_drops, (unsigned long long)audio_total.output_drops,
         (unsigned long long)audio_total.discontinuities);
+    if (preselection_audio_discarded) {
+        fprintf(stderr, "kmx-attach: discarded %lu audio block(s) received before the EnCodec selection\n",
+                preselection_audio_discarded);
+    }
     if (player.dropped) {
         fprintf(stderr, "kmx-attach: dropped %zu audio block(s) at playback\n",
                 player.dropped);
