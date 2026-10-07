@@ -227,6 +227,11 @@ def ssh_python(host, source, *args):
 class Session:
     def __init__(self, args):
         self.args = args
+        # Retain the benchmark controller's ledger across transport replacement.
+        self.input_key = os.urandom(16)
+        self.input_epoch = bytes(16)
+        self.input_sequence = self.input_accepted = 0
+        self.input_pending = {}
         self.temp = tempfile.TemporaryDirectory(prefix="kmx-coding-")
         self.folder = Path(self.temp.name)
         self.process = None
@@ -287,6 +292,8 @@ class Session:
 class Client:
     def __init__(self, session, library):
         args = session.args
+        self.session = session
+        self.input_ready = not args.reliable_input
         self.receiver = Receiver(library, args.rows, args.cols)
         self.delay = args.delay_ms / 1000
         self.rate = args.rate_bytes
@@ -309,17 +316,40 @@ class Client:
             os.set_blocking(self.read_fd, False)
             os.set_blocking(self.write_fd, False)
             self.send(1, struct.pack(">HHB", args.rows, args.cols, 0))
+            if args.reliable_input:
+                self.send(15, b"\x01\0\0\0" + session.input_epoch + session.input_key +
+                          struct.pack("!Q", session.input_accepted))
+                deadline = time.monotonic() + args.timeout
+                while not self.input_ready:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("reliable input selection timed out")
+                    self.pump(.001)
         except BaseException:
             self.close()
             raise
 
     def send(self, kind, payload):
+        if kind == 3 and self.session.args.reliable_input:
+            if not self.input_ready or not 1 <= len(payload) <= 32768:
+                raise RuntimeError("benchmark input requires READY and a bounded payload")
+            self.session.input_sequence += 1
+            sequence = self.session.input_sequence
+            payload = b"\x01\0\0\0" + struct.pack("!Q", sequence) + payload
+            self.session.input_pending[sequence] = payload
+            kind = 17
         wire = frame(kind, payload)
         now = time.monotonic()
         self.tx_due = max(now + self.delay, self.tx_due) + (len(wire) / self.rate if self.rate else 0)
         self.tx_frame_id += 1
         self.tx_queue.append([self.tx_due, wire, self.tx_frame_id])
         return now
+
+    def accept_input(self, accepted):
+        session = self.session
+        if not session.input_accepted <= accepted <= session.input_sequence:
+            raise RuntimeError("invalid input acceptance counter")
+        session.input_accepted = accepted
+        session.input_pending = {seq: data for seq, data in session.input_pending.items() if seq > accepted}
 
     def pump(self, timeout):
         end = time.monotonic() + timeout
@@ -335,6 +365,21 @@ class Client:
                     self.send(5, bytes([0]) + struct.pack(">Q", sequence))
                 elif kind == 6:
                     raise RuntimeError("workload exited before benchmark completed")
+                elif kind == 16 and self.session.args.reliable_input:
+                    session = self.session
+                    if (self.input_ready or len(payload) != 48 or payload[:4] != b"\x01\0\0\0" or
+                            payload[20:36] != session.input_key or payload[4:20] == bytes(16) or
+                            (session.input_epoch != bytes(16) and payload[4:20] != session.input_epoch)):
+                        raise RuntimeError("server refused reliable input or returned invalid STATE")
+                    self.accept_input(struct.unpack("!Q", payload[36:44])[0])
+                    session.input_epoch = payload[4:20]
+                    self.input_ready = True
+                    for data in session.input_pending.values():
+                        self.send(17, data)
+                elif kind == 18 and self.session.args.reliable_input:
+                    if not self.input_ready or len(payload) != 12 or payload[:4] != b"\x01\0\0\0":
+                        raise RuntimeError("invalid input ACK")
+                    self.accept_input(struct.unpack("!Q", payload[4:])[0])
             if now >= end:
                 return
             next_due = min([end] + [q[0][0] for q in (self.tx_queue, self.rx_queue) if q])
@@ -450,10 +495,22 @@ def run(args):
         recovery = {"gap_seconds": args.reconnect_gap, "recovery_ms": (recovered - reconnect_start) * 1000,
                     "confirmed_sequence": status[0], "confirmed_tick": status[1],
                     "tx_bytes": client.tx, "rx_bytes": client.rx}
+        # Confirm resumed input reaches the child, not only viewport recovery.
+        if args.reliable_input:
+            client.send(3, f"EDIT {recovery_sequence + 1}\n".encode())
+            client.wait_status(lambda seq, tick: seq == recovery_sequence + 1, args.timeout)
+            client.receiver.validate(recovery_sequence + 1, status[1])
+            deadline = time.monotonic() + args.timeout
+            while session.input_pending:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("final reliable input acknowledgement timed out")
+                client.pump(.001)
         total_tx += client.tx
         total_rx += client.rx
         return {"schema": 1, "verdict": "pass", "transport": "SSH byte proxy to remote Unix socket" if args.remote else "local Unix socket",
                 "remote": args.remote, "remote_root": args.remote_root if args.remote else None,
+                "input_protocol": "acknowledged-v1" if args.reliable_input else "legacy",
+                "input_accepted": session.input_accepted if args.reliable_input else None,
                 "screen": {"rows": args.rows, "cols": args.cols},
                 "byte_scope": "actual framed KMX stream bytes; excludes SSH, TCP, IP, Ethernet overhead",
                 "latency_scope": "input enqueue on client to corresponding confirmation in native decoded remote screen; no local prediction",
@@ -474,6 +531,8 @@ def parse_args():
     parser.add_argument("--library", type=Path, default=ROOT / "build/libkilix-mux.so")
     parser.add_argument("--remote", metavar="SSH_HOST")
     parser.add_argument("--remote-root", metavar="PATH")
+    parser.add_argument("--reliable-input", action="store_true",
+                        help="measure acknowledged input and retain its ledger across reconnect")
     parser.add_argument("--rows", type=int, default=24)
     parser.add_argument("--cols", type=int, default=100)
     parser.add_argument("--samples", type=int, default=50)

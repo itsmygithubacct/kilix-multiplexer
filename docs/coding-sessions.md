@@ -187,6 +187,9 @@ python3 tools/coding_bench.py --samples 50 --delay-ms 250 --rate-bytes 32000 \
     --output /tmp/coding-shaped.json
 python3 tools/coding_bench.py --remote SSH_HOST --remote-root /path/to/checkout \
     --rows 57 --cols 212 --samples 50 --output /tmp/coding-remote.json
+python3 tools/coding_bench.py --reliable-input --remote SSH_HOST \
+    --remote-root /path/to/checkout --rows 57 --cols 212 --samples 50 \
+    --output /tmp/coding-reliable-remote.json
 ```
 
 The remote checkout must have `build/kmx-serve`. The harness creates its own
@@ -194,6 +197,15 @@ server, PTY workload, and temporary socket; it does not use a person's live
 coding session. It uses the local native decoder through `build/libkilix-mux.so`.
 For another build directory, pass `--server` and `--library` explicitly.
 The process harnesses require Linux and Python with pidfd support for cleanup.
+
+The benchmark defaults to legacy input. With `--reliable-input`, its synthetic
+controller negotiates the ledger, validates cumulative acknowledgements, and
+retains its identity, epoch, and outstanding input across reconnect. It checks
+both recovered viewport contents and a subsequent acknowledged edit. JSON
+records `input_protocol` and the final `input_accepted` counter. This exercises
+the real server with a Python protocol client; the actual `kmx-attach` client
+is covered separately by `test-coding`, including exact 70,000-byte delivery
+to the real server, graceful detach, and acquisition by a new controller.
 
 The synthetic editor writes its confirmation marker after the rest of each
 repaint. Latency runs from input enqueue to that marker in the decoded remote

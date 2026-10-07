@@ -573,6 +573,34 @@ def attach_reject(listener, client, peers, failure):
     print(f"PASS actual attach fail-closed: {failure}")
 
 
+def actual_pair(server_binary, attach_binary, library, folder):
+    server = OwnedServer(server_binary, folder / "actual-pair")
+    client = None
+    try:
+        text = "ordered input\n" * 5000
+        client = Attach(attach_binary, server.endpoint, library, folder,
+                        ["--token", TOKEN.decode(), "--reliable-input", "--send", text])
+        client.wait(lambda: server.received() == text.encode(),
+                    "real server/attach input differed", timeout=10)
+        # Drain queued ACKs before explicit detach, then prove CLOSE released
+        # ownership by acquiring a different identity on the same server.
+        for _ in range(10):
+            client.pump(.02)
+        client.detach()
+        peer = server.peer()
+        peer.send(OPEN, opening(key=OTHER))
+        _, accepted = decode_state(peer.wait(STATE), key=OTHER)
+        assert accepted == 0
+        peer.send(CLOSE, ack(0))
+        peer.closed()
+        server.expect(text.encode())
+        print(f"PASS actual server + attach: {len(text)} exact bytes, graceful lease release and reacquisition")
+    finally:
+        if client:
+            client.close()
+        server.close()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--server", type=Path, default=Path("build/kmx-serve"))
@@ -585,6 +613,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="kmx-input-resume-") as directory:
         folder = Path(directory)
         server_protocol(args.server.resolve(), folder, args.expiry)
+        actual_pair(args.server.resolve(), args.attach.resolve(), library, folder)
         for partial in (False, True):
             client_fixture(args.attach.resolve(), library, folder, "partial" if partial else "lost-ack",
                 lambda listener, client, peers: attach_resume(listener, client, peers, partial))
