@@ -24,6 +24,7 @@
 
 #include "kilix_mux.h"
 #include "kilix_mux_modes.h"
+#include "kilix_mux_input.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -246,6 +247,27 @@ main(int argc, char **argv) {
             kmx_buffer_free(&message);
             kmx_sync_free(sync);
         }
+    }
+
+    {
+        kmx_buffer message;
+        kmx_input_open open = { .client_id = {1} };
+        kmx_input_state state = { .epoch = {2}, .client_id = {1}, .grace_ms = 60000 };
+        kmx_input_data data = { .sequence = 1, .data = (const unsigned char *)"input", .size = 5 };
+        kmx_input_ack ack = { .accepted = 1 };
+        kmx_buffer_init(&message);
+        if (kmx_input_open_encode(&open, &message) == KMX_OK)
+            emit_family(9, message.data, message.size, "input-open");
+        kmx_buffer_reset(&message);
+        if (kmx_input_state_encode(&state, &message) == KMX_OK)
+            emit_family(10, message.data, message.size, "input-state");
+        kmx_buffer_reset(&message);
+        if (kmx_input_data_encode(&data, &message) == KMX_OK)
+            emit_family(11, message.data, message.size, "input-data");
+        kmx_buffer_reset(&message);
+        if (kmx_input_ack_encode(&ack, &message) == KMX_OK)
+            emit_family(12, message.data, message.size, "input-ack-close");
+        kmx_buffer_free(&message);
     }
 
     printf("wrote %d corpus files to %s\n", written, directory);

@@ -9,6 +9,7 @@
  * and libFuzzer's coverage feedback can steer into each. */
 #include "kilix_mux.h"
 #include "kilix_mux_modes.h"
+#include "kilix_mux_input.h"
 
 #include <stdint.h>
 #include <stddef.h>
@@ -127,7 +128,7 @@ fuzz_receiver(const uint8_t *data, size_t size) {
 int
 LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     if (!size) return 0;
-    switch (data[0] % 9) {
+    switch (data[0] % 13) {
         case 0: fuzz_cells(data + 1, size - 1); break;
         case 1: fuzz_layout(data + 1, size - 1); break;
         case 2: fuzz_image(data + 1, size - 1); break;
@@ -136,10 +137,30 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         case 5: fuzz_motion(data + 1, size - 1); break;
         case 6: fuzz_audio(data + 1, size - 1); break;
         case 7: fuzz_receiver(data + 1, size - 1); break;
-        default: {
+        case 8: {
             uint8_t pane;
             uint32_t flags;
             (void)kmx_modes_decode(data + 1, size - 1, &pane, &flags);
+            break;
+        }
+        case 9: {
+            kmx_input_open value;
+            (void)kmx_input_open_decode(data + 1, size - 1, &value);
+            break;
+        }
+        case 10: {
+            kmx_input_state value;
+            (void)kmx_input_state_decode(data + 1, size - 1, &value);
+            break;
+        }
+        case 11: {
+            kmx_input_data value;
+            (void)kmx_input_data_decode(data + 1, size - 1, &value);
+            break;
+        }
+        default: {
+            kmx_input_ack value;
+            (void)kmx_input_ack_decode(data + 1, size - 1, &value);
             break;
         }
     }

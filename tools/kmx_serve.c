@@ -17,6 +17,9 @@
 #define _GNU_SOURCE
 
 #include "kilix_mux.h"
+#include "kilix_mux_input.h"
+#include "kilix_mux_input_session.h"
+#include "kmx_random.h"
 #include "kilix_mux_modes.h"
 #include "endpoint.h"
 #include "kmx_pixel.h"
@@ -146,12 +149,14 @@ pane_output_held(const pane *item, uint64_t now) {
 
 typedef struct {
     int fd;
+    uint64_t connection_id;
     kmx_tls_session *tls;
     bool control;
     bool greeted;
     bool handshaking;
     bool wants_write;   /* the handshake is waiting for the socket, not the peer */
     bool input_blocked;
+    bool input_session;
     size_t input_target; /* bind a retained frame before another peer changes focus */
     /* When this connection must have finished introducing itself.  A peer that
      * connects and then goes quiet - mid-handshake or before HELLO - holds one
@@ -183,6 +188,10 @@ typedef struct {
     kmx_buffer out;
     size_t out_offset;
 } client;
+
+#define KMX_INPUT_GRACE_MS 60000u
+static kmx_input_session input_session;
+static uint64_t connection_sequence;
 
 /* One place that knows whether this connection is wrapped, so every other
  * call site reads and writes without caring. */
@@ -301,6 +310,46 @@ now_millis(void) {
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
 }
 
+static void
+input_session_expire(void) {
+    kmx_input_session_expire(&input_session, now_millis());
+}
+
+static bool
+client_can_control(const client *item) {
+    return item->greeted && item->control &&
+        (!input_session.retained || input_session.owner == item->connection_id);
+}
+
+static int
+input_session_state(client *item, const kmx_input_open *request, kmx_input_status status) {
+    kmx_input_state state = {0};
+    kmx_buffer payload;
+    int result;
+    state.status = status;
+    memcpy(state.epoch, input_session.epoch, sizeof state.epoch);
+    memcpy(state.client_id, request->client_id, sizeof state.client_id);
+    state.accepted = status == KMX_INPUT_READY ? input_session.accepted : 0;
+    state.grace_ms = KMX_INPUT_GRACE_MS;
+    kmx_buffer_init(&payload);
+    result = kmx_input_state_encode(&state, &payload) != KMX_OK ||
+        client_queue(item, KMX_MSG_INPUT_STATE, payload.data, payload.size);
+    kmx_buffer_free(&payload);
+    return result ? -1 : 0;
+}
+
+static int
+input_session_ack(client *item) {
+    kmx_input_ack ack = { .accepted = input_session.accepted };
+    kmx_buffer payload;
+    int result;
+    kmx_buffer_init(&payload);
+    result = kmx_input_ack_encode(&ack, &payload) != KMX_OK ||
+        client_queue(item, KMX_MSG_INPUT_ACK, payload.data, payload.size);
+    kmx_buffer_free(&payload);
+    return result ? -1 : 0;
+}
+
 /* Push queued keystrokes at the pty, without blocking on it. */
 static int
 pane_input_flush(pane *item) {
@@ -324,7 +373,7 @@ pane_input_flush(pane *item) {
 }
 
 static int
-pane_input_queue(pane *item, const void *data, size_t size) {
+pane_input_admit(pane *item, const void *data, size_t size) {
     if (item->input_fd < 0) return -1;
     compact(&item->input, &item->input_offset);
     /* The limit bounds what is ALREADY waiting, not what is arriving.
@@ -340,7 +389,13 @@ pane_input_queue(pane *item, const void *data, size_t size) {
      * deep.  The buffer is therefore bounded by the limit plus one message. */
     if (item->input.size - item->input_offset > KMX_PANE_INPUT_LIMIT) return 1;
     if (kmx_buffer_append(&item->input, data, size) != KMX_OK) return -1;
-    return pane_input_flush(item);
+    return 0;
+}
+
+static int
+pane_input_queue(pane *item, const void *data, size_t size) {
+    int result = pane_input_admit(item, data, size);
+    return result ? result : pane_input_flush(item);
 }
 
 static bool
@@ -562,6 +617,7 @@ stop_helper(pid_t *child) {
 static void
 client_release(client *item, size_t pane_count) {
     size_t slot;
+    kmx_input_session_disconnect(&input_session, item->connection_id, now_millis());
     kmx_tls_session_free(item->tls);
     item->tls = NULL;
     if (item->fd >= 0) close(item->fd);
@@ -833,6 +889,15 @@ main(int argc, char **argv) {
      * in one layout is a later refinement, not part of proving the plane. */
     count = pixel_command ? 0 : (broker_session ? 1 : (single ? 1 : command_count));
 
+    {
+        unsigned char epoch[KMX_INPUT_TOKEN_SIZE];
+        if (kmx_random_bytes(epoch, sizeof epoch) != 0 ||
+            kmx_input_session_init(&input_session, epoch, KMX_INPUT_GRACE_MS) != KMX_OK) {
+            fprintf(stderr, "kmx-serve: cannot generate input session epoch\n");
+            return 1;
+        }
+    }
+
     kmx_layout_init(&layout, rows, cols);
     if (count && kmx_layout_arrange(&layout, count, vertical) != KMX_OK) {
         fprintf(stderr, "kmx-serve: %d by %d is too small for %zu panes\n",
@@ -861,7 +926,8 @@ main(int argc, char **argv) {
     }
     listener = kmx_endpoint_listen(&endpoint, allow_public);
     if (listener < 0) {
-        if (errno == EPERM) {
+        if (errno == EPERM && endpoint.kind == KMX_ENDPOINT_TCP &&
+            !kmx_endpoint_is_loopback(&endpoint) && !allow_public) {
             fprintf(stderr,
                 "kmx-serve: %s is not a loopback address.  Reach a session "
                 "across a network through an SSH tunnel, or pass --lan to "
@@ -1098,6 +1164,7 @@ main(int argc, char **argv) {
     signal(SIGTERM, handle_stop);
 
     while (!stop_requested) {
+        input_session_expire();
         bool held_outputs[KMX_MAX_PANES] = {false};
         /* +4 for audio, the private-display frame pipe, and both ends of the
          * presenter tap. */
@@ -1274,6 +1341,12 @@ main(int argc, char **argv) {
                         continue;
                     }
                     memset(item, 0, sizeof *item);
+                    if (connection_sequence == UINT64_MAX) {
+                        close(accepted);
+                        item->fd = -1;
+                        continue;
+                    }
+                    item->connection_id = ++connection_sequence;
                     if (tls) {
                         item->tls = kmx_tls_server_begin(tls, accepted);
                         if (!item->tls) {
@@ -1382,6 +1455,10 @@ main(int argc, char **argv) {
                 }
                 if (!available) break;
                 if (type == KMX_MSG_HELLO && size >= 4) {
+                    if (item->greeted) {
+                        client_release(item, count);
+                        break;
+                    }
                     if (require_token &&
                         !(size > 5 &&
                           token_matches(
@@ -1410,6 +1487,100 @@ main(int argc, char **argv) {
                     /* Nothing is accepted before a valid greeting. */
                     client_release(item, count);
                     break;
+                } else if (type == KMX_MSG_INPUT_OPEN) {
+                    kmx_input_open request;
+                    unsigned char fresh_epoch[KMX_INPUT_TOKEN_SIZE] = {0};
+                    uint64_t fenced = 0;
+                    bool other_controller = false;
+                    kmx_input_status status;
+                    if (!item->greeted || item->input_session ||
+                        kmx_input_open_decode(payload, size, &request) != KMX_OK) {
+                        client_release(item, count); break;
+                    }
+                    input_session_expire();
+                    if (!input_session.retained &&
+                        kmx_random_bytes(fresh_epoch, sizeof fresh_epoch)) {
+                        client_release(item, count); break;
+                    }
+                    for (size_t other = 0; other < KMX_MAX_CLIENTS; other++) {
+                        if (&clients[other] != item && clients[other].fd >= 0 &&
+                            clients[other].greeted && clients[other].control) {
+                            other_controller = true;
+                            break;
+                        }
+                    }
+                    status = kmx_input_session_open(&input_session, &request,
+                        item->connection_id, now_millis(), fresh_epoch,
+                        item->control && count == 1 && !pixel_running && !broker_session &&
+                        panes[0].alive && panes[0].input_fd >= 0, other_controller, &fenced);
+                    if (status == KMX_INPUT_READY) {
+                        /* Transfer ownership before destroying the old socket:
+                         * its stale disconnect cannot extend or revoke grace. */
+                        for (size_t other = 0; fenced && other < KMX_MAX_CLIENTS; other++) {
+                            if (clients[other].fd >= 0 && clients[other].connection_id == fenced) {
+                                client_release(&clients[other], count);
+                                break;
+                            }
+                        }
+                        item->input_session = true;
+                    }
+                    if (input_session_state(item, &request, status) != 0) {
+                        client_release(item, count); break;
+                    }
+                } else if (type == KMX_MSG_INPUT_DATA) {
+                    kmx_input_data input;
+                    int admitted;
+                    bool duplicate;
+                    if (input_session.owner != item->connection_id || !item->input_session ||
+                        kmx_input_data_decode(payload, size, &input) != KMX_OK ||
+                        input.pane != 0 || count != 1 || !panes[0].alive ||
+                        kmx_input_session_classify(&input_session, item->connection_id,
+                            input.sequence, &duplicate) != KMX_OK) {
+                        client_release(item, count); break;
+                    }
+                    if (!duplicate) {
+                        admitted = pane_input_admit(&panes[0], input.data, input.size);
+                        if (admitted > 0) {
+                            item->input_blocked = true;
+                            item->input_target = 0;
+                            break;
+                        }
+                        if (admitted < 0) {
+                            client_release(item, count); break;
+                        }
+                        /* Commit memory ownership BEFORE any partial PTY write.
+                         * An ACK never promises application execution. */
+                        if (kmx_input_session_commit(&input_session, item->connection_id,
+                                input.sequence) != KMX_OK) {
+                            stop_requested = 1; exit_code = 1;
+                            client_release(item, count); break;
+                        }
+                        if (pane_input_flush(&panes[0]) != 0) {
+                            fprintf(stderr, "kmx-serve: accepted input could not drain to PTY\n");
+                            stop_requested = 1; exit_code = 1;
+                            client_release(item, count); break;
+                        }
+                    }
+                    item->input_blocked = false;
+                    if (input_session_ack(item) != 0) {
+                        client_release(item, count); break;
+                    }
+                } else if (type == KMX_MSG_INPUT_CLOSE) {
+                    kmx_input_ack close_request;
+                    if (item->input_session &&
+                        kmx_input_ack_decode(payload, size, &close_request) == KMX_OK) {
+                        (void)kmx_input_session_close(&input_session, item->connection_id,
+                            close_request.accepted);
+                    }
+                    client_release(item, count);
+                    break;
+                } else if (item->control && input_session.retained &&
+                    (input_session.owner != item->connection_id || item->input_session) &&
+                    (type == KMX_MSG_INPUT ||
+                     (input_session.owner != item->connection_id &&
+                      (type == KMX_MSG_FOCUS || type == KMX_MSG_RESIZE)))) {
+                    /* Legacy input cannot bypass the lease or sequence ledger. */
+                    client_release(item, count); break;
                 } else if (type == KMX_MSG_AUDIO_PROFILE) {
                     kmx_audio_profile offered;
                     if (!item->greeted || item->audio_caps_seen ||
@@ -1513,7 +1684,7 @@ main(int argc, char **argv) {
             int wanted_rows = 0;
             int wanted_cols = 0;
             for (which = 0; which < KMX_MAX_CLIENTS; which++) {
-                if (clients[which].fd < 0 || !clients[which].control) continue;
+                if (clients[which].fd < 0 || !client_can_control(&clients[which])) continue;
                 if (clients[which].rows <= 0 || clients[which].cols <= 0) continue;
                 if (!wanted_rows || clients[which].rows < wanted_rows) {
                     wanted_rows = clients[which].rows;
@@ -1549,7 +1720,11 @@ main(int argc, char **argv) {
         for (which = 0; which < pane_descriptors; which++) {
             size_t id = pane_at[which];
             short revents = descriptors[pane_first + which].revents;
-            if (revents & POLLOUT) (void)pane_input_flush(&panes[id]);
+            if ((revents & POLLOUT) && pane_input_flush(&panes[id]) != 0 &&
+                input_session.retained) {
+                fprintf(stderr, "kmx-serve: accepted input could not drain to PTY\n");
+                stop_requested = 1; exit_code = 1;
+            }
             if (!(revents & (POLLIN | POLLHUP | POLLERR))) continue;
             {
                 ssize_t received = read(panes[id].master, buffer, sizeof buffer);

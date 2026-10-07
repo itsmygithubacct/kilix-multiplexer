@@ -14,6 +14,8 @@
 #define _GNU_SOURCE
 
 #include "kilix_mux.h"
+#include "kilix_mux_input.h"
+#include "kmx_random.h"
 #include "kilix_mux_modes.h"
 #include "endpoint.h"
 #include "kmx_input_transform.h"
@@ -76,7 +78,47 @@ static struct {
     bool tls_wait_read;
     bool input_submitted;
     bool failed;
+    uint64_t queued;
+    uint64_t written;
 } outgoing;
+
+#define KMX_INPUT_JOURNAL_BYTES (256u * 1024u)
+#define KMX_INPUT_JOURNAL_ENTRIES 4096u
+#define KMX_INPUT_SELECT_MS 5000u
+typedef struct input_entry {
+    struct input_entry *next;
+    uint64_t sequence;
+    uint64_t generation;
+    uint64_t wire_end;
+    kmx_buffer payload;
+} input_entry;
+
+static struct {
+    bool enabled;
+    bool ready;
+    bool identified;
+    unsigned char epoch[KMX_INPUT_TOKEN_SIZE];
+    unsigned char client_id[KMX_INPUT_TOKEN_SIZE];
+    uint64_t acknowledged;
+    uint64_t sequence;
+    uint64_t eligible_sequence;
+    uint64_t generation;
+    uint64_t deadline;
+    size_t bytes;
+    size_t entries;
+    input_entry *head;
+    input_entry *tail;
+    input_entry *replay;
+} reliable_input;
+
+static void
+input_emitted_through(uint64_t through) {
+    for (input_entry *entry = reliable_input.head; entry; entry = entry->next) {
+        if (entry->sequence <= reliable_input.eligible_sequence) continue;
+        if (entry->generation != reliable_input.generation || entry->wire_end > through) break;
+        reliable_input.eligible_sequence = entry->sequence;
+    }
+}
 
 static size_t
 outgoing_pending(void) {
@@ -94,6 +136,10 @@ outgoing_flush(int fd, kmx_tls_session *tls) {
     attempt = outgoing.tls_attempt ? outgoing.tls_attempt :
         (pending < KMX_OUT_WRITE_BUDGET ? pending : KMX_OUT_WRITE_BUDGET);
     if (tls) outgoing.tls_attempt = attempt;
+    /* SSL_write can report WANT after emitting complete TLS records. A frame
+     * wholly inside that attempt may already be accepted remotely even if
+     * the call later fails. Plain send reports its exact completed prefix. */
+    if (tls) input_emitted_through(outgoing.written + attempt);
     count = tls ? kmx_tls_write(tls, outgoing.bytes.data + outgoing.offset, attempt)
                 : send(fd, outgoing.bytes.data + outgoing.offset, attempt,
                        MSG_NOSIGNAL | MSG_DONTWAIT);
@@ -104,6 +150,8 @@ outgoing_flush(int fd, kmx_tls_session *tls) {
     }
     if (!count || (size_t)count > attempt) return -1;
     outgoing.offset += (size_t)count;
+    outgoing.written += (size_t)count;
+    if (!tls) input_emitted_through(outgoing.written);
     outgoing.tls_attempt = 0;
     if (outgoing.offset == outgoing.bytes.size) {
         outgoing.offset = 0;
@@ -115,7 +163,7 @@ outgoing_flush(int fd, kmx_tls_session *tls) {
 static void
 outgoing_discard(const char *reason) {
     size_t pending = outgoing_pending();
-    if (pending || outgoing.input_submitted) {
+    if (!reliable_input.enabled && (pending || outgoing.input_submitted)) {
         fprintf(stderr,
             "kmx-attach: %s; discarded %zu pending transport bytes; "
             "prior input delivery is unconfirmed\n", reason, pending);
@@ -125,6 +173,7 @@ outgoing_discard(const char *reason) {
     outgoing.tls_attempt = 0;
     outgoing.tls_wait_read = false;
     outgoing.input_submitted = 0;
+    outgoing.queued = outgoing.written = 0;
 }
 
 static int
@@ -162,8 +211,10 @@ send_message(int fd, kmx_message_type type, const void *payload, size_t size) {
     }
     if (result == KMX_OK &&
         (outgoing.bytes.size > KMX_OUT_HARD_LIMIT ||
-         framed.size > KMX_OUT_HARD_LIMIT - outgoing.bytes.size)) result = KMX_ERR_LIMIT;
+         framed.size > KMX_OUT_HARD_LIMIT - outgoing.bytes.size ||
+         framed.size > UINT64_MAX - outgoing.queued)) result = KMX_ERR_LIMIT;
     if (result == KMX_OK) result = kmx_buffer_append(&outgoing.bytes, framed.data, framed.size);
+    if (result == KMX_OK) outgoing.queued += framed.size;
     kmx_buffer_free(&framed);
     if (result != KMX_OK) {
         fprintf(stderr, "kmx-attach: outgoing frame queue exhausted or failed\n");
@@ -173,6 +224,126 @@ send_message(int fd, kmx_message_type type, const void *payload, size_t size) {
     }
     if (type == KMX_MSG_INPUT && size) outgoing.input_submitted = true;
     return 0;
+}
+
+static bool
+input_has_room(void) {
+    return !reliable_input.enabled ||
+        (reliable_input.ready && !reliable_input.replay &&
+         reliable_input.bytes < KMX_INPUT_JOURNAL_BYTES &&
+         reliable_input.entries < KMX_INPUT_JOURNAL_ENTRIES);
+}
+
+static int
+input_open(int fd) {
+    kmx_input_open request = {0};
+    kmx_buffer payload;
+    int result;
+    if (!reliable_input.enabled) return 0;
+    if (reliable_input.generation == UINT64_MAX) return -1;
+    reliable_input.generation++;
+    memcpy(request.epoch, reliable_input.epoch, sizeof request.epoch);
+    memcpy(request.client_id, reliable_input.client_id, sizeof request.client_id);
+    request.last_ack = reliable_input.acknowledged;
+    reliable_input.ready = false;
+    reliable_input.deadline = now_millis() + KMX_INPUT_SELECT_MS;
+    kmx_buffer_init(&payload);
+    result = kmx_input_open_encode(&request, &payload) != KMX_OK ||
+        send_message(fd, KMX_MSG_INPUT_OPEN, payload.data, payload.size);
+    kmx_buffer_free(&payload);
+    return result ? -1 : 0;
+}
+
+static int
+input_acknowledge(uint64_t accepted) {
+    if (accepted < reliable_input.acknowledged || accepted > reliable_input.eligible_sequence) return -1;
+    while (reliable_input.head && reliable_input.head->sequence <= accepted) {
+        input_entry *entry = reliable_input.head;
+        reliable_input.head = entry->next;
+        if (reliable_input.replay == entry) reliable_input.replay = entry->next;
+        reliable_input.bytes -= entry->payload.size - KMX_INPUT_DATA_HEADER_SIZE;
+        reliable_input.entries--;
+        kmx_buffer_free(&entry->payload);
+        free(entry);
+    }
+    if (!reliable_input.head) reliable_input.tail = NULL;
+    reliable_input.acknowledged = accepted;
+    return 0;
+}
+
+static int
+input_replay(int fd) {
+    while (reliable_input.ready && reliable_input.replay &&
+           outgoing_pending() < KMX_OUT_SOFT_LIMIT) {
+        input_entry *entry = reliable_input.replay;
+        if (send_message(fd, KMX_MSG_INPUT_DATA, entry->payload.data, entry->payload.size)) return -1;
+        entry->generation = reliable_input.generation;
+        entry->wire_end = outgoing.queued;
+        reliable_input.replay = entry->next;
+    }
+    return 0;
+}
+
+static int
+input_send(int fd, const void *data, size_t size) {
+    input_entry *entry;
+    kmx_input_data input;
+    if (!reliable_input.enabled) return send_message(fd, KMX_MSG_INPUT, data, size);
+    if (!size) return 0;
+    if (!input_has_room() || size > KMX_INPUT_DATA_MAX || reliable_input.sequence == UINT64_MAX) return -1;
+    entry = calloc(1, sizeof *entry);
+    if (!entry) return -1;
+    input = (kmx_input_data){ .pane = 0, .sequence = reliable_input.sequence + 1,
+        .data = data, .size = size };
+    kmx_buffer_init(&entry->payload);
+    if (kmx_input_data_encode(&input, &entry->payload) != KMX_OK) {
+        kmx_buffer_free(&entry->payload);
+        free(entry);
+        return -1;
+    }
+    entry->sequence = input.sequence;
+    if (reliable_input.tail) reliable_input.tail->next = entry;
+    else reliable_input.head = entry;
+    reliable_input.tail = entry;
+    reliable_input.bytes += size;
+    reliable_input.entries++;
+    reliable_input.sequence = input.sequence;
+    if (send_message(fd, KMX_MSG_INPUT_DATA, entry->payload.data, entry->payload.size)) return -1;
+    entry->generation = reliable_input.generation;
+    entry->wire_end = outgoing.queued;
+    return 0;
+}
+
+/* Release only a fully acknowledged journal. If this best-effort close cannot
+ * reach the server, its finite disconnect grace still bounds the lease. */
+static void
+input_close(int fd, kmx_tls_session *tls) {
+    kmx_input_ack close_request = { .accepted = reliable_input.acknowledged };
+    kmx_buffer payload;
+    uint64_t deadline;
+    if (!reliable_input.enabled || !reliable_input.ready || reliable_input.head ||
+        outgoing.failed || fd < 0) return;
+    kmx_buffer_init(&payload);
+    if (kmx_input_ack_encode(&close_request, &payload) == KMX_OK &&
+        send_message(fd, KMX_MSG_INPUT_CLOSE, payload.data, payload.size) == 0) {
+        deadline = now_millis() + 100;
+        while (outgoing_pending() && now_millis() < deadline) {
+            struct pollfd descriptor = { .fd = fd,
+                .events = outgoing.tls_wait_read ? POLLIN : POLLOUT };
+            if (poll(&descriptor, 1, 10) > 0 && outgoing_flush(fd, tls)) break;
+        }
+    }
+    kmx_buffer_free(&payload);
+}
+
+static void
+input_free(void) {
+    while (reliable_input.head) {
+        input_entry *entry = reliable_input.head;
+        reliable_input.head = entry->next;
+        kmx_buffer_free(&entry->payload);
+        free(entry);
+    }
 }
 
 static void
@@ -672,6 +843,7 @@ main(int argc, char **argv) {
     int run_seconds = 0;
     time_t started_at;
     bool sent_once = false;
+    size_t send_offset = 0;
     int index = 1;
     int fd;
     kmx_endpoint endpoint;
@@ -729,6 +901,8 @@ main(int argc, char **argv) {
             predict = false;
         } else if (strcmp(argv[index], "--reconnect") == 0 && index + 1 < argc) {
             reconnect_seconds = atoi(argv[++index]);
+        } else if (strcmp(argv[index], "--reliable-input") == 0) {
+            reliable_input.enabled = true;
         } else if (strcmp(argv[index], "--token") == 0 && index + 1 < argc) {
             token = argv[++index];
         } else if (strcmp(argv[index], "--tls-fingerprint") == 0 && index + 1 < argc) {
@@ -766,7 +940,7 @@ main(int argc, char **argv) {
                             "       [--audio-output COMMAND|--no-audio]"
                             " [--audio-codec auto|encodec|pcm] [--audio-bitrate 3|6|12]"
                             " [--audio-threads 2|4]"
-                            " [--pixel-input]\n");
+                            " [--pixel-input] [--reliable-input]\n");
             return 2;
         }
         index++;
@@ -775,6 +949,15 @@ main(int argc, char **argv) {
         fprintf(stderr, "usage: kmx-attach --socket PATH [--no-predict]"
                         " [--dump] [--send TEXT] [--seconds N]\n");
         return 2;
+    }
+    if (reliable_input.enabled && (view_only || pixel_input)) {
+        fprintf(stderr, "kmx-attach: --reliable-input requires a text controller\n");
+        return 2;
+    }
+    if (reliable_input.enabled &&
+        kmx_random_bytes(reliable_input.client_id, sizeof reliable_input.client_id)) {
+        fprintf(stderr, "kmx-attach: cannot generate input identity\n");
+        return 1;
     }
 
     get_size(&rows, &cols);
@@ -861,12 +1044,12 @@ main(int argc, char **argv) {
     if (audio_codec) audio_offer.codecs |= KMX_AUDIO_CODEC_ENCODEC;
     audio_offer.rates = audio_codec ? kmx_audio_rate_bit(audio_bitrate) : 0;
     audio_offer.maximum = KMX_ENCODEC_PACKET_MAX;
-    if (send_hello(fd, rows, cols, view_only, token) ||
+    if (send_hello(fd, rows, cols, view_only, token) || input_open(fd) ||
         send_audio_profile_offer(fd, audio_profiles) || send_audio_offer(fd, &audio_offer)) {
         stop_pending = 1; exit_code = 1;
     }
     audio_select_deadline = now_millis() + 2000u;
-    if (!view_only) send_dimensions(fd, KMX_MSG_RESIZE, rows, cols);
+    if (!view_only && !reliable_input.enabled) send_dimensions(fd, KMX_MSG_RESIZE, rows, cols);
 
     if (!dump && isatty(STDIN_FILENO) && tcgetattr(STDIN_FILENO, &saved) == 0) {
         raw = saved;
@@ -907,7 +1090,9 @@ main(int argc, char **argv) {
             resize_pending = 0;
             get_size(&rows, &cols);
             get_pixel_size(&local_pixel_width, &local_pixel_height);
-            if (!view_only) send_dimensions(fd, KMX_MSG_RESIZE, rows, cols);
+            if (!view_only && (!reliable_input.enabled || reliable_input.ready)) {
+                send_dimensions(fd, KMX_MSG_RESIZE, rows, cols);
+            }
             /* The screen is about to be described differently, so anything
              * predicted about the old one is void. */
             kmx_predictor_reset(predictor);
@@ -922,7 +1107,8 @@ main(int argc, char **argv) {
         descriptors[0].fd = descriptors[0].events ? fd : -1;
         descriptors[0].revents = 0;
         descriptors[1].fd = STDIN_FILENO;
-        descriptors[1].events = dump || outgoing_pending() >= KMX_OUT_SOFT_LIMIT ? 0 : POLLIN;
+        descriptors[1].events = dump || outgoing_pending() >= KMX_OUT_SOFT_LIMIT ||
+            !input_has_room() ? 0 : POLLIN;
         descriptors[1].revents = 0;
         descriptors[2].fd = kmx_encodec_event_fd(audio_codec);
         descriptors[2].events = POLLIN;
@@ -943,18 +1129,26 @@ main(int argc, char **argv) {
             break;
         }
         if (run_seconds > 0 && time(NULL) - started_at >= run_seconds) break;
+        if (reliable_input.enabled && !reliable_input.ready && now_millis() > reliable_input.deadline) {
+            fprintf(stderr, "kmx-attach: peer did not confirm reliable input; no input was replayed\n");
+            exit_code = 1; break;
+        }
+        if (input_replay(fd)) { exit_code = 1; break; }
         if (audio_mode == KMX_AUDIO_ENCODEC && !audio_selected && now_millis() > audio_select_deadline) {
             fprintf(stderr, "kmx-attach: peer did not select the requested EnCodec profile\n");
             exit_code = 1; break;
         }
-        if (send_text && !sent_once) {
-            sent_once = true;
+        if (send_text && !sent_once && input_has_room() && outgoing_pending() < KMX_OUT_SOFT_LIMIT) {
+            size_t size = strlen(send_text) - send_offset;
+            if (reliable_input.enabled && size > KMX_INPUT_DATA_MAX) size = KMX_INPUT_DATA_MAX;
             /* Sent even as a viewer, deliberately: the point of the test is
              * that the server refuses it, not that the client withholds it. */
-            if (send_message(fd, KMX_MSG_INPUT, send_text, strlen(send_text)) != 0) break;
-            if (predict && kmx_predictor_type(predictor, send_text, strlen(send_text))) {
+            if (input_send(fd, send_text + send_offset, size) != 0) { exit_code = 1; break; }
+            if (predict && kmx_predictor_type(predictor, send_text + send_offset, size)) {
                 redraw = true;
             }
+            send_offset += size;
+            sent_once = send_text[send_offset] == '\0';
         }
 
         if (outgoing_pending() &&
@@ -975,9 +1169,14 @@ main(int argc, char **argv) {
             if (count < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) count = 0;
             if (count == 0) {
                 int replacement;
+                if (reliable_input.enabled) {
+                    reliable_input.ready = false;
+                    fprintf(stderr, "kmx-attach: connection lost; retaining %zu unacknowledged input bytes\n",
+                        reliable_input.bytes);
+                }
                 outgoing_discard("connection lost");
                 kmx_buffer_reset(&pixel_input_pending);
-                if (have_termios) (void)tcflush(STDIN_FILENO, TCIFLUSH);
+                if (have_termios && !reliable_input.enabled) (void)tcflush(STDIN_FILENO, TCIFLUSH);
                 tls_read_wants_write = false;
                 /* Release input capture before waiting for a replacement
                  * connection; the old focused pane no longer owns it. */
@@ -1057,12 +1256,12 @@ main(int argc, char **argv) {
                 audio_output_stop(&player);
                 memset(&player, 0, sizeof player); player.fd = player.child = -1;
                 audio_selected = audio_encodec = false;
-                if (send_hello(fd, rows, cols, view_only, token) ||
+                if (send_hello(fd, rows, cols, view_only, token) || input_open(fd) ||
                     send_audio_profile_offer(fd, audio_profiles) || send_audio_offer(fd, &audio_offer)) {
                     exit_code = 1; break;
                 }
                 audio_select_deadline = now_millis() + 2000u;
-                if (!view_only) send_dimensions(fd, KMX_MSG_RESIZE, rows, cols);
+                if (!view_only && !reliable_input.enabled) send_dimensions(fd, KMX_MSG_RESIZE, rows, cols);
                 if (pixel_input && !view_only && have_termios &&
                     enable_pixel_input() == 0) pixel_input_enabled = true;
                 continue;
@@ -1083,14 +1282,57 @@ main(int argc, char **argv) {
                 if (kmx_framer_next(
                         &framer, &available, &type, &payload, &size) != KMX_OK) {
                     stop_pending = 1;
+                    if (reliable_input.enabled) exit_code = 1;
                     break;
                 }
                 if (!available) break;
-                if (type == KMX_MSG_LAYOUT) {
+                if (type == KMX_MSG_INPUT_STATE && reliable_input.enabled) {
+                    kmx_input_state state;
+                    if (reliable_input.ready || kmx_input_state_decode(payload, size, &state) != KMX_OK ||
+                        memcmp(state.client_id, reliable_input.client_id, sizeof state.client_id)) {
+                        fprintf(stderr, "kmx-attach: invalid reliable input state\n");
+                        stop_pending = 1; exit_code = 1; break;
+                    }
+                    if (state.status != KMX_INPUT_READY) {
+                        static const char *const reasons[] = {
+                            "ready", "another controller owns input", "input session expired",
+                            "server epoch changed", "input limit", "input mode denied"
+                        };
+                        fprintf(stderr, "kmx-attach: reliable input refused: %s; no input was replayed\n",
+                            reasons[state.status]);
+                        stop_pending = 1; exit_code = 1; break;
+                    }
+                    if (!state.grace_ms ||
+                        (reliable_input.identified && memcmp(state.epoch, reliable_input.epoch, sizeof state.epoch)) ||
+                        input_acknowledge(state.accepted) != 0) {
+                        fprintf(stderr, "kmx-attach: inconsistent input epoch or acknowledgement; no input was replayed\n");
+                        stop_pending = 1; exit_code = 1; break;
+                    }
+                    memcpy(reliable_input.epoch, state.epoch, sizeof state.epoch);
+                    reliable_input.identified = true;
+                    reliable_input.ready = true;
+                    reliable_input.replay = reliable_input.head;
+                    fprintf(stderr, "kmx-attach: reliable input ready; server accepted through %llu\n",
+                        (unsigned long long)state.accepted);
+                    if (send_dimensions(fd, KMX_MSG_RESIZE, rows, cols) || input_replay(fd)) {
+                        stop_pending = 1; exit_code = 1; break;
+                    }
+                } else if (type == KMX_MSG_INPUT_ACK && reliable_input.enabled) {
+                    kmx_input_ack ack;
+                    if (!reliable_input.ready || kmx_input_ack_decode(payload, size, &ack) != KMX_OK ||
+                        input_acknowledge(ack.accepted) != 0) {
+                        fprintf(stderr, "kmx-attach: invalid input acknowledgement\n");
+                        stop_pending = 1; exit_code = 1; break;
+                    }
+                } else if (type == KMX_MSG_LAYOUT) {
                     kmx_layout received;
                     if (kmx_layout_apply(&received, payload, size) == KMX_OK) {
                         size_t slot;
                         layout = received;
+                        if (reliable_input.enabled && layout.pane_count != 1) {
+                            fprintf(stderr, "kmx-attach: reliable input requires a single text pane\n");
+                            stop_pending = 1; exit_code = 1; break;
+                        }
                         if (terminal_input_flags && have_termios &&
                             !view_only && !pixel_input) {
                             if (apply_terminal_input(0) != 0) {
@@ -1323,8 +1565,10 @@ main(int argc, char **argv) {
             }
         }
 
-        if (descriptors[1].revents & POLLIN) {
-            ssize_t count = read(STDIN_FILENO, buffer, sizeof buffer);
+        if ((descriptors[1].revents & POLLIN) && input_has_room() &&
+            outgoing_pending() < KMX_OUT_SOFT_LIMIT && !stop_pending) {
+            ssize_t count = read(STDIN_FILENO, buffer,
+                reliable_input.enabled ? KMX_INPUT_DATA_MAX : sizeof buffer);
             if (count > 0) {
                 if (memchr(buffer, 0x1d, (size_t)count)) break; /* Ctrl-] */
                 if (pixel_input) {
@@ -1353,7 +1597,7 @@ main(int argc, char **argv) {
                     send_message(fd, KMX_MSG_FOCUS, &wanted, 1);
                     kmx_predictor_reset(predictor);
                 } else {
-                    if (send_message(fd, KMX_MSG_INPUT, buffer, (size_t)count) != 0) break;
+                    if (input_send(fd, buffer, (size_t)count) != 0) { exit_code = 1; break; }
                     if (predict &&
                         kmx_predictor_type(predictor, buffer, (size_t)count)) {
                         redraw = true;
@@ -1398,11 +1642,28 @@ main(int argc, char **argv) {
         audio_output_flush(&player);
     }
 
+    if (reliable_input.enabled && send_text && !sent_once) {
+        fprintf(stderr, "kmx-attach: --send ended before all input was submitted\n");
+        exit_code = 1;
+    }
+    if (!exit_code) input_close(fd, tls);
+    if (reliable_input.head) {
+        fprintf(stderr, "kmx-attach: leaving with %zu unacknowledged input bytes; acceptance is uncertain\n",
+            reliable_input.bytes);
+        exit_code = 1;
+    }
+    input_free();
+    if (reliable_input.enabled && have_termios) (void)tcflush(STDIN_FILENO, TCIFLUSH);
     if (pixel_input_enabled) disable_pixel_input();
     if (have_termios) reset_terminal_input();
     if (have_termios) (void)tcsetattr(STDIN_FILENO, TCSANOW, &saved);
     if (outgoing_pending()) outgoing_discard("leaving session");
     if (outgoing.failed) exit_code = 1;
+    if (reliable_input.enabled && exit_code && fd >= 0) {
+        /* SSL_shutdown must not advance a pending application write after a
+         * protocol error. Keep the fd allocated until TLS cleanup finishes. */
+        (void)shutdown(fd, SHUT_RDWR);
+    }
     if (!dump) {
         char remove_image[64];
         int length = snprintf(

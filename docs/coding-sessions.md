@@ -58,11 +58,93 @@ controller limit. Exhausting the hard bound is an explicit session error.
 
 The attach client also queues complete frames and resumes partial writes after
 socket backpressure, for both plain and TLS connections. It pauses stdin at a
-soft bound while continuing to receive state and queue ACKs. On disconnect it
+soft bound while continuing to receive state and queue ACKs. In legacy mode, disconnect
 reports delivery uncertainty and discards pending transport bytes and unread
-interactive terminal input. It never replays old input automatically. Exactly
-once delivery across reconnect requires a future input acknowledgement and
-deduplication protocol.
+interactive terminal input. Legacy input is never replayed automatically.
+
+## Acknowledged input and reconnect
+
+For a single owned text PTY, both updated endpoints support an opt-in input
+ledger:
+
+```sh
+build/kmx-serve --socket ./coding.sock -- codex
+build/kmx-attach --socket ./coding.sock --reliable-input --no-predict --no-audio
+```
+
+`--reliable-input` waits for a successful handshake before sending any input.
+An older server is rejected after a five-second selection deadline; there is
+no automatic downgrade. Viewers, pixel input, broker panes, and multi-pane
+sessions do not support this mode. Legacy clients retain their existing wire
+format when no reliable controller owns the session.
+
+The client creates a random 128-bit identity and assigns consecutive input
+sequence numbers starting at one. The server grants one exclusive controller
+lease and creates a random 128-bit ledger epoch. An acknowledgement means
+that the complete input message is owned by the server's bounded FIFO. It
+does **not** mean that the child has read, parsed, or executed those bytes.
+The server advances its accepted counter before attempting any partial PTY
+write. An already accepted sequence is acknowledged without appending its
+bytes again. A gap or zero sequence closes the connection.
+
+The client retains unacknowledged messages in memory: at most 256 KiB plus one
+32 KiB message, and at most 4,096 messages. Stdin pauses when either bound is
+reached, while viewport traffic, acknowledgements, timers, and termination
+signals remain serviceable. A peer cannot acknowledge merely allocated
+messages that have never been offered to the transport. For TLS, a complete
+frame included in a write attempt may have reached the server even if that
+attempt returns WANT or subsequently fails, so acknowledgement validation
+conservatively includes such frames. Ctrl-] is part of the stdin byte stream
+and can wait behind input backpressure; SIGTERM and `--seconds` still stop
+the client.
+
+On automatic reconnect, the client presents its epoch, identity, and last
+acknowledged counter. The server returns its current accepted counter. The
+client removes confirmed entries and resends the remaining entries with their
+original sequences; partial transport frames are reconstructed in full. The
+server keeps the ledger for 60 seconds after the owner disconnects. A valid
+resume fences the old transport, including its retained input frame. Other
+controllers cannot inject input, change focus, or resize the PTY during the
+lease or its disconnect grace. Viewers may continue receiving output.
+
+Server restart, expired retention, an unknown identity, an inconsistent
+counter, or a different epoch stops recovery without replay. Every newly
+allocated ledger gets a fresh epoch, including when a client identity is
+reused after close or expiry. Old frames therefore cannot become valid in a
+new ledger. This is bounded deduplication within a running server, not durable
+exactly-once application execution. The client journal is not persisted across
+client process exit, and server acceptance does not survive a server crash.
+
+When detaching with a fully acknowledged journal, the client attempts an
+explicit lease release for up to 100 ms. If it does not reach the server, the
+60-second grace still applies. Leaving with unacknowledged input reports the
+remaining byte count and exits unsuccessfully. A protocol error discards
+pending transport frames instead of flushing them during cleanup.
+
+### Input wire extension
+
+Payload helpers are in `kilix_mux_input.h`; the transport-independent ownership
+and deduplication state machine is in `kilix_mux_input_session.h`. All integer
+fields below are unsigned and big endian. Versions, reserved bytes, sizes,
+identities, and counter bounds are checked before state is changed.
+
+| Type | Direction | Payload |
+| --- | --- | --- |
+| 15 `INPUT_OPEN` | Client → server | 44 bytes: version=1, three zero bytes, epoch[16], identity[16], last ACK[8] |
+| 16 `INPUT_STATE` | Server → client | 48 bytes: version=1, status, two zero bytes, epoch[16], identity[16], accepted[8], disconnect grace in ms[4] |
+| 17 `INPUT_DATA` | Client → server | Version=1, pane, two zero bytes, sequence[8], then 1–32,768 input bytes |
+| 18 `INPUT_ACK` | Server → client | 12 bytes: version=1, three zero bytes, accepted[8] |
+| 19 `INPUT_CLOSE` | Client → server | Same payload as ACK; release requires the active owner's exact accepted counter |
+
+A zero epoch in OPEN requests a new ledger and requires last ACK zero. The
+identity must be nonzero. STATE always contains a nonzero epoch and echoes the
+request identity; error states expose no other owner's accepted counter.
+Status values are READY=0, BUSY=1, EXPIRED=2, EPOCH=3, LIMIT=4, and DENIED=5.
+LIMIT is reserved for an admission policy refusal; ordinary FIFO pressure
+pauses input instead. DATA currently requires pane zero. Duplicate frames are
+identified by sequence within the ledger; they never replace prior bytes.
+TLS or the existing authenticated SSH/Unix transport remains responsible for
+peer identity and confidentiality; the ledger identity is not a substitute.
 
 ## Terminal-mode extension
 
@@ -98,6 +180,7 @@ negotiate enhanced keyboard protocols or application keypad mode.
 
 ```sh
 make test                 # native terminal, mode, and delayed-ACK regressions
+make test-input           # input codecs, lease state, fault-injected client writes
 make test-coding           # owned PTYs/sockets, actual client, input integrity
 python3 tools/coding_bench.py --samples 50 --output /tmp/coding-lan.json
 python3 tools/coding_bench.py --samples 50 --delay-ms 250 --rate-bytes 32000 \
@@ -127,6 +210,13 @@ under plain/TLS backpressure. The TLS tests use an owned temporary certificate
 and require the `openssl` command. Test cleanup targets only owned processes.
 Native delayed-ACK tests include deterministic reversions,
 scrolling, resizes, reconnect resets, and randomized schedules.
+
+`test-input` requires no listener and exercises the actual client journal with
+partial-write and TLS-WANT injection. `test-coding` also runs the input-resume
+socket harness. To check the real retention deadline, run
+`python3 tests/test_input_resume.py --expiry`; this adds a 60-second wait.
+Restricted environments that deny socket listeners cannot run the transport
+suite; native state tests do not establish end-to-end transport compatibility.
 
 ## Further protocol work
 

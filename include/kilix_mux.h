@@ -319,7 +319,12 @@ typedef enum {
     KMX_MSG_AUDIO = 11,  /* server -> client: the audio plane              */
     KMX_MSG_AUDIO_CAPS = 12, /* post-HELLO offer and explicit audio selection */
     KMX_MSG_AUDIO_PROFILE = 13, /* optional epoch profile, before AUDIO_CAPS */
-    KMX_MSG_TERMINAL_MODES = 14 /* optional focused-pane input modes */
+    KMX_MSG_TERMINAL_MODES = 14, /* optional focused-pane input modes */
+    KMX_MSG_INPUT_OPEN = 15,    /* optional acknowledged-input handshake */
+    KMX_MSG_INPUT_STATE = 16,   /* selected input ledger and accepted counter */
+    KMX_MSG_INPUT_DATA = 17,    /* sequenced controller input */
+    KMX_MSG_INPUT_ACK = 18,     /* cumulative server FIFO acceptance */
+    KMX_MSG_INPUT_CLOSE = 19    /* release a fully acknowledged input lease */
 } kmx_message_type;
 
 /* The largest single message accepted from a peer.  A length prefix is an
