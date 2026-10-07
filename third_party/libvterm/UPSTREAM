@@ -2,10 +2,24 @@ name:    libvterm
 source:  https://github.com/neovim/libvterm
 commit:  934bc2fbf21800ac3458a499df8820ca5fb45fd3
 license: MIT (see LICENSE)
-status:  UNMODIFIED
+status:  PATCHED (recorded numbered series)
 
-Vendored verbatim.  Upstream already surfaces Kitty graphics APC sequences
-through vterm_screen_set_unrecognised_fallbacks(), in wire order relative to
-screen damage, so this project carries no patches against it.  If that ever
-changes, add a numbered patch series beside this file and a make target that
-verifies it, rather than editing the vendored tree in place.
+The pinned upstream source is carried with one local patch:
+  patches/0001-guard-dimensions-and-allocations.patch
+
+This patch records exactly the changes to src/screen.c and src/vterm.c made
+by kilix-multiplexer commit 13dad84d7cf5093c9ac690da3c40c3b038b2197a. It adds
+signed cell-index and allocation-size guards, plus allocation failure checks.
+No additional upstream source changes are part of this patch series.
+
+SHA256SUMS retains the original upstream file hashes. `make check-vendor`
+copies the manifest files to a private temporary tree, reverses patches/series
+in reverse order with zero fuzz, and verifies every restored file against
+those original hashes. It also rejects unlisted source files or patches.
+The check never edits this vendored tree and needs Python 3 and `patch`.
+
+For future modifications, add a numbered patch to patches/ and list it in
+patches/series. Preserve original upstream hashes; do not bless patched files
+by rehashing the manifest. Upstream already surfaces Kitty graphics APC
+sequences through vterm_screen_set_unrecognised_fallbacks() in wire order, so
+no graphics-specific patch is needed.

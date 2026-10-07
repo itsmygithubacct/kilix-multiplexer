@@ -8,6 +8,7 @@
  * The first input byte selects a decoder, so one corpus exercises all of them
  * and libFuzzer's coverage feedback can steer into each. */
 #include "kilix_mux.h"
+#include "kilix_mux_modes.h"
 
 #include <stdint.h>
 #include <stddef.h>
@@ -126,7 +127,7 @@ fuzz_receiver(const uint8_t *data, size_t size) {
 int
 LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     if (!size) return 0;
-    switch (data[0] % 8) {
+    switch (data[0] % 9) {
         case 0: fuzz_cells(data + 1, size - 1); break;
         case 1: fuzz_layout(data + 1, size - 1); break;
         case 2: fuzz_image(data + 1, size - 1); break;
@@ -134,7 +135,13 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         case 4: fuzz_decompress(data + 1, size - 1); break;
         case 5: fuzz_motion(data + 1, size - 1); break;
         case 6: fuzz_audio(data + 1, size - 1); break;
-        default: fuzz_receiver(data + 1, size - 1); break;
+        case 7: fuzz_receiver(data + 1, size - 1); break;
+        default: {
+            uint8_t pane;
+            uint32_t flags;
+            (void)kmx_modes_decode(data + 1, size - 1, &pane, &flags);
+            break;
+        }
     }
     return 0;
 }

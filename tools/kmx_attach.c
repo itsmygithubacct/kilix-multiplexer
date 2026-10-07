@@ -14,6 +14,7 @@
 #define _GNU_SOURCE
 
 #include "kilix_mux.h"
+#include "kilix_mux_modes.h"
 #include "endpoint.h"
 #include "kmx_input_transform.h"
 #include "kmx_tls.h"
@@ -60,8 +61,71 @@ handle_stop(int signal_number) {
     stop_pending = 1;
 }
 
-/* The one place that knows whether this connection is wrapped. */
-static kmx_tls_session *active_tls;
+/* Stop reading typing before the queue gets deep, while retaining room for
+ * one complete input frame and control traffic produced by incoming updates. */
+#define KMX_OUT_SOFT_LIMIT (256u * 1024u)
+#define KMX_OUT_CONTROL_RESERVE (64u * 1024u)
+#define KMX_OUT_HARD_LIMIT \
+    ((size_t)KMX_OUT_SOFT_LIMIT + KMX_MESSAGE_MAX + KMX_OUT_CONTROL_RESERVE)
+#define KMX_OUT_WRITE_BUDGET (64u * 1024u)
+
+static struct {
+    kmx_buffer bytes;
+    size_t offset;
+    size_t tls_attempt;
+    bool tls_wait_read;
+    bool input_submitted;
+    bool failed;
+} outgoing;
+
+static size_t
+outgoing_pending(void) {
+    return outgoing.bytes.size - outgoing.offset;
+}
+
+static int
+outgoing_flush(int fd, kmx_tls_session *tls) {
+    size_t pending = outgoing_pending();
+    size_t attempt;
+    long count;
+    if (!pending) return 0;
+    /* OpenSSL permits a moving address, but a WANT retry must retain the
+     * original byte count even if additional complete frames were appended. */
+    attempt = outgoing.tls_attempt ? outgoing.tls_attempt :
+        (pending < KMX_OUT_WRITE_BUDGET ? pending : KMX_OUT_WRITE_BUDGET);
+    if (tls) outgoing.tls_attempt = attempt;
+    count = tls ? kmx_tls_write(tls, outgoing.bytes.data + outgoing.offset, attempt)
+                : send(fd, outgoing.bytes.data + outgoing.offset, attempt,
+                       MSG_NOSIGNAL | MSG_DONTWAIT);
+    outgoing.tls_wait_read = tls && kmx_tls_write_wants_read(tls);
+    if (count < 0) {
+        if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+        return -1;
+    }
+    if (!count || (size_t)count > attempt) return -1;
+    outgoing.offset += (size_t)count;
+    outgoing.tls_attempt = 0;
+    if (outgoing.offset == outgoing.bytes.size) {
+        outgoing.offset = 0;
+        outgoing.bytes.size = 0;
+    }
+    return 0;
+}
+
+static void
+outgoing_discard(const char *reason) {
+    size_t pending = outgoing_pending();
+    if (pending || outgoing.input_submitted) {
+        fprintf(stderr,
+            "kmx-attach: %s; discarded %zu pending transport bytes; "
+            "prior input delivery is unconfirmed\n", reason, pending);
+    }
+    outgoing.offset = 0;
+    outgoing.bytes.size = 0;
+    outgoing.tls_attempt = 0;
+    outgoing.tls_wait_read = false;
+    outgoing.input_submitted = 0;
+}
 
 static int
 write_all(int fd, const void *data, size_t size) {
@@ -69,21 +133,7 @@ write_all(int fd, const void *data, size_t size) {
     size_t done = 0;
     while (done < size) {
         ssize_t count;
-        if (active_tls && fd != STDOUT_FILENO && fd != STDERR_FILENO) {
-            count = kmx_tls_write(active_tls, cursor + done, size - done);
-            if (count < 0 && errno == EAGAIN) {
-                /* Waited on rather than spun on.  The descriptor is
-                 * non-blocking now, so retrying immediately is a hot loop. */
-                struct pollfd waiting;
-                waiting.fd = fd;
-                waiting.events = POLLOUT;
-                waiting.revents = 0;
-                if (poll(&waiting, 1, 5000) <= 0) return -1;
-                continue;
-            }
-        } else {
-            count = write(fd, cursor + done, size - done);
-        }
+        count = write(fd, cursor + done, size - done);
         if (count < 0) {
             if (errno == EINTR) continue;
             return -1;
@@ -97,15 +147,32 @@ write_all(int fd, const void *data, size_t size) {
 static int
 send_message(int fd, kmx_message_type type, const void *payload, size_t size) {
     kmx_buffer framed;
-    int result;
+    kmx_result result;
+    (void)fd;
+    if (outgoing.failed) return -1;
     kmx_buffer_init(&framed);
-    if (kmx_frame_encode(type, payload, size, &framed) != KMX_OK) {
-        kmx_buffer_free(&framed);
+    result = kmx_frame_encode(type, payload, size, &framed);
+    if (outgoing.offset &&
+        (outgoing.offset >= outgoing.bytes.size / 2 ||
+         outgoing.offset >= KMX_OUT_WRITE_BUDGET)) {
+        memmove(outgoing.bytes.data, outgoing.bytes.data + outgoing.offset,
+                outgoing_pending());
+        outgoing.bytes.size -= outgoing.offset;
+        outgoing.offset = 0;
+    }
+    if (result == KMX_OK &&
+        (outgoing.bytes.size > KMX_OUT_HARD_LIMIT ||
+         framed.size > KMX_OUT_HARD_LIMIT - outgoing.bytes.size)) result = KMX_ERR_LIMIT;
+    if (result == KMX_OK) result = kmx_buffer_append(&outgoing.bytes, framed.data, framed.size);
+    kmx_buffer_free(&framed);
+    if (result != KMX_OK) {
+        fprintf(stderr, "kmx-attach: outgoing frame queue exhausted or failed\n");
+        outgoing.failed = true;
+        stop_pending = 1;
         return -1;
     }
-    result = write_all(fd, framed.data, framed.size);
-    kmx_buffer_free(&framed);
-    return result;
+    if (type == KMX_MSG_INPUT && size) outgoing.input_submitted = true;
+    return 0;
 }
 
 static void
@@ -350,6 +417,39 @@ disable_pixel_input(void) {
         "\033[?1003l\033[?1006l\033[?1016l\033[?2004l"
         "\033_Ga=d,d=A\033\\\033[?25h";
     (void)write_all(STDOUT_FILENO, controls, sizeof controls - 1);
+}
+
+static void
+reset_terminal_input(void) {
+    static const char controls[] =
+        "\033[?1l\033[?2004l\033[?1004l"
+        "\033[?1000l\033[?1002l\033[?1003l\033[?1006l\033[?25h";
+    (void)write_all(STDOUT_FILENO, controls, sizeof controls - 1);
+}
+
+static int
+apply_terminal_input(uint32_t flags) {
+    static const struct { uint32_t bit; unsigned int selector; } modes[] = {
+        {KMX_MODE_APPLICATION_CURSOR, 1}, {KMX_MODE_BRACKETED_PASTE, 2004},
+        {KMX_MODE_FOCUS_REPORT, 1004}, {KMX_MODE_MOUSE_CLICK, 1000},
+        {KMX_MODE_MOUSE_DRAG, 1002}, {KMX_MODE_MOUSE_MOVE, 1003},
+        {KMX_MODE_MOUSE_SGR, 1006},
+    };
+    char controls[160];
+    size_t used = 0;
+    /* Clear tracking selectors first: a later reset of another selector
+     * would otherwise disable the requested one on libvterm terminals. */
+    for (unsigned int enabled = 0; enabled <= 1; enabled++) {
+        for (size_t i = 0; i < sizeof modes / sizeof modes[0]; i++) {
+            int length;
+            if (((flags & modes[i].bit) != 0) != (enabled != 0)) continue;
+            length = snprintf(controls + used, sizeof controls - used,
+                              "\033[?%u%c", modes[i].selector, enabled ? 'h' : 'l');
+            if (length < 0 || (size_t)length >= sizeof controls - used) return -1;
+            used += (size_t)length;
+        }
+    }
+    return write_all(STDOUT_FILENO, controls, used);
 }
 
 typedef struct {
@@ -601,6 +701,8 @@ main(int argc, char **argv) {
     int remote_pixel_width = 0;
     int remote_pixel_height = 0;
     bool pixel_input_enabled = false;
+    uint32_t terminal_input_flags = 0;
+    bool tls_read_wants_write = false;
     kmx_buffer pixel_input_pending;
     kmx_buffer pixel_input_output;
     int exit_code = 0;
@@ -723,7 +825,6 @@ main(int argc, char **argv) {
             setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &limit, sizeof limit);
         }
         tls = kmx_tls_client_connect(tls_client, fd);
-        active_tls = tls;
         if (!tls) {
             /* Either the handshake failed or the certificate is not the one
              * named.  Both mean: do not talk to this. */
@@ -775,6 +876,8 @@ main(int argc, char **argv) {
     if (pixel_input && !view_only && have_termios &&
         enable_pixel_input() == 0) {
         pixel_input_enabled = true;
+    } else if (have_termios && !view_only && !pixel_input) {
+        reset_terminal_input();
     }
     {
         /* sigaction with no SA_RESTART, deliberately.  glibc's signal() sets
@@ -798,6 +901,7 @@ main(int argc, char **argv) {
         struct pollfd descriptors[3];
         int ready;
         bool redraw = false;
+        bool write_failed = false;
 
         if (resize_pending && !dump) {
             resize_pending = 0;
@@ -810,11 +914,15 @@ main(int argc, char **argv) {
             kmx_render_invalidate(render);
         }
 
-        descriptors[0].fd = audio_backpressure ? -1 : fd;
-        descriptors[0].events = audio_backpressure ? 0 : POLLIN;
+        /* TLS can need reads to complete a write. Keep that transport progress
+         * enabled even while the application audio decoder is backpressured. */
+        descriptors[0].events = (short)((!audio_backpressure || outgoing.tls_wait_read ? POLLIN : 0) |
+            ((outgoing_pending() && !outgoing.tls_wait_read) ||
+             (!audio_backpressure && tls_read_wants_write) ? POLLOUT : 0));
+        descriptors[0].fd = descriptors[0].events ? fd : -1;
         descriptors[0].revents = 0;
         descriptors[1].fd = STDIN_FILENO;
-        descriptors[1].events = dump ? 0 : POLLIN;
+        descriptors[1].events = dump || outgoing_pending() >= KMX_OUT_SOFT_LIMIT ? 0 : POLLIN;
         descriptors[1].revents = 0;
         descriptors[2].fd = kmx_encodec_event_fd(audio_codec);
         descriptors[2].events = POLLIN;
@@ -849,20 +957,36 @@ main(int argc, char **argv) {
             }
         }
 
-        if (!audio_backpressure && (descriptors[0].revents & (POLLIN | POLLHUP | POLLERR))) {
-            ssize_t count;
-            if (tls) {
+        if (outgoing_pending() &&
+            (descriptors[0].revents & (POLLERR | POLLHUP |
+                (outgoing.tls_wait_read ? POLLIN : POLLOUT)))) {
+            write_failed = outgoing_flush(fd, tls) != 0;
+        }
+        if (write_failed || (!audio_backpressure &&
+            ((descriptors[0].revents & (POLLIN | POLLHUP | POLLERR)) ||
+             (tls_read_wants_write && (descriptors[0].revents & POLLOUT))))) {
+            ssize_t count = 0;
+            if (!write_failed && tls) {
                 count = kmx_tls_read(tls, buffer, sizeof buffer);
-                if (count < 0 && errno == EAGAIN) continue;
-            } else {
+                tls_read_wants_write = kmx_tls_wants_write(tls);
+            } else if (!write_failed) {
                 count = read(fd, buffer, sizeof buffer);
-                if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK ||
-                                  errno == EINTR)) {
-                    continue;
-                }
             }
-            if (count <= 0) {
+            if (count < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) count = 0;
+            if (count == 0) {
                 int replacement;
+                outgoing_discard("connection lost");
+                kmx_buffer_reset(&pixel_input_pending);
+                if (have_termios) (void)tcflush(STDIN_FILENO, TCIFLUSH);
+                tls_read_wants_write = false;
+                /* Release input capture before waiting for a replacement
+                 * connection; the old focused pane no longer owns it. */
+                if (pixel_input_enabled) {
+                    disable_pixel_input();
+                    pixel_input_enabled = false;
+                }
+                if (have_termios) reset_terminal_input();
+                terminal_input_flags = 0;
                 /* A pane that ended is not a link that dropped; do not chase
                  * a session that is over. */
                 if (pane_ended || reconnect_seconds <= 0) break;
@@ -874,7 +998,6 @@ main(int argc, char **argv) {
                 if (tls) {
                     kmx_tls_session_free(tls);
                     tls = NULL;
-                    active_tls = NULL;
                 }
                 close(fd);
                 replacement = reconnect(&endpoint, reconnect_seconds);
@@ -894,7 +1017,6 @@ main(int argc, char **argv) {
                         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &limit, sizeof limit);
                     }
                     tls = kmx_tls_client_connect(tls_client, fd);
-                    active_tls = tls;
                     if (!tls) {
                         /* Closed rather than abandoned: leaking it is harmless
                          * only because the process is about to exit, which is
@@ -941,12 +1063,16 @@ main(int argc, char **argv) {
                 }
                 audio_select_deadline = now_millis() + 2000u;
                 if (!view_only) send_dimensions(fd, KMX_MSG_RESIZE, rows, cols);
+                if (pixel_input && !view_only && have_termios &&
+                    enable_pixel_input() == 0) pixel_input_enabled = true;
                 continue;
             }
             /* Conservatively attribute retained bytes to the oldest read.
              * Backpressure never refreshes a packet's 250ms age budget. */
-            kmx_read_clock_push(&read_clock, framer.pending.size, now_millis());
-            if (kmx_framer_push(&framer, buffer, (size_t)count) != KMX_OK) break;
+            if (count > 0) {
+                kmx_read_clock_push(&read_clock, framer.pending.size, now_millis());
+                if (kmx_framer_push(&framer, buffer, (size_t)count) != KMX_OK) break;
+            }
         }
         audio_backpressure = false;
         while (true) {
@@ -965,6 +1091,13 @@ main(int argc, char **argv) {
                     if (kmx_layout_apply(&received, payload, size) == KMX_OK) {
                         size_t slot;
                         layout = received;
+                        if (terminal_input_flags && have_termios &&
+                            !view_only && !pixel_input) {
+                            if (apply_terminal_input(0) != 0) {
+                                stop_pending = 1; exit_code = 1; break;
+                            }
+                            terminal_input_flags = 0;
+                        }
                         for (slot = 0; slot < layout.pane_count; slot++) {
                             const kmx_pane_info *info = &layout.panes[slot];
                             if (!receivers[slot] &&
@@ -980,6 +1113,26 @@ main(int argc, char **argv) {
                         kmx_render_invalidate(render);
                         kmx_predictor_reset(predictor);
                         redraw = true;
+                    }
+                } else if (type == KMX_MSG_TERMINAL_MODES) {
+                    uint8_t pane;
+                    uint32_t flags;
+                    if (kmx_modes_decode(payload, size, &pane, &flags) != KMX_OK ||
+                        pane >= layout.pane_count || pane >= KMX_MAX_PANES ||
+                        !layout.panes[pane].focused) {
+                        fprintf(stderr, "kmx-attach: invalid terminal mode state\n");
+                        stop_pending = 1; exit_code = 1; break;
+                    }
+                    if (have_termios && !dump && !view_only && !pixel_input) {
+                        /* Mouse coordinates currently describe the whole
+                         * local terminal. Multiple pane geometry needs an
+                         * input mapping before capture can be enabled. */
+                        if (layout.pane_count != 1) flags &= ~KMX_MODE_MOUSE_TRACKING;
+                        if (flags != terminal_input_flags &&
+                            apply_terminal_input(flags) != 0) {
+                            stop_pending = 1; exit_code = 1; break;
+                        }
+                        terminal_input_flags = flags;
                     }
                 } else if (type == KMX_MSG_CELLS && size >= 1) {
                     size_t which = payload[0];
@@ -1246,7 +1399,10 @@ main(int argc, char **argv) {
     }
 
     if (pixel_input_enabled) disable_pixel_input();
+    if (have_termios) reset_terminal_input();
     if (have_termios) (void)tcsetattr(STDIN_FILENO, TCSANOW, &saved);
+    if (outgoing_pending()) outgoing_discard("leaving session");
+    if (outgoing.failed) exit_code = 1;
     if (!dump) {
         char remove_image[64];
         int length = snprintf(
@@ -1265,6 +1421,7 @@ main(int argc, char **argv) {
         }
     }
     kmx_framer_free(&framer);
+    kmx_buffer_free(&outgoing.bytes);
     kmx_buffer_free(&pixel_input_output);
     kmx_buffer_free(&pixel_input_pending);
     kmx_image_cache_free(images);

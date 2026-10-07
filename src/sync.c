@@ -1,7 +1,11 @@
 /* State synchronisation and wire framing.
  *
- * The sender holds two things: the state the receiver has acknowledged, and
- * the state the pane is in now.  Every message is the difference between them.
+ * The sender holds a retained baseline covered by the receiver's cumulative
+ * acknowledgement, and the state the pane is in now. Every message is the
+ * difference between them, plus repairs for possible intermediate screens.
+ * Rows changed in an unacknowledged state are included even if they have since
+ * reverted to the baseline. A receiver on the ordered stream may already hold
+ * an intermediate screen, rather than the acknowledged one.
  * Nothing is queued, so a link that was down for a minute costs one screen
  * when it returns rather than a minute of scrollback, and a message that was
  * lost is superseded by the next one rather than retransmitted.
@@ -19,8 +23,10 @@
 #define KMX_CODEC_RAW 0u
 #define KMX_CODEC_ZSTD 1u
 
-/* How many sent-but-unacknowledged states to remember.  Bounded because an
- * unbounded history is the queue this design exists to avoid. */
+/* How many sent-but-unacknowledged states to remember. Preserve the oldest
+ * unacknowledged state as an anchor; rotating every slot would evict all ACK
+ * evidence on a link whose RTT exceeds eight send intervals. The other slots
+ * retain recent screens, so skipped messages never stop fresh updates. */
 #define KMX_SENT_HISTORY 8
 
 static kmx_result
@@ -153,6 +159,12 @@ struct kmx_sync {
     /* The highest sequence the baseline has been moved to.  Acknowledgements
      * are cumulative, so this only ever moves forward; see kmx_sync_ack_at. */
     uint64_t acked_sequence;
+    /* Most recent emitted change to each row, relative to the preceding sent
+     * screen. These obligations survive history eviction. Repeating the same
+     * row does not advance its change sequence, so an ACK of an identical
+     * screen can still make the sender idle with newer repeats in flight. */
+    uint64_t row_changed_at[KMX_MAX_DIMENSION];
+    uint64_t cursor_changed_at;
     sent_state history[KMX_SENT_HISTORY];
     uint64_t next_sequence;
     uint64_t last_send_millis;
@@ -275,6 +287,8 @@ kmx_sync_reset_baseline(kmx_sync *sync) {
     for (index = 0; index < KMX_SENT_HISTORY; index++) {
         sync->history[index].used = false;
     }
+    memset(sync->row_changed_at, 0, sizeof sync->row_changed_at);
+    sync->cursor_changed_at = 0;
 }
 
 const kmx_grid *
@@ -288,8 +302,43 @@ kmx_sync_term(kmx_sync *sync) {
 }
 
 static sent_state *
-history_slot(kmx_sync *sync, uint64_t sequence) {
-    return &sync->history[sequence % KMX_SENT_HISTORY];
+history_at_or_before(kmx_sync *sync, uint64_t sequence) {
+    sent_state *best = NULL;
+    for (size_t index = 0; index < KMX_SENT_HISTORY; index++) {
+        sent_state *slot = &sync->history[index];
+        if (slot->used && slot->sequence <= sequence &&
+            (!best || slot->sequence > best->sequence)) best = slot;
+    }
+    return best;
+}
+
+static sent_state *
+history_next_slot(kmx_sync *sync) {
+    sent_state *oldest = NULL;
+    sent_state *second = NULL;
+    for (size_t index = 0; index < KMX_SENT_HISTORY; index++) {
+        sent_state *slot = &sync->history[index];
+        if (!slot->used || slot->sequence <= sync->acked_sequence) return slot;
+        if (!oldest || slot->sequence < oldest->sequence) {
+            second = oldest;
+            oldest = slot;
+        } else if (!second || slot->sequence < second->sequence) {
+            second = slot;
+        }
+    }
+    /* A full history has eight unacknowledged states. Keep its oldest anchor
+     * until a cumulative ACK covers it and replace the next oldest instead. */
+    return second;
+}
+
+static bool
+same_row(const kmx_grid *a, const kmx_grid *b, int row) {
+    if (!a || a->rows != b->rows || a->cols != b->cols) return false;
+    for (int col = 0; col < b->cols; col++) {
+        if (!kmx_cell_equal(kmx_grid_cell_const(a, row, col),
+                            kmx_grid_cell_const(b, row, col))) return false;
+    }
+    return true;
 }
 
 kmx_result
@@ -305,6 +354,12 @@ kmx_sync_poll(
     uint64_t sequence;
     sent_state *slot;
     bool from_scratch;
+    bool changed_rows[KMX_MAX_DIMENSION];
+    bool repair_rows[KMX_MAX_DIMENSION];
+    bool repair_pending = false;
+    bool changed_since_send = false;
+    bool cursor_changed;
+    const kmx_grid *last_sent = NULL;
 
     if (!sync || !out || !produced) return KMX_ERR_INVALID;
     *produced = false;
@@ -312,13 +367,49 @@ kmx_sync_poll(
     result = kmx_term_snapshot(sync->term, &sync->current);
     if (result != KMX_OK) return result;
 
+    if (sync->next_sequence > 1) {
+        sent_state *last = history_at_or_before(sync, sync->next_sequence - 1);
+        if (last && last->sequence == sync->next_sequence - 1) {
+            last_sent = &last->state;
+        }
+    }
+    for (int row = 0; row < sync->current.rows; row++) {
+        changed_rows[row] = !same_row(last_sent, &sync->current, row);
+        changed_since_send |= changed_rows[row];
+        repair_rows[row] = changed_rows[row] ||
+            sync->row_changed_at[row] > sync->acked_sequence;
+        repair_pending |= repair_rows[row];
+    }
+    cursor_changed = !last_sent ||
+        last_sent->cursor_row != sync->current.cursor_row ||
+        last_sent->cursor_col != sync->current.cursor_col ||
+        last_sent->cursor_visible != sync->current.cursor_visible;
+    /* Cursor fields are always sent, but a cursor-only reversion must also
+     * defeat idle suppression while the intermediate cursor is unacked. */
+    repair_pending |= cursor_changed ||
+        sync->cursor_changed_at > sync->acked_sequence;
+    changed_since_send |= cursor_changed;
+
     /* Nothing to say costs nothing.  This is what an idle session is. */
-    if (sync->acked_valid && kmx_grid_equal(&sync->acked, &sync->current)) {
+    if (sync->acked_valid && !repair_pending &&
+        kmx_grid_equal(&sync->acked, &sync->current)) {
         return KMX_OK;
     }
-    if (sync->last_send_millis &&
-        now_millis - sync->last_send_millis < sync->interval_millis) {
-        return KMX_OK;
+    {
+        unsigned interval = sync->interval_millis;
+        /* An unchanged retry should allow its ACK to arrive. Repeating it at
+         * the repaint cadence wastes bandwidth and pushes the next keystroke's
+         * changed screen behind another interval. Keep retries for skipped
+         * messages, but wait two measured round trips for an identical screen.
+         * Before the first sample, a one-second retry avoids filling the
+         * stream with duplicate initial screens. New content still uses the
+         * normal cadence; explicit pinning wins. */
+        if (!sync->interval_pinned && !changed_since_send) {
+            unsigned retry = sync->smoothed_rtt ? sync->smoothed_rtt * 2u : 1000u;
+            if (retry > interval) interval = retry;
+        }
+        if (sync->last_send_millis &&
+            now_millis - sync->last_send_millis < interval) return KMX_OK;
     }
 
     from_scratch = !sync->acked_valid ||
@@ -326,14 +417,14 @@ kmx_sync_poll(
         sync->acked.cols != sync->current.cols;
 
     kmx_buffer_init(&encoded);
-    result = kmx_cells_encode(
-        from_scratch ? NULL : &sync->acked, &sync->current, &encoded);
+    result = kmx_cells_encode_rows(
+        from_scratch ? NULL : &sync->acked, &sync->current, repair_rows, &encoded);
     if (result != KMX_OK) {
         kmx_buffer_free(&encoded);
         return result;
     }
 
-    sequence = sync->next_sequence++;
+    sequence = sync->next_sequence;
     result = put_varint_buffer(out, sequence);
     if (result == KMX_OK) result = kmx_compress(encoded.data, encoded.size, out);
     if (result != KMX_OK) {
@@ -343,7 +434,7 @@ kmx_sync_poll(
 
     /* Remember what this sequence claimed, so its acknowledgement can move the
      * baseline forward without a round trip's worth of guessing. */
-    slot = history_slot(sync, sequence);
+    slot = history_next_slot(sync);
     result = kmx_grid_copy(&slot->state, &sync->current);
     if (result != KMX_OK) {
         kmx_buffer_free(&encoded);
@@ -353,6 +444,11 @@ kmx_sync_poll(
     slot->sent_at = now_millis;
     slot->wire_bytes = out->size;
     slot->used = true;
+    for (int row = 0; row < sync->current.rows; row++) {
+        if (changed_rows[row]) sync->row_changed_at[row] = sequence;
+    }
+    if (cursor_changed) sync->cursor_changed_at = sequence;
+    sync->next_sequence++;
 
     sync->last_send_millis = now_millis ? now_millis : 1;
     *produced = true;
@@ -417,17 +513,24 @@ kmx_sync_ack_at(kmx_sync *sync, uint64_t sequence, uint64_t now_millis) {
      * folded into the estimate either; a duplicate's arrival time says nothing
      * about how long the original took. */
     if (sequence <= sync->acked_sequence) return KMX_OK;
-    slot = history_slot(sync, sequence);
-    /* An acknowledgement for a state that has aged out of the ring is not an
-     * error; the baseline simply stays where it is and the next message is a
-     * larger diff. */
-    if (!slot->used || slot->sequence != sequence) return KMX_OK;
+    slot = history_at_or_before(sync, sequence);
+    if (!slot || slot->sequence <= sync->acked_sequence) return KMX_OK;
+    /* A cumulative ACK also covers an earlier retained screen, even when that
+     * earlier message was skipped. The receiver may hold a newer screen, just
+     * as it does with delayed ACKs; the row/cursor repair obligations cover
+     * every change after this retained baseline. Advance only to its sequence,
+     * never to the unknown evicted state, so no obligations are cleared early.
+     *
+     * If this is a later ACK, its age is a conservative RTT upper bound for the
+     * anchor. Unlike ignoring evicted ACKs, it can bootstrap slower pacing even
+     * after the anchor's own message or ACK was lost. Exact matches retain the
+     * usual measured RTT sample. Duplicate/stale ACKs cannot advance again. */
     if (now_millis && now_millis >= slot->sent_at) {
         observe_round_trip(sync, now_millis - slot->sent_at, slot->wire_bytes);
     }
     if (kmx_grid_copy(&sync->acked, &slot->state) != KMX_OK) return KMX_ERR_MEMORY;
     sync->acked_valid = true;
-    sync->acked_sequence = sequence;
+    sync->acked_sequence = slot->sequence;
     return KMX_OK;
 }
 

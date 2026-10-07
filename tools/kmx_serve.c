@@ -17,6 +17,7 @@
 #define _GNU_SOURCE
 
 #include "kilix_mux.h"
+#include "kilix_mux_modes.h"
 #include "endpoint.h"
 #include "kmx_pixel.h"
 #include "kmx_tap.h"
@@ -90,6 +91,7 @@ dimensions_ok(int rows, int cols) {
 
 typedef struct {
     kmx_term *term;
+    kmx_modes *modes;
     int master;
     int input_fd;
     int observer_hold;
@@ -105,12 +107,29 @@ typedef struct {
      * drained on POLLOUT, exactly like a client's outbound queue. */
     kmx_buffer input;
     size_t input_offset;
+    bool terminal_reply_failed;
+    uint64_t synchronized_since;
+    bool synchronized_holding;
 } pane;
 
-/* Typing ahead of a program that is not reading is worth a little tolerance and
- * no more.  Past this the oldest keystrokes are already meaningless, so the new
- * ones are dropped rather than the buffer grown. */
+#define KMX_SYNCHRONIZED_HOLD_MS 200u
+
+static bool
+pane_output_held(const pane *item, uint64_t now) {
+    return item->alive && kmx_modes_synchronized(item->modes) &&
+        now - item->synchronized_since < KMX_SYNCHRONIZED_HOLD_MS;
+}
+
+/* Bound typing ahead of a program that is not reading. A complete input frame
+ * stays in its client's bounded framer until this queue has room; applying
+ * socket backpressure preserves paste bytes without blocking other clients. */
 #define KMX_PANE_INPUT_LIMIT (256u * 1024u)
+/* Controller input can hold the soft limit plus one maximum-sized frame.
+ * Reserve bounded extra space for replies generated synchronously while
+ * parsing PTY output; those cannot be retried by retaining a client frame. */
+#define KMX_PANE_REPLY_RESERVE (64u * 1024u)
+#define KMX_PANE_INPUT_HARD_LIMIT \
+    ((size_t)KMX_PANE_INPUT_LIMIT + KMX_MESSAGE_MAX + KMX_PANE_REPLY_RESERVE)
 
 /* KMX_CLIENT_QUEUE_LIMIT bounds what is held for one client.  A client that
  * stops reading must not be able to stall the panes or the other clients, so
@@ -132,6 +151,8 @@ typedef struct {
     bool greeted;
     bool handshaking;
     bool wants_write;   /* the handshake is waiting for the socket, not the peer */
+    bool input_blocked;
+    size_t input_target; /* bind a retained frame before another peer changes focus */
     /* When this connection must have finished introducing itself.  A peer that
      * connects and then goes quiet - mid-handshake or before HELLO - holds one
      * of a small number of slots, so silence is given a limit rather than
@@ -155,6 +176,9 @@ typedef struct {
     kmx_sync *sync[KMX_MAX_PANES];
     kmx_image_cache *holds;
     kmx_layout announced;
+    bool modes_announced;
+    uint8_t announced_modes_pane;
+    uint32_t announced_modes_flags;
     kmx_framer framer;
     kmx_buffer out;
     size_t out_offset;
@@ -299,9 +323,9 @@ pane_input_flush(pane *item) {
     return 0;
 }
 
-static void
+static int
 pane_input_queue(pane *item, const void *data, size_t size) {
-    if (item->input_fd < 0) return;
+    if (item->input_fd < 0) return -1;
     compact(&item->input, &item->input_offset);
     /* The limit bounds what is ALREADY waiting, not what is arriving.
      *
@@ -314,14 +338,29 @@ pane_input_queue(pane *item, const void *data, size_t size) {
      * that arrives when there is room is taken whole however big it is; what
      * the limit refuses is piling more on top of a backlog that is already too
      * deep.  The buffer is therefore bounded by the limit plus one message. */
-    if (item->input.size - item->input_offset > KMX_PANE_INPUT_LIMIT) return;
-    if (kmx_buffer_append(&item->input, data, size) != KMX_OK) return;
-    (void)pane_input_flush(item);
+    if (item->input.size - item->input_offset > KMX_PANE_INPUT_LIMIT) return 1;
+    if (kmx_buffer_append(&item->input, data, size) != KMX_OK) return -1;
+    return pane_input_flush(item);
 }
 
 static bool
 pane_input_pending(const pane *item) {
     return item->input_fd >= 0 && item->input_offset < item->input.size;
+}
+
+static void
+pane_terminal_reply(const void *data, size_t size, void *user) {
+    pane *item = user;
+    if (item->terminal_reply_failed) return;
+    compact(&item->input, &item->input_offset);
+    /* Keep replies after bytes already accepted from controllers. Prioritising
+     * a separate FIFO would insert replies into an accepted paste. */
+    if (item->input.size > KMX_PANE_INPUT_HARD_LIMIT ||
+        size > KMX_PANE_INPUT_HARD_LIMIT - item->input.size ||
+        kmx_buffer_append(&item->input, data, size) != KMX_OK ||
+        pane_input_flush(item) != 0) {
+        item->terminal_reply_failed = true;
+    }
 }
 
 /* Compared in constant time: a token check that returns early on the first
@@ -891,7 +930,8 @@ main(int argc, char **argv) {
             : (single ? single[0] : commands[slot]);
         snprintf(layout.panes[slot].title, KMX_TITLE_MAX, "%zu: %s",
                  slot + 1, item->command);
-        if (kmx_term_create(&item->term, info->rows, info->cols) != KMX_OK) {
+        if (kmx_term_create(&item->term, info->rows, info->cols) != KMX_OK ||
+            kmx_modes_create(&item->modes) != KMX_OK) {
             fprintf(stderr, "kmx-serve: out of memory\n");
             return 1;
         }
@@ -944,6 +984,9 @@ main(int argc, char **argv) {
         make_non_blocking(item->master);
         item->input_fd = item->master;
         item->alive = true;
+        /* This server owns the terminal. A broker observer takes the earlier
+         * continue and never answers queries from replayed/live output. */
+        kmx_term_set_output_callback(item->term, pane_terminal_reply, item);
     }
 
     if (tap_path) {
@@ -1055,6 +1098,7 @@ main(int argc, char **argv) {
     signal(SIGTERM, handle_stop);
 
     while (!stop_requested) {
+        bool held_outputs[KMX_MAX_PANES] = {false};
         /* +4 for audio, the private-display frame pipe, and both ends of the
          * presenter tap. */
         struct pollfd descriptors[1 + KMX_MAX_CLIENTS + KMX_MAX_PANES + 6];
@@ -1079,7 +1123,7 @@ main(int argc, char **argv) {
             client_at[descriptor_count - client_first] = which;
             descriptors[descriptor_count].fd = clients[which].fd;
             descriptors[descriptor_count].events =
-                (short)(POLLIN |
+                (short)((clients[which].input_blocked ? 0 : POLLIN) |
                         ((clients[which].handshaking
                               ? clients[which].wants_write
                               : !client_idle(&clients[which]))
@@ -1311,8 +1355,13 @@ main(int argc, char **argv) {
                     continue;
                 }
             }
-            if (!(revents & (POLLIN | POLLHUP | POLLERR))) continue;
-            {
+            if (item->input_blocked && (revents & (POLLHUP | POLLERR))) {
+                client_release(item, count);
+                continue;
+            }
+            if (!item->input_blocked &&
+                !(revents & (POLLIN | POLLHUP | POLLERR))) continue;
+            if (!item->input_blocked) {
                 long received = client_recv(item, buffer, sizeof buffer);
                 if (received == -1 && errno == EAGAIN) continue;
                 if (received <= 0 ||
@@ -1403,14 +1452,25 @@ main(int argc, char **argv) {
                 } else if (type == KMX_MSG_INPUT) {
                     /* Enforced here, not in the client: a viewer that chose to
                      * send input still cannot reach the pane. */
-                    if (item->control && pixel_running &&
-                        panes[0].input_fd >= 0) {
-                        pane_input_queue(&panes[0], payload, size);
-                    } else if (item->control && focused < count &&
-                        panes[focused].alive &&
-                        panes[focused].input_fd >= 0) {
-                        pane_input_queue(&panes[focused], payload, size);
+                    size_t target = item->input_blocked ? item->input_target
+                        : (pixel_running ? 0 : focused);
+                    if (item->control && target < (pixel_running ? 1 : count) &&
+                        (pixel_running || panes[target].alive) &&
+                        panes[target].input_fd >= 0) {
+                        int queued = pane_input_queue(&panes[target], payload, size);
+                        if (queued > 0) {
+                            item->input_blocked = true;
+                            item->input_target = target;
+                            /* Retry this same frame after the PTY drains.
+                             * Do not consume it or read any further bytes. */
+                            break;
+                        }
+                        if (queued < 0) {
+                            client_release(item, count);
+                            break;
+                        }
                     }
+                    item->input_blocked = false;
                 } else if (type == KMX_MSG_FOCUS && size >= 1 && item->control) {
                     size_t wanted = payload[0];
                     if (wanted < count) {
@@ -1494,8 +1554,28 @@ main(int argc, char **argv) {
             {
                 ssize_t received = read(panes[id].master, buffer, sizeof buffer);
                 if (received > 0) {
+                    uint64_t generation =
+                        kmx_modes_synchronized_generation(panes[id].modes);
                     /* Fed once, however many clients are watching. */
                     kmx_term_feed(panes[id].term, buffer, (size_t)received);
+                    kmx_modes_feed(panes[id].modes, buffer, (size_t)received);
+                    if (generation != kmx_modes_synchronized_generation(panes[id].modes) &&
+                        !panes[id].synchronized_holding) {
+                        panes[id].synchronized_since = now_millis();
+                        panes[id].synchronized_holding = true;
+                    }
+                    if (panes[id].terminal_reply_failed) {
+                        fprintf(stderr,
+                            "kmx-serve: pane %zu terminal reply queue exhausted or failed\n",
+                            id);
+                        /* A query flood cannot grow memory indefinitely or
+                         * silently lose required replies. Stop its source and
+                         * finish normal server cleanup with an explicit error. */
+                        panes[id].alive = false;
+                        if (panes[id].child > 0) kill(panes[id].child, SIGTERM);
+                        stop_requested = 1;
+                        exit_code = 1;
+                    }
                 } else if (received == 0 || (errno != EINTR && errno != EAGAIN)) {
                     panes[id].alive = false;
                     /* Reaped here rather than only once every pane has gone.
@@ -1690,6 +1770,13 @@ main(int argc, char **argv) {
             }
         }
 
+        for (slot = 0; slot < count; slot++) {
+            held_outputs[slot] = pane_output_held(&panes[slot], now_millis());
+            /* Back-to-back end/begin pairs must not extend continuous
+             * withholding. A new window can begin only after a scheduler
+             * iteration has allowed this pane's snapshot to be published. */
+            if (!held_outputs[slot]) panes[slot].synchronized_holding = false;
+        }
         for (which = 0; which < KMX_MAX_CLIENTS; which++) {
             client *item = &clients[which];
             if (item->fd < 0) continue;
@@ -1716,8 +1803,30 @@ main(int argc, char **argv) {
                         continue;
                     }
                     item->announced = layout;
+                    item->modes_announced = false;
                 }
                 kmx_buffer_free(&wire);
+            }
+
+            /* A full state after layout also covers focus changes and late
+             * attach, even when neither cells nor flags have changed. Older
+             * clients already ignore unrecognised framed message types. */
+            if (count && item->greeted) {
+                uint32_t flags = kmx_modes_get(panes[focused].modes);
+                if (!item->modes_announced ||
+                    item->announced_modes_pane != focused ||
+                    item->announced_modes_flags != flags) {
+                    unsigned char wire[KMX_MODES_WIRE_SIZE];
+                    if (kmx_modes_encode((uint8_t)focused, flags, wire) != KMX_OK ||
+                        client_queue(item, KMX_MSG_TERMINAL_MODES,
+                                     wire, sizeof wire) != 0) {
+                        client_release(item, count);
+                        continue;
+                    }
+                    item->modes_announced = true;
+                    item->announced_modes_pane = (uint8_t)focused;
+                    item->announced_modes_flags = flags;
+                }
             }
 
             for (slot = 0; slot < count && item->fd >= 0; slot++) {
@@ -1727,6 +1836,7 @@ main(int argc, char **argv) {
                 /* Nothing new until the last one is away: a client that is
                  * behind wants the next diff, not a queue of stale ones. */
                 if (!client_idle(item)) break;
+                if (held_outputs[slot]) continue;
                 kmx_buffer_init(&message);
                 if (kmx_buffer_append(
                         &message, &(unsigned char){(unsigned char)slot}, 1) == KMX_OK &&
@@ -1744,6 +1854,7 @@ main(int argc, char **argv) {
             }
 
             for (slot = 0; slot < count && item->fd >= 0; slot++) {
+                if (held_outputs[slot]) continue;
                 size_t events = kmx_term_graphics_count(panes[slot].term);
                 size_t event;
                 for (event = 0; event < events && item->fd >= 0; event++) {
@@ -1804,6 +1915,7 @@ main(int argc, char **argv) {
             }
             if (anyone_attached) {
                 for (slot = 0; slot < count; slot++) {
+                    if (held_outputs[slot]) continue;
                     if (kmx_term_graphics_count(panes[slot].term)) {
                         kmx_term_graphics_clear(panes[slot].term);
                     }
@@ -1839,6 +1951,7 @@ main(int argc, char **argv) {
         if (broker_session) stop_helper(&panes[slot].child);
         kmx_buffer_free(&panes[slot].input);
         kmx_term_free(panes[slot].term);
+        kmx_modes_free(panes[slot].modes);
     }
     if (pixel_running && count == 0) {
         if (panes[0].input_fd >= 0) close(panes[0].input_fd);

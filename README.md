@@ -25,14 +25,19 @@ two machines in both directions. A live Kilix pane can also be observed through
 ```sh
 make               # library and tools
 make test          # unit suite
+make test-coding    # coding-session PTYs, input backpressure, client modes
 make sanitize      # under ASan + UBSan
 make fuzz          # libFuzzer against the decoder (needs clang)
-make check-vendor  # the vendored tree is unmodified upstream
+make check-vendor  # original upstream hashes plus recorded local patches
 tests/integration.sh   # real processes over a real socket
 tests/network.sh HOST  # both directions through an SSH tunnel
 tests/lan.sh HOST      # direct routed TLS, both directions and all media
 tools/bench.sh         # what the cell plane actually costs
 ```
+
+For coding CLIs, see [coding sessions](docs/coding-sessions.md) for the
+terminal-mode extension, delayed-ACK repair, input delivery guarantees,
+repeatable SSH benchmarks, and remaining history/capability work.
 
 ## Try it
 
@@ -340,11 +345,13 @@ A peer's claimed grid size is an instruction to allocate, so it is bounded
 
 ## Dependencies
 
-`libvterm` (MIT) is vendored **unmodified** under `third_party/libvterm` with
-its upstream commit and checksums recorded. `make check-vendor` proves the tree
-still matches. Upstream already surfaces Kitty graphics APC sequences in wire
-order through `vterm_screen_set_unrecognised_fallbacks`, so this project
-carries no patches against it.
+`libvterm` (MIT) is vendored under `third_party/libvterm` at the commit recorded
+in `UPSTREAM`, with a numbered patch for dimension and allocation guards.
+The original upstream checksums remain unchanged. `make check-vendor` reverses
+the recorded patch series in a temporary copy and verifies those original
+hashes, rejecting unrecorded source changes. This check needs Python 3 and
+`patch`. Upstream already surfaces Kitty graphics APC sequences in wire order
+through `vterm_screen_set_unrecognised_fallbacks`; no graphics patch is needed.
 
 The native build uses zstd, zlib and OpenSSL. `Xvfb` and `ffmpeg` are
 optional standalone pixel-pane dependencies. Live attachment expects the

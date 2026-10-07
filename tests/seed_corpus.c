@@ -23,6 +23,7 @@
 #define _GNU_SOURCE
 
 #include "kilix_mux.h"
+#include "kilix_mux_modes.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -71,6 +72,15 @@ main(int argc, char **argv) {
     }
     directory = argv[1];
     mkdir(directory, 0700);
+
+    /* Optional focused-terminal state, including strict reserved fields. */
+    {
+        unsigned char message[KMX_MODES_WIRE_SIZE];
+        if (kmx_modes_encode(0, KMX_MODE_APPLICATION_CURSOR |
+                KMX_MODE_BRACKETED_PASTE, message) == KMX_OK) {
+            emit_family(8, message, sizeof message, "terminal-modes");
+        }
+    }
 
     /* Cell plane: an empty screen, a screen with content, and a diff. */
     {

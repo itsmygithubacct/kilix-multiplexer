@@ -1,0 +1,225 @@
+From: kilix-multiplexer maintainers
+Subject: [PATCH 1/1] Guard terminal dimensions and allocation failures
+Origin: kilix-multiplexer commit 13dad84d7cf5093c9ac690da3c40c3b038b2197a
+
+This records exactly the existing libvterm changes introduced by the commit
+above. Reject dimensions whose signed cell indexing would overflow, check
+allocation sizes, and handle allocation failures before initializing buffers.
+The original pinned upstream SHA256SUMS remain unchanged.
+
+diff --git a/third_party/libvterm/src/screen.c b/third_party/libvterm/src/screen.c
+index 6747acb..0493b51 100644
+--- a/third_party/libvterm/src/screen.c
++++ b/third_party/libvterm/src/screen.c
+@@ -1,5 +1,6 @@
+ #include "vterm_internal.h"
+ 
++#include <limits.h>
+ #include <stdio.h>
+ #include <string.h>
+ 
+@@ -89,9 +90,31 @@ static inline ScreenCell *getcell(const VTermScreen *screen, int row, int col)
+   return screen->buffer + (screen->cols * row) + col;
+ }
+ 
++/* The rest of this file indexes cells with a signed `row * cols + col`.
++ * A product that does not fit in int is not a big screen, it is a write
++ * outside the allocation. */
++static int cell_bytes(int rows, int cols, size_t *bytes)
++{
++  if(rows < 1 || cols < 1)
++    return 0;
++  if((size_t)rows > (size_t)INT_MAX / (size_t)cols)
++    return 0;
++  size_t cells = (size_t)rows * (size_t)cols;
++  if(cells > SIZE_MAX / sizeof(ScreenCell))
++    return 0;
++  *bytes = cells * sizeof(ScreenCell);
++  return 1;
++}
++
+ static ScreenCell *alloc_buffer(VTermScreen *screen, int rows, int cols)
+ {
+-  ScreenCell *new_buffer = vterm_allocator_malloc(screen->vt, sizeof(ScreenCell) * rows * cols);
++  size_t bytes;
++  if(!cell_bytes(rows, cols, &bytes))
++    return NULL;
++
++  ScreenCell *new_buffer = vterm_allocator_malloc(screen->vt, bytes);
++  if(!new_buffer)
++    return NULL;
+ 
+   for(int row = 0; row < rows; row++) {
+     for(int col = 0; col < cols; col++) {
+@@ -516,16 +539,29 @@ static int line_popcount(ScreenCell *buffer, int row, int rows, int cols)
+   return col + 1;
+ }
+ 
+-static void resize_buffer(VTermScreen *screen, int bufidx, int new_rows, int new_cols, bool active, VTermStateFields *statefields)
++static int resize_buffer(VTermScreen *screen, int bufidx, int new_rows, int new_cols, bool active, VTermStateFields *statefields)
+ {
+   int old_rows = screen->rows;
+   int old_cols = screen->cols;
++  size_t bytes;
+ 
+   ScreenCell *old_buffer = screen->buffers[bufidx];
+   VTermLineInfo *old_lineinfo = statefields->lineinfos[bufidx];
+ 
+-  ScreenCell *new_buffer = vterm_allocator_malloc(screen->vt, sizeof(ScreenCell) * new_rows * new_cols);
+-  VTermLineInfo *new_lineinfo = vterm_allocator_malloc(screen->vt, sizeof(new_lineinfo[0]) * new_rows);
++  if(!cell_bytes(new_rows, new_cols, &bytes))
++    return 0;
++  if(new_rows > SIZE_MAX / sizeof(VTermLineInfo))
++    return 0;
++
++  ScreenCell *new_buffer = vterm_allocator_malloc(screen->vt, bytes);
++  VTermLineInfo *new_lineinfo = vterm_allocator_malloc(screen->vt, sizeof(new_lineinfo[0]) * (size_t)new_rows);
++  if(!new_buffer || !new_lineinfo) {
++    if(new_buffer)
++      vterm_allocator_free(screen->vt, new_buffer);
++    if(new_lineinfo)
++      vterm_allocator_free(screen->vt, new_lineinfo);
++    return 0;
++  }
+ 
+   int old_row = old_rows - 1;
+   int new_row = new_rows - 1;
+@@ -755,12 +791,16 @@ static void resize_buffer(VTermScreen *screen, int bufidx, int new_rows, int new
+   if(active)
+     statefields->pos = new_cursor;
+ 
+-  return;
++  return 1;
+ }
+ 
+ static int resize(int new_rows, int new_cols, VTermStateFields *fields, void *user)
+ {
+   VTermScreen *screen = user;
++  size_t bytes;
++
++  if(!cell_bytes(new_rows, new_cols, &bytes))
++    return 0;
+ 
+   int altscreen_active = (screen->buffers[BUFIDX_ALTSCREEN] && screen->buffer == screen->buffers[BUFIDX_ALTSCREEN]);
+ 
+@@ -772,18 +812,25 @@ static int resize(int new_rows, int new_cols, VTermStateFields *fields, void *us
+     if(screen->sb_buffer)
+       vterm_allocator_free(screen->vt, screen->sb_buffer);
+ 
+-    screen->sb_buffer = vterm_allocator_malloc(screen->vt, sizeof(VTermScreenCell) * new_cols);
++    screen->sb_buffer = vterm_allocator_malloc(screen->vt, sizeof(VTermScreenCell) * (size_t)new_cols);
++    if(!screen->sb_buffer)
++      return 0;
+   }
+ 
+-  resize_buffer(screen, 0, new_rows, new_cols, !altscreen_active, fields);
+-  if(screen->buffers[BUFIDX_ALTSCREEN])
+-    resize_buffer(screen, 1, new_rows, new_cols, altscreen_active, fields);
++  if(!resize_buffer(screen, 0, new_rows, new_cols, !altscreen_active, fields))
++    return 0;
++  if(screen->buffers[BUFIDX_ALTSCREEN]) {
++    if(!resize_buffer(screen, 1, new_rows, new_cols, altscreen_active, fields))
++      return 0;
++  }
+   else if(new_rows != old_rows) {
+     /* We don't need a full resize of the altscreen because it isn't enabled
+      * but we should at least keep the lineinfo the right size */
+     vterm_allocator_free(screen->vt, fields->lineinfos[BUFIDX_ALTSCREEN]);
+ 
+-    VTermLineInfo *new_lineinfo = vterm_allocator_malloc(screen->vt, sizeof(new_lineinfo[0]) * new_rows);
++    VTermLineInfo *new_lineinfo = vterm_allocator_malloc(screen->vt, sizeof(new_lineinfo[0]) * (size_t)new_rows);
++    if(!new_lineinfo)
++      return 0;
+     for(int row = 0; row < new_rows; row++)
+       new_lineinfo[row] = (VTermLineInfo){ 0 };
+ 
+@@ -874,6 +921,8 @@ static VTermScreen *screen_new(VTerm *vt)
+ 
+   VTermScreen *screen = vterm_allocator_malloc(vt, sizeof(VTermScreen));
+   int rows, cols;
++  if(!screen)
++    return NULL;
+ 
+   vterm_get_size(vt, &rows, &cols);
+ 
+@@ -895,10 +944,19 @@ static VTermScreen *screen_new(VTerm *vt)
+   screen->callbacks_has_pushline4 = false;
+ 
+   screen->buffers[BUFIDX_PRIMARY] = alloc_buffer(screen, rows, cols);
++  if(!screen->buffers[BUFIDX_PRIMARY]) {
++    vterm_allocator_free(vt, screen);
++    return NULL;
++  }
+ 
+   screen->buffer = screen->buffers[BUFIDX_PRIMARY];
+ 
+-  screen->sb_buffer = vterm_allocator_malloc(screen->vt, sizeof(VTermScreenCell) * cols);
++  screen->sb_buffer = vterm_allocator_malloc(screen->vt, sizeof(VTermScreenCell) * (size_t)cols);
++  if(!screen->sb_buffer) {
++    vterm_allocator_free(vt, screen->buffers[BUFIDX_PRIMARY]);
++    vterm_allocator_free(vt, screen);
++    return NULL;
++  }
+ 
+   vterm_state_set_callbacks(screen->state, &state_cbs, screen);
+   vterm_state_callbacks_has_premove(screen->state);
+@@ -1065,6 +1123,8 @@ void vterm_screen_enable_altscreen(VTermScreen *screen, int altscreen)
+     vterm_get_size(screen->vt, &rows, &cols);
+ 
+     screen->buffers[BUFIDX_ALTSCREEN] = alloc_buffer(screen, rows, cols);
++    if(!screen->buffers[BUFIDX_ALTSCREEN])
++      return;
+   }
+ }
+ 
+diff --git a/third_party/libvterm/src/vterm.c b/third_party/libvterm/src/vterm.c
+index e1f676f..ca115df 100644
+--- a/third_party/libvterm/src/vterm.c
++++ b/third_party/libvterm/src/vterm.c
+@@ -1,5 +1,6 @@
+ #include "vterm_internal.h"
+ 
++#include <limits.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <stdarg.h>
+@@ -27,6 +28,16 @@ static VTermAllocatorFunctions default_allocator = {
+   .free   = &default_free,
+ };
+ 
++static int dimensions_fit(int rows, int cols)
++{
++  if(rows < 1 || cols < 1)
++    return 0;
++  /* Callers index with signed int. Refuse a product that would wrap. */
++  if((size_t)rows > (size_t)INT_MAX / (size_t)cols)
++    return 0;
++  return 1;
++}
++
+ VTerm *vterm_new(int rows, int cols)
+ {
+   return vterm_build(&(const struct VTermBuilder){
+@@ -52,8 +63,13 @@ VTerm *vterm_build(const struct VTermBuilder *builder)
+ {
+   const VTermAllocatorFunctions *allocator = DEFAULT(builder->allocator, &default_allocator);
+ 
++  if(!dimensions_fit(builder->rows, builder->cols))
++    return NULL;
++
+   /* Need to bootstrap using the allocator function directly */
+   VTerm *vt = (*allocator->malloc)(sizeof(VTerm), builder->allocdata);
++  if(!vt)
++    return NULL;
+ 
+   vt->allocator = allocator;
+   vt->allocdata = builder->allocdata;
+@@ -115,7 +131,7 @@ void vterm_get_size(const VTerm *vt, int *rowsp, int *colsp)
+ 
+ void vterm_set_size(VTerm *vt, int rows, int cols)
+ {
+-  if(rows < 1 || cols < 1)
++  if(!dimensions_fit(rows, cols))
+     return;
+ 
+   vt->rows = rows;

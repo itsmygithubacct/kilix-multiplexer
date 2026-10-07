@@ -1,0 +1,2 @@
+# Unified patches retain a required space on empty context lines.
+third_party/libvterm/patches/*.patch whitespace=-blank-at-eol

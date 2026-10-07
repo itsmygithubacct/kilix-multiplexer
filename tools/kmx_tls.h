@@ -62,9 +62,12 @@ kmx_tls_session *kmx_tls_client_connect(kmx_tls_client *client, int fd);
  * caller should wait, 0 at end of stream. */
 long kmx_tls_read(kmx_tls_session *session, void *data, size_t size);
 long kmx_tls_write(kmx_tls_session *session, const void *data, size_t size);
-/* True when the last operation needs the socket writable before it can make
- * progress, which a poll loop has to know about. */
+/* Legacy last-operation indicator: reads distinguish WANT_WRITE, while writes
+ * mark either wait direction. Existing server callers retain this behavior. */
 bool kmx_tls_wants_write(const kmx_tls_session *session);
+/* True when the most recent write returned WANT_READ. Reads do not overwrite
+ * this flag; pending write retries must wait for this direction to be ready. */
+bool kmx_tls_write_wants_read(const kmx_tls_session *session);
 void kmx_tls_session_free(kmx_tls_session *session);
 
 #endif

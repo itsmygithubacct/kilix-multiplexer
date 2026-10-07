@@ -173,9 +173,10 @@ row_changed(const kmx_grid *previous, const kmx_grid *current, int row) {
 }
 
 kmx_result
-kmx_cells_encode(
+kmx_cells_encode_rows(
     const kmx_grid *previous,
     const kmx_grid *current,
+    const bool *include_rows,
     kmx_buffer *out
 ) {
     kmx_buffer rows;
@@ -191,7 +192,8 @@ kmx_cells_encode(
     kmx_buffer_init(&rows);
     result = KMX_OK;
     for (row = 0; row < current->rows && result == KMX_OK; row++) {
-        if (!row_changed(previous, current, row)) continue;
+        if (!(include_rows && include_rows[row]) &&
+            !row_changed(previous, current, row)) continue;
         result = put_row(&rows, current, row);
         if (result == KMX_OK) changed++;
     }
@@ -216,6 +218,15 @@ kmx_cells_encode(
     if (result == KMX_OK) result = kmx_buffer_append(out, rows.data, rows.size);
     kmx_buffer_free(&rows);
     return result;
+}
+
+kmx_result
+kmx_cells_encode(
+    const kmx_grid *previous,
+    const kmx_grid *current,
+    kmx_buffer *out
+) {
+    return kmx_cells_encode_rows(previous, current, NULL, out);
 }
 
 kmx_result

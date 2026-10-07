@@ -25,12 +25,34 @@ struct kmx_term {
     /* libvterm stores the pointer it is handed, not a copy, so this must
      * outlive every call into the parser. */
     VTermStateFallbacks fallbacks;
+    bool cursor_visible;
+    kmx_term_output_callback *output_callback;
+    void *output_user;
     kmx_graphics_event graphics[KMX_GRAPHICS_MAX];
     size_t graphics_count;
     bool graphics_open;   /* a fragmented sequence is still arriving */
     bool graphics_lost;   /* the queue overflowed; do not fabricate order */
     size_t stream_offset;
 };
+
+static int
+on_termprop(VTermProp prop, VTermValue *value, void *user) {
+    kmx_term *term = user;
+    if (prop == VTERM_PROP_CURSORVISIBLE) term->cursor_visible = value->boolean != 0;
+    return 1;
+}
+
+static const VTermScreenCallbacks screen_callbacks = {
+    .settermprop = on_termprop,
+};
+
+static void
+on_output(const char *data, size_t size, void *user) {
+    kmx_term *term = user;
+    if (term->output_callback) {
+        term->output_callback(data, size, term->output_user);
+    }
+}
 
 static kmx_color
 from_vterm_color(const VTermColor *color) {
@@ -102,6 +124,9 @@ kmx_term_create(kmx_term **out, int rows, int cols) {
         return KMX_ERR_MEMORY;
     }
     vterm_set_utf8(term->vt, 1);
+    /* Always consume generated replies, including for passive observers.
+     * libvterm's small default output buffer otherwise fills during replay. */
+    vterm_output_set_callback(term->vt, on_output, term);
     term->screen = vterm_obtain_screen(term->vt);
     if (!term->screen) {
         vterm_free(term->vt);
@@ -111,6 +136,9 @@ kmx_term_create(kmx_term **out, int rows, int cols) {
     memset(&term->fallbacks, 0, sizeof term->fallbacks);
     term->fallbacks.apc = on_apc;
     vterm_screen_set_unrecognised_fallbacks(term->screen, &term->fallbacks, term);
+    vterm_screen_enable_altscreen(term->screen, 1);
+    term->cursor_visible = true;
+    vterm_screen_set_callbacks(term->screen, &screen_callbacks, term);
     vterm_screen_reset(term->screen, 1);
     *out = term;
     return KMX_OK;
@@ -132,6 +160,15 @@ kmx_term_feed(kmx_term *term, const void *data, size_t size) {
     vterm_screen_flush_damage(term->screen);
     term->stream_offset += size;
     return KMX_OK;
+}
+
+void
+kmx_term_set_output_callback(
+    kmx_term *term, kmx_term_output_callback *callback, void *user
+) {
+    if (!term) return;
+    term->output_callback = callback;
+    term->output_user = user;
 }
 
 kmx_result
@@ -209,7 +246,7 @@ kmx_term_snapshot(kmx_term *term, kmx_grid *grid) {
     vterm_state_get_cursorpos(state, &cursor);
     grid->cursor_row = cursor.row < 0 ? 0 : (cursor.row >= rows ? rows - 1 : cursor.row);
     grid->cursor_col = cursor.col < 0 ? 0 : (cursor.col >= cols ? cols - 1 : cursor.col);
-    grid->cursor_visible = true;
+    grid->cursor_visible = term->cursor_visible;
     return KMX_OK;
 }
 

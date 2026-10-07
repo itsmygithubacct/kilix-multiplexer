@@ -49,6 +49,7 @@ struct kmx_tls_client {
 struct kmx_tls_session {
     SSL *ssl;
     bool wants_write;
+    bool write_wants_read; /* last write direction survives intervening reads */
 };
 
 static void
@@ -437,11 +438,17 @@ kmx_tls_write(kmx_tls_session *session, const void *data, size_t size) {
     int count;
     if (!session) return -1;
     session->wants_write = false;
+    session->write_wants_read = false;
     count = SSL_write(session->ssl, data, (int)size);
     if (count > 0) return count;
     switch (SSL_get_error(session->ssl, count)) {
-        case SSL_ERROR_WANT_WRITE:
         case SSL_ERROR_WANT_READ:
+            session->write_wants_read = true;
+            /* Preserve the legacy indicator used by the server. */
+            session->wants_write = true;
+            errno = EAGAIN;
+            return -1;
+        case SSL_ERROR_WANT_WRITE:
             session->wants_write = true;
             errno = EAGAIN;
             return -1;
@@ -456,6 +463,11 @@ kmx_tls_write(kmx_tls_session *session, const void *data, size_t size) {
 bool
 kmx_tls_wants_write(const kmx_tls_session *session) {
     return session ? session->wants_write : false;
+}
+
+bool
+kmx_tls_write_wants_read(const kmx_tls_session *session) {
+    return session ? session->write_wants_read : false;
 }
 
 void

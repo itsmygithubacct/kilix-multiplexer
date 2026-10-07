@@ -26,35 +26,39 @@ CPPFLAGS += -DKMX_HAVE_ENCODEC=1 $(ENCODEC_CFLAGS)
 CODEC_LIBS := $(ENCODEC_LIBS) -lsamplerate -pthread
 endif
 
-# Vendored verbatim; built with the upstream project's own warning posture
+# Vendored with recorded patches; built with upstream's own warning posture
 # rather than ours, so our -Werror never depends on someone else's code.
 VTERM_CFLAGS := -O2 -std=c99 -fPIC -w
 
-LIB_SOURCES := src/grid.c src/codec.c src/term.c src/sync.c src/frame.c src/render.c src/predict.c src/layout.c src/graphics.c src/motion.c src/audio.c src/endpoint.c
+LIB_SOURCES := src/grid.c src/codec.c src/term.c src/modes.c src/sync.c src/frame.c src/render.c src/predict.c src/layout.c src/graphics.c src/motion.c src/audio.c src/endpoint.c
 LIB_OBJECTS := $(LIB_SOURCES:%.c=$(BUILD_DIR)/%.o)
 VTERM_SOURCES := $(wildcard $(VTERM_DIR)/src/*.c)
 VTERM_OBJECTS := $(VTERM_SOURCES:%.c=$(BUILD_DIR)/%.o)
 
 STATIC_LIB := $(BUILD_DIR)/libkilix-mux.a
+SHARED_LIB := $(BUILD_DIR)/libkilix-mux.so
 TEST := $(BUILD_DIR)/test-mux
+MODES_TEST := $(BUILD_DIR)/test-modes
+INFLIGHT_TEST := $(BUILD_DIR)/test-sync-inflight
 TAP_TEST := $(BUILD_DIR)/test-tap
 FUZZ := $(BUILD_DIR)/fuzz-decoders
 BENCH := $(BUILD_DIR)/kmx-bench
 SERVE := $(BUILD_DIR)/kmx-serve
 SHAPE := $(BUILD_DIR)/kmx-shape
 ATTACH := $(BUILD_DIR)/kmx-attach
+TLS_WAIT_ATTACH := $(BUILD_DIR)/kmx-attach-tls-write-wait
 FLOOD := $(BUILD_DIR)/flood-input
 INPUT_TEST := $(BUILD_DIR)/test-input-transform
 ENCODEC_TEST := $(BUILD_DIR)/test-encodec
 
-.PHONY: all clean test sanitize fuzz backpressure churn check-vendor install
+.PHONY: all clean test test-coding sanitize fuzz backpressure churn check-vendor install
 
 all: $(STATIC_LIB) $(BENCH) $(SERVE) $(ATTACH) $(SHAPE)
 
 $(BUILD_DIR):
 	mkdir -p "$@"
 
-$(BUILD_DIR)/src/%.o: src/%.c include/kilix_mux.h | $(BUILD_DIR)
+$(BUILD_DIR)/src/%.o: src/%.c include/kilix_mux.h include/kilix_mux_modes.h | $(BUILD_DIR)
 	@mkdir -p "$(dir $@)"
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c "$<" -o "$@"
 
@@ -65,13 +69,17 @@ $(BUILD_DIR)/$(VTERM_DIR)/src/%.o: $(VTERM_DIR)/src/%.c | $(BUILD_DIR)
 $(STATIC_LIB): $(LIB_OBJECTS) $(VTERM_OBJECTS)
 	$(AR) rcs "$@" $(LIB_OBJECTS) $(VTERM_OBJECTS)
 
+# The Python coding-session harness uses the native decoder through ctypes.
+$(SHARED_LIB): $(STATIC_LIB)
+	$(CC) $(LDFLAGS) -shared -o "$@" -Wl,--whole-archive $(STATIC_LIB) -Wl,--no-whole-archive $(LDLIBS)
+
 $(BUILD_DIR)/kmx_bench.o: tools/kmx_bench.c include/kilix_mux.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c "$<" -o "$@"
 
 $(BENCH): $(BUILD_DIR)/kmx_bench.o $(STATIC_LIB)
 	$(CC) $(LDFLAGS) -o "$@" $(BUILD_DIR)/kmx_bench.o $(STATIC_LIB) $(LDLIBS) -lutil
 
-$(BUILD_DIR)/kmx_serve.o: tools/kmx_serve.c tools/kmx_pixel.h tools/kmx_tap.h tools/kmx_encodec.h include/kilix_mux.h | $(BUILD_DIR)
+$(BUILD_DIR)/kmx_serve.o: tools/kmx_serve.c tools/kmx_pixel.h tools/kmx_tap.h tools/kmx_encodec.h include/kilix_mux.h include/kilix_mux_modes.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Itools -c "$<" -o "$@"
 
 $(BUILD_DIR)/kmx_pixel.o: tools/kmx_pixel.c tools/kmx_pixel.h | $(BUILD_DIR)
@@ -95,7 +103,7 @@ $(BUILD_DIR)/kmx_encodec.o: tools/kmx_encodec.c tools/kmx_encodec.h | $(BUILD_DI
 $(SERVE): $(BUILD_DIR)/kmx_serve.o $(BUILD_DIR)/kmx_pixel.o $(BUILD_DIR)/kmx_tap.o $(BUILD_DIR)/kmx_tls.o $(BUILD_DIR)/kmx_encodec.o $(STATIC_LIB)
 	$(CC) $(LDFLAGS) -o "$@" $(BUILD_DIR)/kmx_serve.o $(BUILD_DIR)/kmx_pixel.o $(BUILD_DIR)/kmx_tap.o $(BUILD_DIR)/kmx_tls.o $(BUILD_DIR)/kmx_encodec.o $(STATIC_LIB) $(LDLIBS) $(CODEC_LIBS) -lutil -lssl -lcrypto
 
-$(BUILD_DIR)/kmx_attach.o: tools/kmx_attach.c tools/kmx_tls.h tools/kmx_input_transform.h tools/kmx_encodec.h tools/kmx_read_clock.h include/kilix_mux.h | $(BUILD_DIR)
+$(BUILD_DIR)/kmx_attach.o: tools/kmx_attach.c tools/kmx_tls.h tools/kmx_input_transform.h tools/kmx_encodec.h tools/kmx_read_clock.h include/kilix_mux.h include/kilix_mux_modes.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Itools -c "$<" -o "$@"
 
 $(BUILD_DIR)/kmx_input_transform.o: tools/kmx_input_transform.c tools/kmx_input_transform.h include/kilix_mux.h | $(BUILD_DIR)
@@ -104,11 +112,20 @@ $(BUILD_DIR)/kmx_input_transform.o: tools/kmx_input_transform.c tools/kmx_input_
 $(ATTACH): $(BUILD_DIR)/kmx_attach.o $(BUILD_DIR)/kmx_input_transform.o $(BUILD_DIR)/kmx_tls.o $(BUILD_DIR)/kmx_encodec.o $(STATIC_LIB)
 	$(CC) $(LDFLAGS) -o "$@" $(BUILD_DIR)/kmx_attach.o $(BUILD_DIR)/kmx_input_transform.o $(BUILD_DIR)/kmx_tls.o $(BUILD_DIR)/kmx_encodec.o $(STATIC_LIB) $(LDLIBS) $(CODEC_LIBS) -lssl -lcrypto
 
+$(TLS_WAIT_ATTACH): tests/tls_write_wait_shim.c $(BUILD_DIR)/kmx_attach.o $(BUILD_DIR)/kmx_input_transform.o $(BUILD_DIR)/kmx_tls.o $(BUILD_DIR)/kmx_encodec.o $(STATIC_LIB)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o "$@" tests/tls_write_wait_shim.c $(BUILD_DIR)/kmx_attach.o $(BUILD_DIR)/kmx_input_transform.o $(BUILD_DIR)/kmx_tls.o $(BUILD_DIR)/kmx_encodec.o $(STATIC_LIB) -Wl,--wrap=SSL_write -Wl,--wrap=SSL_get_error $(LDLIBS) $(CODEC_LIBS) -lssl -lcrypto
+
 $(BUILD_DIR)/test_mux.o: tests/test_mux.c include/kilix_mux.h tools/kmx_read_clock.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c "$<" -o "$@"
 
 $(TEST): $(BUILD_DIR)/test_mux.o $(STATIC_LIB)
 	$(CC) $(LDFLAGS) -o "$@" $(BUILD_DIR)/test_mux.o $(STATIC_LIB) $(LDLIBS)
+
+$(MODES_TEST): tests/test_modes.c include/kilix_mux_modes.h $(STATIC_LIB)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o "$@" tests/test_modes.c $(STATIC_LIB) $(LDLIBS)
+
+$(INFLIGHT_TEST): tests/test_sync_inflight.c $(STATIC_LIB)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o "$@" tests/test_sync_inflight.c $(STATIC_LIB) $(LDLIBS)
 
 $(BUILD_DIR)/test_tap.o: tests/test_tap.c tools/kmx_tap.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Itools -c "$<" -o "$@"
@@ -147,13 +164,23 @@ $(ENCODEC_TEST): tests/test_encodec.c tools/kmx_read_clock.h $(BUILD_DIR)/kmx_en
 $(BUILD_DIR)/test-encodec-age: tests/test_encodec_age.c $(BUILD_DIR)/kmx_encodec.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Itools $(LDFLAGS) -Wl,--wrap=kenc_encoder_push_s16 -o "$@" tests/test_encodec_age.c $(BUILD_DIR)/kmx_encodec.o $(CODEC_LIBS) -lm
 
-test: $(TEST) $(TAP_TEST) $(INPUT_TEST) $(ENCODEC_TEST)
+test: $(TEST) $(MODES_TEST) $(INFLIGHT_TEST) $(TAP_TEST) $(INPUT_TEST) $(ENCODEC_TEST)
 	$(TEST_ENVIRONMENT) "$(TEST)"
+	$(TEST_ENVIRONMENT) "$(MODES_TEST)"
+	$(TEST_ENVIRONMENT) "$(INFLIGHT_TEST)"
 	$(TEST_ENVIRONMENT) "$(TAP_TEST)"
 	$(TEST_ENVIRONMENT) "$(INPUT_TEST)"
 	$(TEST_ENVIRONMENT) "$(ENCODEC_TEST)"
 	$(PYTHON) tests/test_remote_chrome.py
 	$(PYTHON) tests/test_pixel_input.py
+
+# Starts owned PTYs and Unix sockets; kept separate for restricted sandboxes.
+test-coding: $(SERVE) $(ATTACH) $(TLS_WAIT_ATTACH) $(SHARED_LIB)
+	$(PYTHON) tests/test_coding_terminal.py --server "$(SERVE)" --library "$(SHARED_LIB)"
+	$(PYTHON) tests/test_attach_modes.py --server "$(SERVE)" --attach "$(ATTACH)" --library "$(SHARED_LIB)"
+	$(PYTHON) tests/test_attach_backpressure.py --attach "$(ATTACH)" --library "$(SHARED_LIB)"
+	$(PYTHON) tests/test_synchronized_output.py --server "$(SERVE)" --library "$(SHARED_LIB)"
+	$(PYTHON) tests/test_tls_write_wait.py --attach "$(TLS_WAIT_ATTACH)" --library "$(SHARED_LIB)"
 
 TEST_ENVIRONMENT ?=
 
@@ -172,7 +199,7 @@ sanitize:
 SEED := $(BUILD_DIR)/seed-corpus
 CORPUS := $(BUILD_DIR)/corpus
 
-$(BUILD_DIR)/seed_corpus.o: tests/seed_corpus.c include/kilix_mux.h | $(BUILD_DIR)
+$(BUILD_DIR)/seed_corpus.o: tests/seed_corpus.c include/kilix_mux.h include/kilix_mux_modes.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c "$<" -o "$@"
 
 $(SEED): $(BUILD_DIR)/seed_corpus.o $(STATIC_LIB)
@@ -190,10 +217,9 @@ fuzz: $(BUILD_DIR) $(SEED)
 		-o "$(FUZZ)" tests/fuzz_decoders.c $(LIB_SOURCES) $(VTERM_SOURCES) $(LDLIBS)
 	"$(FUZZ)" "$(CORPUS)" -max_total_time=$${FUZZ_SECONDS:-30} -print_final_stats=1
 
-# The vendored tree is unmodified upstream; prove it rather than assume it.
+# Reverse recorded patches in a private copy, then verify original upstream hashes.
 check-vendor:
-	@sha256sum --quiet -c $(VTERM_DIR)/SHA256SUMS \
-		&& echo "third_party/libvterm matches its recorded checksums"
+	$(PYTHON) tools/check_vendor.py
 
 clean:
 	rm -rf -- "$(BUILD_DIR)"
@@ -207,5 +233,5 @@ install: all
 	install -m 0755 "$(SERVE)" "$(DESTDIR)$(PREFIX)/bin/"
 	install -m 0755 "$(ATTACH)" "$(DESTDIR)$(PREFIX)/bin/"
 	install -m 0755 "$(SHAPE)" "$(DESTDIR)$(PREFIX)/bin/"
-	install -m 0644 include/kilix_mux.h "$(DESTDIR)$(PREFIX)/include/"
+	install -m 0644 include/kilix_mux.h include/kilix_mux_modes.h "$(DESTDIR)$(PREFIX)/include/"
 	install -m 0644 "$(STATIC_LIB)" "$(DESTDIR)$(PREFIX)/lib/"

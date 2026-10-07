@@ -108,7 +108,11 @@ append_style(kmx_buffer *out, const kmx_cell *cell) {
         result = append_text(out, "\033[3m");
     }
     if (result == KMX_OK && (cell->attrs & KMX_ATTR_UNDERLINE)) {
-        result = append_text(out, "\033[4m");
+        char underline[16];
+        unsigned style = cell->underline ? cell->underline : 1u;
+        int written = snprintf(underline, sizeof underline, "\033[4:%um", style);
+        if (written < 0 || (size_t)written >= sizeof underline) return KMX_ERR_INVALID;
+        result = kmx_buffer_append(out, underline, (size_t)written);
     }
     if (result == KMX_OK && (cell->attrs & KMX_ATTR_BLINK)) {
         result = append_text(out, "\033[5m");
@@ -127,6 +131,13 @@ append_style(kmx_buffer *out, const kmx_cell *cell) {
     return result;
 }
 
+static bool
+same_style(const kmx_cell *a, const kmx_cell *b) {
+    return a->attrs == b->attrs && a->underline == b->underline &&
+        memcmp(&a->fg, &b->fg, sizeof a->fg) == 0 &&
+        memcmp(&a->bg, &b->bg, sizeof a->bg) == 0;
+}
+
 static kmx_result
 move_cursor(kmx_buffer *out, int row, int col) {
     char scratch[32];
@@ -141,6 +152,7 @@ kmx_render_frame(kmx_render *render, const kmx_grid *grid, kmx_buffer *out) {
     int row;
     int cursor_row = -1;
     int cursor_col = -1;
+    const kmx_cell *style = NULL;
     kmx_result result = KMX_OK;
 
     if (!render || !grid || !out) return KMX_ERR_INVALID;
@@ -154,11 +166,15 @@ kmx_render_frame(kmx_render *render, const kmx_grid *grid, kmx_buffer *out) {
 
     for (row = 0; row < grid->rows && result == KMX_OK; row++) {
         int col;
+        bool repaint_next = false;
         for (col = 0; col < grid->cols && result == KMX_OK; col++) {
             const kmx_cell *cell = kmx_grid_cell_const(grid, row, col);
+            bool forced = repaint_next;
+            bool unicode = false;
+            repaint_next = false;
             /* The tail of a wide character is drawn by its head. */
             if (cell->width == 0) continue;
-            if (!full) {
+            if (!full && !forced) {
                 const kmx_cell *before = kmx_grid_cell_const(&render->previous, row, col);
                 if (before && kmx_cell_equal(before, cell)) continue;
             }
@@ -168,18 +184,36 @@ kmx_render_frame(kmx_render *render, const kmx_grid *grid, kmx_buffer *out) {
                 cursor_row = row;
                 cursor_col = col;
             }
-            result = append_style(out, cell);
-            if (result != KMX_OK) break;
+            /* Cursor moves do not change SGR. Reuse a style within this
+             * frame, including across untouched cells and row boundaries.
+             * Each frame still establishes its first style independently. */
+            if (!style || !same_style(style, cell)) {
+                result = append_style(out, cell);
+                if (result != KMX_OK) break;
+                style = cell;
+            }
             if (!cell->chars[0]) {
                 result = kmx_buffer_append(out, " ", 1);
             } else {
                 size_t index;
                 for (index = 0; index < KMX_MAX_CHARS && cell->chars[index] &&
                      result == KMX_OK; index++) {
+                    if (cell->chars[index] >= 0x80u) unicode = true;
                     result = append_utf8(out, cell->chars[index]);
                 }
             }
-            cursor_col += cell->width ? cell->width : 1;
+            if (unicode || cell->width != 1) {
+                /* Overwriting a wide character's tail leaves its head in the
+                 * model with width 1, although printing that codepoint still
+                 * advances the local terminal by 2. Reposition before the
+                 * next write and restore the adjacent cell even when its
+                 * value did not change: the glyph may just have erased it.
+                 * This also avoids guessing widths for combining sequences. */
+                cursor_col = -1;
+                repaint_next = cell->width == 1;
+            } else {
+                cursor_col += cell->width ? cell->width : 1;
+            }
         }
     }
     if (result == KMX_OK) result = append_text(out, "\033[0m");

@@ -304,6 +304,76 @@ test_resize(void) {
     harness_free(&h);
 }
 
+static void
+test_terminal_cursor_visibility(void) {
+    harness h;
+    harness_init(&h, 12, 60);
+    harness_step(&h, "prompt\033[?25l");
+    CHECK(!h.current.cursor_visible && !h.received.cursor_visible);
+    harness_step(&h, "\033[3;5Hworking");
+    CHECK(!h.received.cursor_visible);
+    CHECK(kmx_term_resize(h.term, 20, 80) == KMX_OK);
+    harness_step(&h, "");
+    CHECK(!h.received.cursor_visible);
+    /* A visibility-only transition must reach the receiver too. */
+    harness_step(&h, "\033[?25h");
+    CHECK(h.received.cursor_visible);
+    harness_free(&h);
+}
+
+static void
+test_terminal_alternate_screen_restores_primary(void) {
+    harness h;
+    kmx_grid primary = {0};
+    harness_init(&h, 12, 60);
+    harness_step(&h, "\033[31mPRIMARY prompt\033[0m\033[4;7H");
+    CHECK(kmx_grid_copy(&primary, &h.current) == KMX_OK);
+    /* Split a mode sequence as a real PTY read may do. */
+    harness_step(&h, "\033[?104");
+    harness_step(&h, "9h\033[HEDITOR\033[?25l");
+    CHECK(kmx_grid_cell(&h.received, 0, 0)->chars[0] == 'E');
+    CHECK(!h.received.cursor_visible);
+    harness_step(&h, "\033[?25h\033[?1049l");
+    CHECK(kmx_grid_equal(&primary, &h.received));
+    /* Repeated editor visits must not gradually damage the normal screen. */
+    harness_step(&h, "\033[?1049h\033[HSECOND\033[?1049l");
+    CHECK(kmx_grid_equal(&primary, &h.received));
+    kmx_grid_free(&primary);
+    harness_free(&h);
+}
+
+static void
+collect_terminal_reply(const void *data, size_t size, void *user) {
+    CHECK(kmx_buffer_append(user, data, size) == KMX_OK);
+}
+
+static void
+test_terminal_query_replies(void) {
+    kmx_term *term = NULL;
+    kmx_buffer replies;
+    const char query[] = "\033[5;9H\033[6n";
+    const char expected[] = "\033[5;9R";
+    kmx_buffer_init(&replies);
+    CHECK(kmx_term_create(&term, 12, 60) == KMX_OK);
+    /* Observers discard historical queries instead of accumulating replies. */
+    for (int n = 0; n < 1000; n++) {
+        CHECK(kmx_term_feed(term, query, sizeof query - 1) == KMX_OK);
+    }
+    kmx_term_set_output_callback(term, collect_terminal_reply, &replies);
+    CHECK(replies.size == 0);
+    for (size_t n = 0; n < sizeof query - 1; n++) {
+        CHECK(kmx_term_feed(term, query + n, 1) == KMX_OK);
+    }
+    CHECK(replies.size == sizeof expected - 1);
+    CHECK(memcmp(replies.data, expected, replies.size) == 0);
+    kmx_buffer_reset(&replies);
+    kmx_term_set_output_callback(term, NULL, NULL);
+    CHECK(kmx_term_feed(term, query, sizeof query - 1) == KMX_OK);
+    CHECK(replies.size == 0);
+    kmx_term_free(term);
+    kmx_buffer_free(&replies);
+}
+
 /* Graphics escapes are captured whole, in order, and interleaved correctly
  * with the text around them. */
 static void
@@ -760,7 +830,8 @@ cells_look_the_same(const kmx_cell *a, const kmx_cell *b) {
     if (memcmp(a->chars + 1, b->chars + 1, sizeof a->chars - sizeof a->chars[0]) != 0) {
         return false;
     }
-    if (a->attrs != b->attrs || a->width != b->width) return false;
+    if (a->attrs != b->attrs || a->width != b->width ||
+        a->underline != b->underline) return false;
     if (memcmp(&a->fg, &b->fg, sizeof a->fg) != 0) return false;
     return memcmp(&a->bg, &b->bg, sizeof a->bg) == 0;
 }
@@ -785,9 +856,10 @@ test_render_reproduces_the_grid(void) {
     reset_random();
     for (step = 0; step < 40; step++) {
         char text[64];
-        snprintf(text, sizeof text, "\033[%u;%uH\033[3%um%c%c%c",
+        snprintf(text, sizeof text, "\033[%u;%uH\033[3%um\033[4:%um%c%c%c",
                  next_random() % 12 + 1, next_random() % 38 + 1,
                  next_random() % 8,
+                 next_random() % 4,
                  (char)('A' + next_random() % 26),
                  (char)('a' + next_random() % 26),
                  (char)('0' + next_random() % 10));
@@ -813,6 +885,65 @@ test_render_reproduces_the_grid(void) {
             }
         }
     }
+    kmx_grid_free(&drawn);
+    kmx_term_free(replica);
+    kmx_render_free(render);
+    harness_free(&h);
+}
+
+
+static void
+test_render_wide_tail_overwrites_and_combining(void) {
+    const char *steps[] = {
+        "\033[H\xe4\xb8\xad" "ab e\xcc\x81",
+        /* The head remains U+4E2D, but its tail is now a normal 'a' cell. */
+        "\033[1;2Hab",
+        /* Restore the same neighbour after repainting the clipped head.
+         * Only the head's colour changes, so a diff normally skips 'a'. */
+        "\033[H\033[31m\xe4\xb8\xad\033[0m\033[1;2Ha",
+        "\033[2;1He\xcc\x81Z\xe4\xb8\xadq",
+        "\033[2;4HR",
+        "\033[2;3H\033[4:3m\xe4\xb8\xad\033[0m\033[2;4HR",
+        /* Repeat at the bottom right, where an unintended wrap would scroll. */
+        "\033[3;9H\xe4\xb8\xad",
+        "\033[3;10Hx",
+        "\033[3;9H\033[32m\xe4\xb8\xad\033[0m\033[3;10Hx",
+    };
+    harness h;
+    kmx_render *render = NULL;
+    kmx_term *replica = NULL;
+    kmx_grid drawn = {0};
+    kmx_buffer painted;
+    harness_init(&h, 3, 10);
+    CHECK(kmx_render_create(&render) == KMX_OK);
+    CHECK(kmx_term_create(&replica, 3, 10) == KMX_OK);
+    kmx_buffer_init(&painted);
+    for (size_t step = 0; step < sizeof steps / sizeof steps[0]; step++) {
+        harness_step(&h, steps[step]);
+        if (step == 1 || step == 2) {
+            CHECK(kmx_grid_cell(&h.current, 0, 0)->chars[0] == 0x4e2du);
+            CHECK(kmx_grid_cell(&h.current, 0, 0)->width == 1);
+            CHECK(kmx_grid_cell(&h.current, 0, 1)->chars[0] == 'a');
+        }
+        /* Check both a full repaint of a clipped head and incremental diffs. */
+        for (int pass = 0; pass < 2; pass++) {
+            if (pass) kmx_render_invalidate(render);
+            kmx_buffer_reset(&painted);
+            CHECK(kmx_render_frame(render, &h.current, &painted) == KMX_OK);
+            CHECK(kmx_term_feed(replica, painted.data, painted.size) == KMX_OK);
+            CHECK(kmx_term_snapshot(replica, &drawn) == KMX_OK);
+            for (int row = 0; row < h.current.rows; row++) {
+                for (int col = 0; col < h.current.cols; col++) {
+                    CHECK(cells_look_the_same(kmx_grid_cell(&h.current, row, col),
+                                             kmx_grid_cell(&drawn, row, col)));
+                }
+            }
+            CHECK(h.current.cursor_row == drawn.cursor_row);
+            CHECK(h.current.cursor_col == drawn.cursor_col);
+            CHECK(h.current.cursor_visible == drawn.cursor_visible);
+        }
+    }
+    kmx_buffer_free(&painted);
     kmx_grid_free(&drawn);
     kmx_term_free(replica);
     kmx_render_free(render);
@@ -1973,6 +2104,9 @@ main(void) {
     RUN(test_small_change_is_a_small_message);
     RUN(test_term_rejects_dimensions_libvterm_would_misindex);
     RUN(test_resize);
+    RUN(test_terminal_cursor_visibility);
+    RUN(test_terminal_alternate_screen_restores_primary);
+    RUN(test_terminal_query_replies);
     RUN(test_graphics_captured_in_wire_order);
     RUN(test_graphics_split_across_feeds);
     RUN(test_decoder_rejects_malformed_input);
@@ -1988,6 +2122,7 @@ main(void) {
     RUN(test_framer_rejects_absurd_lengths);
     RUN(test_fragmented_frame_receipt_clock);
     RUN(test_render_reproduces_the_grid);
+    RUN(test_render_wide_tail_overwrites_and_combining);
     RUN(test_predictor_echoes_and_withdraws);
     RUN(test_layout_arrange_fills_the_screen);
     RUN(test_layout_roundtrip);

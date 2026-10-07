@@ -138,6 +138,13 @@ kmx_result kmx_term_create(kmx_term **out, int rows, int cols);
 void kmx_term_free(kmx_term *term);
 kmx_result kmx_term_feed(kmx_term *term, const void *data, size_t size);
 kmx_result kmx_term_resize(kmx_term *term, int rows, int cols);
+/* Replies to terminal queries (for example DSR) belong to the PTY owner.
+ * The callback runs synchronously during feed/resize and must not block.
+ * NULL discards replies; observers must leave it unset so replay cannot
+ * inject duplicate replies into a live application's input. */
+typedef void kmx_term_output_callback(const void *data, size_t size, void *user);
+void kmx_term_set_output_callback(
+    kmx_term *term, kmx_term_output_callback *callback, void *user);
 /* Copy the current screen into `grid`, resizing it if needed. */
 kmx_result kmx_term_snapshot(kmx_term *term, kmx_grid *grid);
 size_t kmx_term_graphics_count(const kmx_term *term);
@@ -155,6 +162,15 @@ void kmx_term_graphics_clear(kmx_term *term);
 kmx_result kmx_cells_encode(
     const kmx_grid *previous,
     const kmx_grid *current,
+    kmx_buffer *out
+);
+/* Also emit rows selected by `include_rows`, even when they match `previous`.
+ * A non-NULL mask has current->rows entries. NULL preserves the ordinary diff.
+ * This uses the existing row-replacement wire format, so old decoders work. */
+kmx_result kmx_cells_encode_rows(
+    const kmx_grid *previous,
+    const kmx_grid *current,
+    const bool *include_rows,
     kmx_buffer *out
 );
 
@@ -231,9 +247,10 @@ kmx_result kmx_sync_poll(
     kmx_sync_info *info
 );
 
-/* Acknowledge everything up to and including `sequence`.  Until an ack
- * arrives the sender keeps diffing against the last acknowledged state, so a
- * lost message is superseded by the next one rather than retransmitted. */
+/* Acknowledge everything up to and including `sequence`. A retained earlier
+ * state may be used when this sequence has been evicted. Cumulative row repair
+ * makes later messages safe over intermediate states on an ordered stream;
+ * a skipped message is superseded rather than replayed as historical output. */
 kmx_result kmx_sync_ack(kmx_sync *sync, uint64_t sequence);
 
 /* The same, with the arrival time, which is what makes the round trip
@@ -251,7 +268,9 @@ void kmx_sync_set_interval(kmx_sync *sync, unsigned millis);
  * Unless the interval has been pinned, this drives it: there is no point
  * producing messages faster than the far end can acknowledge them, and on a
  * slow link that only builds a backlog of screens that are already stale.  The
- * interval follows the smoothed round trip, clamped to the bounds above. */
+ * repaint interval follows the smoothed round trip, clamped to the bounds
+ * above. Unchanged-state retries wait two measured round trips (one second
+ * before the first sample) unless pinned. */
 unsigned kmx_sync_rtt_millis(const kmx_sync *sync);
 unsigned kmx_sync_interval_millis(const kmx_sync *sync);
 
@@ -299,7 +318,8 @@ typedef enum {
     KMX_MSG_FRAME = 10,  /* server -> client: the motion plane             */
     KMX_MSG_AUDIO = 11,  /* server -> client: the audio plane              */
     KMX_MSG_AUDIO_CAPS = 12, /* post-HELLO offer and explicit audio selection */
-    KMX_MSG_AUDIO_PROFILE = 13 /* optional epoch profile, before AUDIO_CAPS */
+    KMX_MSG_AUDIO_PROFILE = 13, /* optional epoch profile, before AUDIO_CAPS */
+    KMX_MSG_TERMINAL_MODES = 14 /* optional focused-pane input modes */
 } kmx_message_type;
 
 /* The largest single message accepted from a peer.  A length prefix is an
