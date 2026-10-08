@@ -86,6 +86,9 @@ gets C0 on both sides. Legacy PCM peers keep PCM. Each endpoint prewarms at
 most two fixed native contexts before accepting audio, so profile selection
 does not run model loading or inference inside the connection event loop.
 
+The server reports a precise per-profile first-publication counter boundary and
+quiescent final totals; see [EnCodec publication counters](docs/encodec-counters.md).
+
 The optional post-HELLO `AUDIO_PROFILE` message (type13) is exactly12 bytes:
 `KEP1`, kind (0 offer,1 selection), three reserved zero bytes, then a big-endian
 uint32 value. Offers use capability bits0=C0 and1=C5-R4; C0 is required and

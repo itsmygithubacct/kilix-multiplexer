@@ -59,6 +59,43 @@ parse_dimension(const char *text, int *out) {
     return 0;
 }
 
+/* One codec instance per profile per server process. Logs deliberately keep
+ * lifetime totals as well as the publication boundary; no counter is reset. */
+static bool report_encodec_start(const kmx_encodec *codec, unsigned profile) {
+    kmx_encodec_boundary boundary;
+    if (!kmx_encodec_stream_boundary(codec, &boundary)) return false;
+    kmx_encodec_stats stats = boundary.before;
+    fprintf(stderr, "KMX_ENCODEC_PHASE v=1 event=start profile=%s instance=1 at_ns=%llu pts_ms=%llu epoch=%llu flags=%u calls=%llu inference_ns=%llu input_drops=%llu output_drops=%llu discontinuities=%llu\n",
+        profile ? "C5-R4" : "C0", (unsigned long long)boundary.monotonic_ns,
+        (unsigned long long)boundary.pts_ms, (unsigned long long)boundary.epoch, boundary.flags,
+        (unsigned long long)stats.calls, (unsigned long long)stats.inference_ns,
+        (unsigned long long)stats.input_drops, (unsigned long long)stats.output_drops,
+        (unsigned long long)stats.discontinuities);
+    fflush(stderr);
+    return true;
+}
+
+static kmx_encodec_stats finish_encodec_profile(kmx_encodec *codec, unsigned profile,
+    size_t client_drops, bool *start_reported) {
+    /* Quiescence precedes EVERY final read, including in-flight inference. */
+    kmx_encodec_stop(codec);
+    if (!*start_reported) *start_reported = report_encodec_start(codec, profile);
+    kmx_encodec_stats stats = kmx_encodec_statistics(codec);
+    struct timespec ended;
+    uint64_t ended_ns = clock_gettime(CLOCK_MONOTONIC, &ended) ? 0 :
+        (uint64_t)ended.tv_sec * UINT64_C(1000000000) + (uint64_t)ended.tv_nsec;
+    fprintf(stderr, "KMX_ENCODEC_PHASE v=1 event=end profile=%s instance=1 at_ns=%llu started=%u calls=%llu inference_ns=%llu input_drops=%llu output_drops=%llu discontinuities=%llu client_drops=%zu\n",
+        profile ? "C5-R4" : "C0", (unsigned long long)ended_ns, *start_reported ? 1u : 0u,
+        (unsigned long long)stats.calls, (unsigned long long)stats.inference_ns,
+        (unsigned long long)stats.input_drops, (unsigned long long)stats.output_drops,
+        (unsigned long long)stats.discontinuities, client_drops);
+    fprintf(stderr, "kmx-serve: encodec_profile calls=%llu rtf=%.6f input_drops=%llu output_drops=%llu discontinuities=%llu client_drops=%zu profile=%s\n",
+        (unsigned long long)stats.calls, stats.calls ? (double)stats.inference_ns / ((double)stats.calls * 40000000.0) : 0.0,
+        (unsigned long long)stats.input_drops, (unsigned long long)stats.output_drops,
+        (unsigned long long)stats.discontinuities, client_drops, profile ? "C5-R4" : "C0");
+    return stats;
+}
+
 static bool
 dimensions_ok(int rows, int cols) {
     if (rows < 1 || cols < 1) return false;
@@ -720,6 +757,7 @@ main(int argc, char **argv) {
     unsigned char *audio_codec_block = NULL;
     size_t audio_codec_filled = 0;
     size_t encodec_client_drops[2] = {0, 0};
+    bool encodec_start_reported[2] = {false, false};
     int exit_code = 0;
     char *const *single = NULL;
     size_t command_count = 0;
@@ -1850,6 +1888,8 @@ main(int argc, char **argv) {
         for (unsigned profile = 0; profile < 2; profile++) if (audio_codecs[profile]) {
             kmx_encodec_output output;
             while (kmx_encodec_receive(audio_codecs[profile], &output)) {
+                if (!encodec_start_reported[profile])
+                    encodec_start_reported[profile] = report_encodec_start(audio_codecs[profile], profile);
                 for (which = 0; which < KMX_MAX_CLIENTS; which++) {
                     client *item = &clients[which];
                     size_t framed = output.size + (output.size + 1u >= 128u ? 3u : 2u);
@@ -2145,14 +2185,11 @@ main(int argc, char **argv) {
     bool had_audio_codec = audio_codecs[0] != NULL;
     kmx_encodec_stats audio_total = {0};
     for (unsigned profile = 0; profile < 2; profile++) if (audio_codecs[profile]) {
-        kmx_encodec_stats stats = kmx_encodec_statistics(audio_codecs[profile]);
+        kmx_encodec_stats stats = finish_encodec_profile(audio_codecs[profile], profile,
+            encodec_client_drops[profile], &encodec_start_reported[profile]);
         audio_total.calls += stats.calls; audio_total.inference_ns += stats.inference_ns;
         audio_total.input_drops += stats.input_drops; audio_total.output_drops += stats.output_drops;
         audio_total.discontinuities += stats.discontinuities;
-        fprintf(stderr, "kmx-serve: encodec_profile calls=%llu rtf=%.6f input_drops=%llu output_drops=%llu discontinuities=%llu client_drops=%zu profile=%s\n",
-            (unsigned long long)stats.calls, stats.calls ? (double)stats.inference_ns / ((double)stats.calls * 40000000.0) : 0.0,
-            (unsigned long long)stats.input_drops, (unsigned long long)stats.output_drops,
-            (unsigned long long)stats.discontinuities, encodec_client_drops[profile], profile ? "C5-R4" : "C0");
         kmx_encodec_close(audio_codecs[profile]);
     }
     if (had_audio_codec) fprintf(stderr, "kmx-serve: encodec calls=%llu rtf=%.6f input_drops=%llu output_drops=%llu discontinuities=%llu client_drops=%zu\n",

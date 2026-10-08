@@ -53,6 +53,8 @@ TLS_WAIT_ATTACH := $(BUILD_DIR)/kmx-attach-tls-write-wait
 FLOOD := $(BUILD_DIR)/flood-input
 INPUT_TEST := $(BUILD_DIR)/test-input-transform
 ENCODEC_TEST := $(BUILD_DIR)/test-encodec
+BOUNDARY_TEST := $(BUILD_DIR)/test-encodec-boundary
+PHASE_LOG_TEST := $(BUILD_DIR)/test-encodec-phase-log
 
 .PHONY: all clean test test-input test-coding sanitize fuzz backpressure churn check-vendor install
 
@@ -162,6 +164,19 @@ churn:
 
 $(ENCODEC_TEST): tests/test_encodec.c tools/kmx_read_clock.h $(BUILD_DIR)/kmx_encodec.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Itools $(LDFLAGS) -o "$@" tests/test_encodec.c $(BUILD_DIR)/kmx_encodec.o $(CODEC_LIBS) -lm
+
+# Real worker/ring/counter code; native calls use a deterministic ABI double.
+# No installed admission, graphs, capture devices or model licence paths.
+$(BOUNDARY_TEST): tests/test_encodec_boundary.c tests/encodec_double.c tests/encodec_double.h tools/kmx_encodec.c tools/kmx_encodec.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(ENCODEC_CFLAGS) -DKMX_HAVE_ENCODEC=1 -Itools $(LDFLAGS) -o "$@" tests/test_encodec_boundary.c tests/encodec_double.c -lsamplerate -pthread -lm
+
+.PHONY: test-boundary
+$(PHASE_LOG_TEST): tests/test_encodec_phase_log.c tests/encodec_double.c tests/encodec_double.h tools/kmx_serve.c tools/kmx_encodec.c $(BUILD_DIR)/kmx_pixel.o $(BUILD_DIR)/kmx_tap.o $(BUILD_DIR)/kmx_tls.o $(STATIC_LIB)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(ENCODEC_CFLAGS) -DKMX_HAVE_ENCODEC=1 -Itools $(LDFLAGS) -o "$@" tests/test_encodec_phase_log.c tests/encodec_double.c tools/kmx_encodec.c $(BUILD_DIR)/kmx_pixel.o $(BUILD_DIR)/kmx_tap.o $(BUILD_DIR)/kmx_tls.o $(STATIC_LIB) $(LDLIBS) -lsamplerate -pthread -lutil -lssl -lcrypto
+
+test-boundary: $(BOUNDARY_TEST) $(PHASE_LOG_TEST)
+	"$(BOUNDARY_TEST)"
+	"$(PHASE_LOG_TEST)"
 
 # Explicit local graph input is required to run this scheduling regression.
 $(BUILD_DIR)/test-encodec-age: tests/test_encodec_age.c $(BUILD_DIR)/kmx_encodec.o

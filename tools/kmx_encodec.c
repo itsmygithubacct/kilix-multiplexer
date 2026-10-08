@@ -140,7 +140,10 @@ struct kmx_encodec {
     atomic_bool stop;
     atomic_uint_fast64_t in_head, in_tail, out_head, out_tail;
     atomic_uint_fast64_t generation, broken_until;
-    atomic_uint_fast64_t calls, inference_ns, input_drops, output_drops, discontinuities;
+    pthread_mutex_t statistics_lock;
+    kmx_encodec_stats statistics;
+    kmx_encodec_boundary boundary;
+    bool stream_started, worker_running;
     codec_input input[SLOTS];
     codec_output output[SLOTS];
 };
@@ -151,6 +154,29 @@ static uint64_t nanoseconds(void) {
     return (uint64_t)now.tv_sec * UINT64_C(1000000000) + (uint64_t)now.tv_nsec;
 }
 static uint64_t milliseconds(void) { return nanoseconds() / UINT64_C(1000000); }
+/* Accounting commits define ordering relative to the first publication. No
+ * resampling, native call, poll, or I/O runs while this mutex is held. */
+static void note_input_drop(kmx_encodec *codec) {
+    pthread_mutex_lock(&codec->statistics_lock);
+    codec->statistics.input_drops++;
+    pthread_mutex_unlock(&codec->statistics_lock);
+}
+static void note_output_drop(kmx_encodec *codec) {
+    pthread_mutex_lock(&codec->statistics_lock);
+    codec->statistics.output_drops++;
+    pthread_mutex_unlock(&codec->statistics_lock);
+}
+static void note_discontinuity(kmx_encodec *codec) {
+    pthread_mutex_lock(&codec->statistics_lock);
+    codec->statistics.discontinuities++;
+    pthread_mutex_unlock(&codec->statistics_lock);
+}
+static void note_inference(kmx_encodec *codec, uint64_t elapsed_ns) {
+    pthread_mutex_lock(&codec->statistics_lock);
+    codec->statistics.inference_ns += elapsed_ns;
+    codec->statistics.calls++;
+    pthread_mutex_unlock(&codec->statistics_lock);
+}
 static void notify(int fd) {
     uint64_t value = 1;
     ssize_t result;
@@ -176,12 +202,20 @@ static void break_epoch(kmx_encodec *codec, uint64_t pts_ms) {
 static bool publish(kmx_encodec *codec, const kmx_encodec_output *output, uint64_t generation) {
     uint64_t head = atomic_load_explicit(&codec->out_head, memory_order_relaxed);
     if (head - atomic_load_explicit(&codec->out_tail, memory_order_acquire) >= SLOTS) {
-        atomic_fetch_add(&codec->output_drops, 1);
+        note_output_drop(codec);
         if (codec->encode) break_epoch(codec, output->pts_ms);
         return false;
     }
     codec->output[head % SLOTS] = (codec_output){.value = *output, .generation = generation};
+    pthread_mutex_lock(&codec->statistics_lock);
+    if (codec->encode && !codec->stream_started) {
+        codec->boundary = (kmx_encodec_boundary){.monotonic_ns = nanoseconds(),
+            .pts_ms = output->pts_ms, .epoch = output->epoch,
+            .flags = output->flags, .before = codec->statistics};
+        codec->stream_started = true;
+    }
     atomic_store_explicit(&codec->out_head, head + 1, memory_order_release);
+    pthread_mutex_unlock(&codec->statistics_lock);
     notify(codec->output_event);
     return true;
 }
@@ -252,14 +286,14 @@ static void *worker(void *opaque) {
         input = codec->input[tail % SLOTS];
         atomic_store_explicit(&codec->in_tail, tail + 1, memory_order_release);
         if (input.generation != generation) {
-            atomic_fetch_add(&codec->input_drops, 1); continue;
+            note_input_drop(codec); continue;
         }
         if (codec->encode) {
             float converted[CAPTURE_MAX_FRAMES];
             long frames, at;
             uint64_t boundary = atomic_load(&codec->broken_until);
             if (input.pts_ms < boundary || milliseconds() - input.offered_ms > KMX_ENCODEC_STALE_MS) {
-                atomic_fetch_add(&codec->input_drops, 1);
+                note_input_drop(codec);
                 if (input.pts_ms >= boundary) break_epoch(codec, input.pts_ms);
                 started = false; used = 0;
                 continue;
@@ -267,20 +301,20 @@ static void *worker(void *opaque) {
             if (!started || input.pts_ms != next_capture) {
                 if (input.pts_ms % 1000u) {
                     break_epoch(codec, input.pts_ms);
-                    atomic_fetch_add(&codec->input_drops, 1);
+                    note_input_drop(codec);
                     started = false; used = 0;
                     continue;
                 }
                 if (codec->resampler) src_reset(codec->resampler);
                 kenc_encoder_reset(codec->encoder);
-                atomic_fetch_add(&codec->discontinuities, 1);
+                note_discontinuity(codec);
                 next_pts = input.pts_ms; used = 0; started = true;
             }
             next_capture = input.pts_ms + 40;
             frames = resample(codec, &input, converted);
             if (frames < 0) {
                 break_epoch(codec, input.pts_ms); started = false; used = 0;
-                atomic_fetch_add(&codec->input_drops, 1); continue;
+                note_input_drop(codec); continue;
             }
             for (at = 0; at < frames; at++) {
                 float value = converted[at] * 32768.0f;
@@ -295,13 +329,12 @@ static void *worker(void *opaque) {
                     uint64_t began = nanoseconds();
                     kenc_result result = kenc_encoder_push_s16(codec->encoder, accumulated, used, next_pts,
                         output.packet, sizeof output.packet, &output.size);
-                    atomic_fetch_add(&codec->inference_ns, nanoseconds() - began);
-                    atomic_fetch_add(&codec->calls, 1);
+                    note_inference(codec, nanoseconds() - began);
                     used = 0;
                     if (result != KENC_OK || milliseconds() - accumulated_offered_ms > KMX_ENCODEC_STALE_MS ||
                         kenc_packet_metadata_read(&metadata, output.packet, output.size, &codec->options) != KENC_OK) {
                         break_epoch(codec, input.pts_ms); started = false;
-                        atomic_fetch_add(&codec->output_drops, 1); break;
+                        note_output_drop(codec); break;
                     }
                     output.pts_ms = metadata.packet.pts_ms; output.flags = metadata.packet.flags;
                     output.epoch = metadata.epoch; output.created_ms = accumulated_offered_ms;
@@ -318,21 +351,20 @@ static void *worker(void *opaque) {
             kenc_result result;
             if (milliseconds() - input.offered_ms > KMX_ENCODEC_STALE_MS ||
                 kenc_packet_metadata_read(&metadata, input.bytes, input.size, &codec->options) != KENC_OK) {
-                waiting = true; atomic_fetch_add(&codec->input_drops, 1); continue;
+                waiting = true; note_input_drop(codec); continue;
             }
             if (waiting && !(metadata.packet.flags & KENC_PACKET_FLAG_RESET)) {
-                atomic_fetch_add(&codec->input_drops, 1); continue;
+                note_input_drop(codec); continue;
             }
             began = nanoseconds();
             result = kenc_decoder_pull_s16(codec->decoder, input.bytes, input.size,
                 output.pcm, KMX_ENCODEC_SAMPLES, &samples, &info);
-            atomic_fetch_add(&codec->inference_ns, nanoseconds() - began);
-            atomic_fetch_add(&codec->calls, 1);
-            if (result != KENC_OK) { waiting = true; atomic_fetch_add(&codec->input_drops, 1); continue; }
+            note_inference(codec, nanoseconds() - began);
+            if (result != KENC_OK) { waiting = true; note_input_drop(codec); continue; }
             waiting = false;
-            if (info.flags & KENC_PACKET_FLAG_DISCONTINUITY) atomic_fetch_add(&codec->discontinuities, 1);
+            if (info.flags & KENC_PACKET_FLAG_DISCONTINUITY) note_discontinuity(codec);
             if (milliseconds() - input.offered_ms > KMX_ENCODEC_STALE_MS) {
-                waiting = true; atomic_fetch_add(&codec->output_drops, 1); continue;
+                waiting = true; note_output_drop(codec); continue;
             }
             output.size = samples * 2u; output.pts_ms = info.pts_ms;
             output.flags = info.flags; output.epoch = metadata.epoch; output.created_ms = input.offered_ms;
@@ -362,13 +394,11 @@ kmx_encodec *kmx_encodec_open_profile(bool encode, unsigned bitrate, int capture
          capture_channels < 1 || capture_channels > 8))) return NULL;
     codec = calloc(1, sizeof *codec);
     if (!codec) return NULL;
+    if (pthread_mutex_init(&codec->statistics_lock, NULL)) { free(codec); return NULL; }
     atomic_init(&codec->stop, false);
     atomic_init(&codec->in_head, 0); atomic_init(&codec->in_tail, 0);
     atomic_init(&codec->out_head, 0); atomic_init(&codec->out_tail, 0);
     atomic_init(&codec->generation, 0); atomic_init(&codec->broken_until, 0);
-    atomic_init(&codec->calls, 0); atomic_init(&codec->inference_ns, 0);
-    atomic_init(&codec->input_drops, 0); atomic_init(&codec->output_drops, 0);
-    atomic_init(&codec->discontinuities, 0);
     codec->input_event = codec->output_event = -1;
     codec->encode = encode; codec->rate = capture_rate; codec->channels = capture_channels;
     codec->options = kenc_options_default(); codec->options.threads = (uint8_t)threads;
@@ -406,6 +436,7 @@ kmx_encodec *kmx_encodec_open_profile(bool encode, unsigned bitrate, int capture
     codec->input_event = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     codec->output_event = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     if (codec->input_event < 0 || codec->output_event < 0 || pthread_create(&codec->thread, NULL, worker, codec)) goto fail;
+    codec->worker_running = true;
     return codec;
 fail:
     kenc_installed_assets_free(assets); kenc_model_free(model);
@@ -415,18 +446,29 @@ fail:
         if (codec->resampler) src_delete(codec->resampler);
         if (codec->input_event >= 0) close(codec->input_event);
         if (codec->output_event >= 0) close(codec->output_event);
+        pthread_mutex_destroy(&codec->statistics_lock);
         free(codec);
     }
     return NULL;
 }
 
-void kmx_encodec_close(kmx_encodec *codec) {
+void kmx_encodec_stop(kmx_encodec *codec) {
     if (!codec) return;
     atomic_store(&codec->stop, true); notify(codec->input_event);
-    pthread_join(codec->thread, NULL);
+    if (codec->worker_running) {
+        pthread_join(codec->thread, NULL);
+        codec->worker_running = false;
+    }
+}
+
+void kmx_encodec_close(kmx_encodec *codec) {
+    if (!codec) return;
+    kmx_encodec_stop(codec);
     kenc_encoder_free(codec->encoder); kenc_decoder_free(codec->decoder);
     if (codec->resampler) src_delete(codec->resampler);
-    close(codec->input_event); close(codec->output_event); free(codec);
+    close(codec->input_event); close(codec->output_event);
+    pthread_mutex_destroy(&codec->statistics_lock);
+    free(codec);
 }
 
 int kmx_encodec_event_fd(const kmx_encodec *codec) { return codec ? codec->output_event : -1; }
@@ -435,10 +477,10 @@ static bool offer(kmx_encodec *codec, const void *bytes, size_t size, uint64_t p
     uint64_t head = atomic_load_explicit(&codec->in_head, memory_order_relaxed);
     codec_input *input;
     if (codec->encode && pts_ms < atomic_load(&codec->broken_until)) {
-        atomic_fetch_add(&codec->input_drops, 1); return false;
+        note_input_drop(codec); return false;
     }
     if (head - atomic_load_explicit(&codec->in_tail, memory_order_acquire) >= SLOTS) {
-        atomic_fetch_add(&codec->input_drops, 1);
+        note_input_drop(codec);
         if (codec->encode) break_epoch(codec, pts_ms);
         return false;
     }
@@ -481,10 +523,10 @@ bool kmx_encodec_receive(kmx_encodec *codec, kmx_encodec_output *output) {
         notify(codec->input_event);
         if (current.generation != generation_now(codec) ||
             (codec->encode && current.value.pts_ms < atomic_load(&codec->broken_until))) {
-            atomic_fetch_add(&codec->output_drops, 1); continue;
+            note_output_drop(codec); continue;
         }
         if (milliseconds() - current.value.created_ms > KMX_ENCODEC_STALE_MS) {
-            atomic_fetch_add(&codec->output_drops, 1);
+            note_output_drop(codec);
             if (codec->encode) break_epoch(codec, current.value.pts_ms);
             continue;
         }
@@ -500,8 +542,18 @@ void kmx_encodec_restart(kmx_encodec *codec) {
 
 kmx_encodec_stats kmx_encodec_statistics(const kmx_encodec *codec) {
     if (!codec) return (kmx_encodec_stats){0};
-    return (kmx_encodec_stats){atomic_load(&codec->calls), atomic_load(&codec->inference_ns),
-        atomic_load(&codec->input_drops), atomic_load(&codec->output_drops), atomic_load(&codec->discontinuities)};
+    pthread_mutex_lock((pthread_mutex_t *)&codec->statistics_lock);
+    kmx_encodec_stats result = codec->statistics;
+    pthread_mutex_unlock((pthread_mutex_t *)&codec->statistics_lock);
+    return result;
+}
+bool kmx_encodec_stream_boundary(const kmx_encodec *codec, kmx_encodec_boundary *boundary) {
+    if (!codec || !boundary || !codec->encode) return false;
+    pthread_mutex_lock((pthread_mutex_t *)&codec->statistics_lock);
+    bool started = codec->stream_started;
+    if (started) *boundary = codec->boundary;
+    pthread_mutex_unlock((pthread_mutex_t *)&codec->statistics_lock);
+    return started;
 }
 #else
 kmx_encodec *kmx_encodec_open_profile(bool encode, unsigned bitrate, int capture_rate,
@@ -511,6 +563,7 @@ kmx_encodec *kmx_encodec_open_profile(bool encode, unsigned bitrate, int capture
     (void)content_root; (void)development_assets; (void)threads; (void)profile; return NULL;
 }
 void kmx_encodec_close(kmx_encodec *codec) { (void)codec; }
+void kmx_encodec_stop(kmx_encodec *codec) { (void)codec; }
 int kmx_encodec_event_fd(const kmx_encodec *codec) { (void)codec; return -1; }
 bool kmx_encodec_offer_pcm(kmx_encodec *codec, const void *pcm, size_t bytes, uint64_t pts_ms) {
     (void)codec; (void)pcm; (void)bytes; (void)pts_ms; return false;
@@ -525,6 +578,9 @@ bool kmx_encodec_offer_packet_at(kmx_encodec *codec, const void *packet, size_t 
 bool kmx_encodec_receive(kmx_encodec *codec, kmx_encodec_output *output) { (void)codec; (void)output; return false; }
 void kmx_encodec_restart(kmx_encodec *codec) { (void)codec; }
 kmx_encodec_stats kmx_encodec_statistics(const kmx_encodec *codec) { (void)codec; return (kmx_encodec_stats){0}; }
+bool kmx_encodec_stream_boundary(const kmx_encodec *codec, kmx_encodec_boundary *boundary) {
+    (void)codec; (void)boundary; return false;
+}
 #endif
 
 kmx_encodec *kmx_encodec_open_with_threads(bool encode, unsigned bitrate, int capture_rate,

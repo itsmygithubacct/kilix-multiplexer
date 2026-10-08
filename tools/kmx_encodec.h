@@ -55,6 +55,11 @@ typedef struct {
 typedef struct {
     uint64_t calls, inference_ns, input_drops, output_drops, discontinuities;
 } kmx_encodec_stats;
+typedef struct {
+    uint64_t monotonic_ns, pts_ms, epoch;
+    uint8_t flags;
+    kmx_encodec_stats before;
+} kmx_encodec_boundary;
 
 /* All admission, graph creation and warm-up complete before success. The
  * normal path admits fresh installed assets via native's embedded F100 API.
@@ -73,6 +78,9 @@ kmx_encodec *kmx_encodec_open_profile(bool encode, unsigned bitrate, int capture
     int capture_channels, const char *content_root, const char *development_assets,
     unsigned threads, uint32_t profile);
 void kmx_encodec_close(kmx_encodec *codec);
+/* Scheduler teardown: stop and join the worker before its final statistics.
+ * Idempotent; like close/offer/receive, called only by the owning scheduler. */
+void kmx_encodec_stop(kmx_encodec *codec);
 int kmx_encodec_event_fd(const kmx_encodec *codec);
 /* Each encoder offer is exactly 40 ms of interleaved little-endian PCM16.
  * There are exactly two fixed input slots. Offers never wait for inference.
@@ -87,5 +95,11 @@ bool kmx_encodec_receive(kmx_encodec *codec, kmx_encodec_output *output);
 /* A reconnected decoder has no continuity claim about the new connection. */
 void kmx_encodec_restart(kmx_encodec *codec);
 kmx_encodec_stats kmx_encodec_statistics(const kmx_encodec *codec);
+/* Encoder-only, immutable until close. The first packet publication captures
+ * all counters immediately BEFORE releasing the output ring's first entry.
+ * Counter updates and capture use one short mutex, never held for inference.
+ * Later drops, including stale/invalidated delivery of that entry, are after
+ * the boundary. Peer reconnects and idle periods never create a new boundary. */
+bool kmx_encodec_stream_boundary(const kmx_encodec *codec, kmx_encodec_boundary *boundary);
 
 #endif
