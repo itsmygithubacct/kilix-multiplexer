@@ -203,6 +203,7 @@ test-coding: $(SERVE) $(ATTACH) $(TLS_WAIT_ATTACH) $(SHARED_LIB)
 	$(PYTHON) tests/test_synchronized_output.py --server "$(SERVE)" --library "$(SHARED_LIB)"
 	$(PYTHON) tests/test_tls_write_wait.py --attach "$(TLS_WAIT_ATTACH)" --library "$(SHARED_LIB)"
 	$(PYTHON) tests/test_input_resume.py --server "$(SERVE)" --attach "$(ATTACH)" --library "$(SHARED_LIB)"
+	$(PYTHON) tests/test_input_tls_resume.py --server "$(SERVE)" --attach "$(ATTACH)" --library "$(SHARED_LIB)"
 
 TEST_ENVIRONMENT ?=
 

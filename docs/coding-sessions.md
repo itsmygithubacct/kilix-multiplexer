@@ -225,7 +225,12 @@ scrolling, resizes, reconnect resets, and randomized schedules.
 
 `test-input` requires no listener and exercises the actual client journal with
 partial-write and TLS-WANT injection. `test-coding` also runs the input-resume
-socket harness. To check the real retention deadline, run
+socket harness and a TLS reconnect harness with the actual attach and server.
+The TLS fixture uses an owned, certificate-pinned proxy to lose an ACK after
+server acceptance or cut an input frame after five payload-header bytes. It
+checks the resumed watermark, exact child input, replay sequence numbers,
+explicit CLOSE, and terminal cleanup across fresh TLS handshakes.
+To check the real retention deadline, run
 `python3 tests/test_input_resume.py --expiry`; this adds a 60-second wait.
 Restricted environments that deny socket listeners cannot run the transport
 suite; native state tests do not establish end-to-end transport compatibility.

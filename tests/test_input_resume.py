@@ -10,6 +10,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import select
 import shlex
 import socket
@@ -136,10 +137,18 @@ class Peer:
 
 
 class OwnedServer:
-    def __init__(self, binary, folder, panes=1):
+    def __init__(self, binary, folder, panes=1, tls=False):
         self.folder = folder
         self.folder.mkdir()
         self.endpoint = folder / "server.sock"
+        options = []
+        if tls:
+            # Reserve a loopback port briefly; readiness reports bind races
+            # explicitly rather than attaching to a different service.
+            with socket.socket() as reservation:
+                reservation.bind(("127.0.0.1", 0))
+                self.endpoint = f"127.0.0.1:{reservation.getsockname()[1]}"
+            options = ["--tls", "--tls-ephemeral"]
         self.paths = []
         commands = []
         for pane in range(panes):
@@ -149,13 +158,20 @@ class OwnedServer:
             commands += ["--pane", shlex.join(command)] if panes > 1 else ["--", *command]
         self.log = tempfile.TemporaryFile(dir=folder)
         self.process = subprocess.Popen([str(binary), "--socket", str(self.endpoint),
-            "--token", TOKEN.decode(), "--rows", "12", "--cols", "60", *commands], stdout=self.log, stderr=self.log)
+            "--token", TOKEN.decode(), "--rows", "12", "--cols", "60", *options, *commands], stdout=self.log, stderr=self.log)
         self.peers = []
         self.next_connect = 0.0
         try:
             for paths in self.paths:
                 wait_path(paths[2], self.process)
-            wait_path(self.endpoint, self.process)
+            if tls:
+                self.log.seek(0)
+                diagnostic = self.log.read().decode(errors="replace")
+                match = re.search(r"--tls-fingerprint ([0-9a-fA-F]{64})", diagnostic)
+                assert match, f"missing TLS identity: {diagnostic}"
+                self.fingerprint = match[1].lower()
+            else:
+                wait_path(self.endpoint, self.process)
         except BaseException:
             self.log.seek(0)
             diagnostic = self.log.read().decode(errors="replace")
