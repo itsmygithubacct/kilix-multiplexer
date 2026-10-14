@@ -123,8 +123,10 @@ EnCodec inference uses two ORT threads by default. Both programs accept
 `--audio-threads 4` to explicitly allocate four inference threads, including
 the inference caller, for the mono codec. This requires a native EnCodec
 runtime supporting that allocation. Each endpoint selects its own local
-budget; it changes no audio negotiation or wire format. The owned worker has two
-fixed 40 ms input slots and two fixed output slots. Capture conversion also
+budget; it changes no audio negotiation or wire format. The encoder worker has
+a fixed queue for six 40 ms frames to retain timely capture during C5-R4 reset work,
+and two fixed output slots. The decoder retains two input slots and two output
+slots. Capture conversion also
 runs there: 24/44.1/48 kHz interleaved PCM16 with one to eight channels is
 averaged with headroom and resampled to 24 kHz mono, accumulating exactly
 960 samples. Ordinary codec epochs preserve resampler state. Capture gaps
@@ -157,7 +159,20 @@ decoder input backpressure retains a complete packet in the existing bounded
 framer until an input slot is free and temporarily pauses socket reads. It
 resumes from the codec event without requiring another network read. Retained
 packets keep the oldest contributing read's timestamp, so waiting does not
-refresh the 250ms age budget. Codec input/output slots remain two each.
+refresh the 250ms age budget. Decoder input/output slots remain two each.
+
+With the native library, patched ORT, Content assets and licence receipts
+already installed, a short two-client transport regression uses synthetic
+24kHz mono capture and file sinks, without a playback device:
+
+```sh
+python3 -B tests/encodec_transport.py --new-bin /absolute/native-build \
+    --only installed-pair6 --seconds 30 --evidence /absolute/new-test-directory
+```
+
+It requires C5-R4 at 6kbps with the default two inference threads, all 750
+frames at both clients, matching PCM lengths and no codec queue drops. It
+does not replace calibration, long-run, fault or hardware acceptance.
 
 `make test` includes bounded capability/refusal controls. An optional real
 native check is `build-encodec/test-encodec --development-assets /absolute/graphs`.

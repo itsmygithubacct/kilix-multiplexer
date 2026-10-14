@@ -113,8 +113,75 @@ static void in_flight_stop(void) {
     CHECK(kmx_encodec_statistics(codec).calls == 1 && !codec->worker_running, "KILL-FINAL-QUIESCENT");
     kmx_encodec_close(codec);
 }
+
+static void timely_capture_during_reset(void) {
+    unsigned char pcm[1920] = {0};
+    kmx_encodec *codec = opened(1);
+    kmx_encodec_output output;
+    uint64_t began;
+    kenc_double_arm();
+    CHECK(kmx_encodec_offer_pcm(codec, pcm, sizeof pcm, 0), "RESET-OFFER");
+    for (unsigned i = 0; i < 2000 && !kenc_double_entered(); i++) pause_ms(1);
+    CHECK(kenc_double_entered(), "RESET-GATE");
+    began = milliseconds();
+    /* The retained native first reset took 166ms. Hold this ABI call for
+     * 140ms while ordinary 40ms capture continues: every offered frame is
+     * timely, but the old two-slot queue refused the third one at 120ms and
+     * invalidated the entire epoch. The worker/rings/age checks are real. */
+    for (unsigned i = 1; i <= 3; i++) {
+        while (milliseconds() - began < i * 40u) pause_ms(1);
+        CHECK(kmx_encodec_offer_pcm(codec, pcm, sizeof pcm, i * 40u), "RESET-TIMELY-CAPTURE");
+    }
+    while (milliseconds() - began < 140u) pause_ms(1);
+    kenc_double_release();
+    for (unsigned i = 0; i <= 3; i++) {
+        if (!kmx_encodec_receive(codec, &output)) {
+            await_output(codec);
+            CHECK(kmx_encodec_receive(codec, &output), "RESET-TIMELY-OUTPUT");
+        }
+        CHECK(output.pts_ms == i * 40u && output.flags == (i ? 0u : 13u), "RESET-ORDER");
+    }
+    kmx_encodec_stats stats = kmx_encodec_statistics(codec);
+    CHECK(stats.calls == 4 && stats.input_drops == 0 && stats.output_drops == 0 &&
+          stats.discontinuities == 1, "RESET-NO-DROPS");
+    kmx_encodec_close(codec);
+}
+
+static void queued_capture_at_counter_wrap(void) {
+    unsigned char pcm[1920] = {0};
+    kmx_encodec *codec = opened(1);
+    kmx_encodec_output output;
+    /* Seed the empty ring while its worker is stopped, then exercise the
+     * actual producer/consumer through counter wrap with a full input queue. */
+    kmx_encodec_stop(codec);
+    atomic_store(&codec->in_head, UINT64_MAX - 2u);
+    atomic_store(&codec->in_tail, UINT64_MAX - 2u);
+    atomic_store(&codec->stop, false);
+    CHECK(pthread_create(&codec->thread, NULL, worker, codec) == 0, "WRAP-WORKER");
+    codec->worker_running = true;
+    kenc_double_arm();
+    CHECK(kmx_encodec_offer_pcm(codec, pcm, sizeof pcm, 0), "WRAP-FIRST-OFFER");
+    for (unsigned i = 0; i < 2000 && !kenc_double_entered(); i++) pause_ms(1);
+    CHECK(kenc_double_entered(), "WRAP-GATE");
+    for (unsigned i = 1; i <= 6; i++)
+        CHECK(kmx_encodec_offer_pcm(codec, pcm, sizeof pcm, i * 40u), "WRAP-OFFER");
+    kenc_double_release();
+    for (unsigned i = 0; i <= 6; i++) {
+        if (!kmx_encodec_receive(codec, &output)) {
+            await_output(codec);
+            CHECK(kmx_encodec_receive(codec, &output), "WRAP-OUTPUT");
+        }
+        CHECK(output.pts_ms == i * 40u && output.flags == (i ? 0u : 13u), "WRAP-ORDER");
+    }
+    kmx_encodec_stats stats = kmx_encodec_statistics(codec);
+    CHECK(stats.calls == 7 && stats.input_drops == 0 && stats.output_drops == 0,
+          "WRAP-NO-DROPS");
+    kmx_encodec_close(codec);
+}
+
 int main(void) {
     first_boundary(); profiles(); serialized(); in_flight_stop();
+    timely_capture_during_reset(); queued_capture_at_counter_wrap();
     printf("publication boundary: %u checks PASS (native ABI double; no qualification)\n", checks);
     return 0;
 }

@@ -83,7 +83,8 @@ void kmx_encodec_close(kmx_encodec *codec);
 void kmx_encodec_stop(kmx_encodec *codec);
 int kmx_encodec_event_fd(const kmx_encodec *codec);
 /* Each encoder offer is exactly 40 ms of interleaved little-endian PCM16.
- * There are exactly two fixed input slots. Offers never wait for inference.
+ * The fixed queue accepts six frames, 240ms of capture, within the 250ms age budget,
+ * including C5-R4 reset work. Offers never wait for inference.
  * Overflow/staleness resumes at the next one-second source boundary. */
 bool kmx_encodec_offer_pcm(kmx_encodec *codec, const void *pcm, size_t bytes, uint64_t pts_ms);
 bool kmx_encodec_offer_packet(kmx_encodec *codec, const void *packet, size_t bytes);

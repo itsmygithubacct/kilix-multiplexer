@@ -116,7 +116,15 @@ kmx_audio_caps kmx_audio_choose(const kmx_audio_caps *offer, bool ready, unsigne
 
 #define CAPTURE_MAX_FRAMES 1920u
 #define CAPTURE_MAX_BYTES (CAPTURE_MAX_FRAMES * 8u * 2u)
-#define SLOTS 2u
+/* A C5-R4 RESET runs its tiled lead-in before publishing the current packet.
+ * Keep the PCM arriving during that work within the existing 250ms age budget;
+ * two 40ms slots discard timely capture after only 80ms. Decoder transport
+ * already applies backpressure and retains its two-slot limit. */
+#define ENCODER_INPUT_SLOTS (KMX_ENCODEC_STALE_MS / 40u)
+#define ENCODER_RING_SLOTS 8u
+#define DECODER_INPUT_SLOTS 2u
+#define OUTPUT_SLOTS 2u
+_Static_assert(ENCODER_INPUT_SLOTS <= ENCODER_RING_SLOTS, "encoder queue exceeds its ring");
 
 typedef struct {
     unsigned char bytes[CAPTURE_MAX_BYTES];
@@ -144,9 +152,19 @@ struct kmx_encodec {
     kmx_encodec_stats statistics;
     kmx_encodec_boundary boundary;
     bool stream_started, worker_running;
-    codec_input input[SLOTS];
-    codec_output output[SLOTS];
+    codec_input input[ENCODER_RING_SLOTS];
+    codec_output output[OUTPUT_SLOTS];
 };
+
+static unsigned input_slots(const kmx_encodec *codec) {
+    return codec->encode ? ENCODER_INPUT_SLOTS : DECODER_INPUT_SLOTS;
+}
+
+static unsigned input_index(const kmx_encodec *codec, uint64_t position) {
+    /* Power-of-two storage keeps the absolute counter's wrap consistent with
+     * ring indices. Encoder admission still permits only six queued frames. */
+    return (unsigned)(position % (codec->encode ? ENCODER_RING_SLOTS : DECODER_INPUT_SLOTS));
+}
 
 static uint64_t nanoseconds(void) {
     struct timespec now;
@@ -201,12 +219,12 @@ static void break_epoch(kmx_encodec *codec, uint64_t pts_ms) {
 
 static bool publish(kmx_encodec *codec, const kmx_encodec_output *output, uint64_t generation) {
     uint64_t head = atomic_load_explicit(&codec->out_head, memory_order_relaxed);
-    if (head - atomic_load_explicit(&codec->out_tail, memory_order_acquire) >= SLOTS) {
+    if (head - atomic_load_explicit(&codec->out_tail, memory_order_acquire) >= OUTPUT_SLOTS) {
         note_output_drop(codec);
         if (codec->encode) break_epoch(codec, output->pts_ms);
         return false;
     }
-    codec->output[head % SLOTS] = (codec_output){.value = *output, .generation = generation};
+    codec->output[head % OUTPUT_SLOTS] = (codec_output){.value = *output, .generation = generation};
     pthread_mutex_lock(&codec->statistics_lock);
     if (codec->encode && !codec->stream_started) {
         codec->boundary = (kmx_encodec_boundary){.monotonic_ns = nanoseconds(),
@@ -269,9 +287,9 @@ static void *worker(void *opaque) {
         }
         /* Output capacity never expands. Stop consuming input until the
          * scheduler drains it; a continuing capture source then hits the
-         * existing two-input overflow rule, which owns epoch recovery. */
+         * fixed input overflow rule, which owns epoch recovery. */
         if (atomic_load_explicit(&codec->out_head, memory_order_relaxed) -
-            atomic_load_explicit(&codec->out_tail, memory_order_acquire) >= SLOTS) {
+            atomic_load_explicit(&codec->out_tail, memory_order_acquire) >= OUTPUT_SLOTS) {
             struct pollfd event = {.fd = codec->input_event, .events = POLLIN};
             (void)poll(&event, 1, 100);
             drain_event(codec->input_event);
@@ -283,7 +301,7 @@ static void *worker(void *opaque) {
             drain_event(codec->input_event);
             continue;
         }
-        input = codec->input[tail % SLOTS];
+        input = codec->input[input_index(codec, tail)];
         atomic_store_explicit(&codec->in_tail, tail + 1, memory_order_release);
         if (input.generation != generation) {
             note_input_drop(codec); continue;
@@ -479,12 +497,12 @@ static bool offer(kmx_encodec *codec, const void *bytes, size_t size, uint64_t p
     if (codec->encode && pts_ms < atomic_load(&codec->broken_until)) {
         note_input_drop(codec); return false;
     }
-    if (head - atomic_load_explicit(&codec->in_tail, memory_order_acquire) >= SLOTS) {
+    if (head - atomic_load_explicit(&codec->in_tail, memory_order_acquire) >= input_slots(codec)) {
         note_input_drop(codec);
         if (codec->encode) break_epoch(codec, pts_ms);
         return false;
     }
-    input = &codec->input[head % SLOTS];
+    input = &codec->input[input_index(codec, head)];
     memcpy(input->bytes, bytes, size); input->size = size; input->pts_ms = pts_ms;
     input->offered_ms = offered_ms; input->generation = generation_now(codec);
     atomic_store_explicit(&codec->in_head, head + 1, memory_order_release);
@@ -503,7 +521,7 @@ bool kmx_encodec_offer_packet(kmx_encodec *codec, const void *packet, size_t byt
 bool kmx_encodec_packet_ready(const kmx_encodec *codec) {
     return codec && !codec->encode &&
         atomic_load_explicit(&codec->in_head, memory_order_relaxed) -
-        atomic_load_explicit(&codec->in_tail, memory_order_acquire) < SLOTS;
+        atomic_load_explicit(&codec->in_tail, memory_order_acquire) < DECODER_INPUT_SLOTS;
 }
 bool kmx_encodec_offer_packet_at(kmx_encodec *codec, const void *packet, size_t bytes, uint64_t received_ms) {
     if (!codec || codec->encode || !packet || !bytes || bytes > KMX_ENCODEC_PACKET_MAX) return false;
@@ -518,7 +536,7 @@ bool kmx_encodec_receive(kmx_encodec *codec, kmx_encodec_output *output) {
         uint64_t tail = atomic_load_explicit(&codec->out_tail, memory_order_relaxed);
         codec_output current;
         if (tail == atomic_load_explicit(&codec->out_head, memory_order_acquire)) return false;
-        current = codec->output[tail % SLOTS];
+        current = codec->output[tail % OUTPUT_SLOTS];
         atomic_store_explicit(&codec->out_tail, tail + 1, memory_order_release);
         notify(codec->input_event);
         if (current.generation != generation_now(codec) ||

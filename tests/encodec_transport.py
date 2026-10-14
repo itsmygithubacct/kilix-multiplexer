@@ -1,7 +1,8 @@
 """Real optional EnCodec transport controls with synthetic PCM and local graphs.
 
-This exercises the explicit development path. It does not grant installed
-admission, wire performance, listening or hardware-profile qualification.
+The ordinary matrix exercises the explicit development path. The installed
+pair mode uses caller-supplied installed Content/receipts and two real clients.
+Neither mode grants long-run, wire performance or hardware qualification.
 """
 from __future__ import annotations
 
@@ -22,14 +23,14 @@ import tempfile
 import time
 
 
-def capture(rate, channels, gate):
+def capture(rate, channels, gate, seconds=2):
     until = time.monotonic() + 30
     while not Path(gate).exists():
         if time.monotonic() > until:
             return 1
         time.sleep(.01)
     started = time.monotonic()
-    for packet in range(100):
+    for packet in range(int(seconds * 50)):
         samples = []
         for offset in range(rate // 50):
             index = packet * (rate // 50) + offset
@@ -157,17 +158,109 @@ def run_case(options, name, bitrate, rate, channels, *, tls=False, legacy_server
     return result
 
 
+def run_installed_pair(options):
+    """One short shared encoder/two decoder run; no asset path fallback."""
+    directory = options.evidence
+    gate = directory / 'capture-ready'
+    expected = options.seconds * 25
+    received = [directory / f'healthy-{name}.pcm' for name in ('a', 'b')]
+    dumps = [directory / f'healthy-{name}.out' for name in ('a', 'b')]
+    errors = [directory / f'healthy-{name}.err' for name in ('a', 'b')]
+    process = None
+    peers = []
+    commands = []
+    row_pattern = r'KMX_AUDIO (\d+) #\d+ at=(\d+) epoch=(\d+) flags=(\d+)'
+    marker = 'KMX_AUDIO_CODEC encodec-24k-mono-v1 bitrate=6 threads=2 profile=C5-R4'
+    with tempfile.TemporaryDirectory(prefix='kmxe-pair-', dir='/tmp') as temporary:
+        endpoint = Path(temporary) / 'session.sock'
+        command = shlex.join([sys.executable, str(Path(__file__).resolve()), '--capture',
+                              '24000', '1', str(gate), str(options.seconds)])
+        server = [str(options.new_bin / 'kmx-serve'), '--socket', str(endpoint),
+                  '--pane', f'exec sleep {options.seconds + 60}', '--audio-source', 'exec ' + command,
+                  '--audio-rate', '24000', '--audio-channels', '1', '--audio-bitrate', '6',
+                  '--audio-codec', 'encodec']
+        files = [(directory / 'serve.out').open('wb'), (directory / 'serve.err').open('wb')]
+        try:
+            process = subprocess.Popen(server, stdout=files[0], stderr=files[1], start_new_session=True)
+            wait_for(endpoint.exists, process, 30)
+            for index in range(2):
+                client = [str(options.new_bin / 'kmx-attach'), '--socket', str(endpoint),
+                          '--view', '--dump', '--reconnect', '0', '--audio-bitrate', '6',
+                          '--audio-codec', 'encodec', '--audio-output',
+                          'exec cat > ' + shlex.quote(str(received[index]))]
+                out, err = dumps[index].open('wb'), errors[index].open('wb')
+                files.extend((out, err))
+                peers.append(subprocess.Popen(client, stdout=out, stderr=err, start_new_session=True))
+                commands.append(client)
+
+            def both_ready():
+                assert all(peer.poll() is None for peer in peers), 'client ended before readiness'
+                return all(marker in path.read_text() for path in dumps)
+
+            wait_for(both_ready, process, 30)
+            gate.touch()
+
+            def both_complete():
+                assert all(peer.poll() is None for peer in peers), 'client ended during transport'
+                return all(len(re.findall(row_pattern, path.read_text())) >= expected for path in dumps)
+
+            wait_for(both_complete, process, options.seconds + 10)
+        finally:
+            for peer in peers:
+                stop(peer)
+            stop(process)
+            for file in files:
+                file.close()
+    assert process.returncode == 0 and all(peer.returncode == 0 for peer in peers)
+    rows = []
+    for index in range(2):
+        records = [tuple(map(int, record)) for record in re.findall(row_pattern, dumps[index].read_text())]
+        assert len(records) == expected, (index, len(records), expected)
+        assert all(size == 1920 for size, _pts, _epoch, _flags in records)
+        assert [record[1] for record in records] == [i * 40 for i in range(expected)], index
+        assert records[0][3] == 13, records[0]
+        pcm = received[index].read_bytes()
+        assert len(pcm) == expected * 1920, (index, len(pcm))
+        rows.append({'client': index, 'frames': len(records), 'pcm_bytes': len(pcm),
+                     'pcm_sha256': hashlib.sha256(pcm).hexdigest()})
+    # Check every profile and aggregate row; an unused clean C0 row alone
+    # cannot hide losses in the selected C5-R4 stream.
+    for path in [directory / 'serve.err', *errors]:
+        stats = re.findall(r'kmx-(?:serve|attach): encodec(?:_profile)? calls=\d+ rtf=\S+ '
+                           r'input_drops=(\d+) output_drops=(\d+) discontinuities=(\d+)', path.read_text())
+        assert len(stats) == 3 and all(int(i) == 0 and int(o) == 0 for i, o, _d in stats), (path, stats)
+        assert [int(row[2]) for row in stats] == [0, 1, 1], (path, stats)
+    server_text = (directory / 'serve.err').read_text()
+    assert re.findall(r'client_drops=(\d+)', server_text) and all(
+        int(value) == 0 for value in re.findall(r'client_drops=(\d+)', server_text))
+    result = {'passed': True, 'seconds': options.seconds, 'rows': rows,
+              'server_argv': server, 'client_argv': commands,
+              'scope': 'short installed two-client C5-R4 transport; not a calibration or soak'}
+    (directory / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
+    print(json.dumps({'passed': True, 'clients': 2, 'frames_each': expected, 'seconds': options.seconds}))
+
+
 def main():
-    if len(sys.argv) == 5 and sys.argv[1] == '--capture':
-        return capture(int(sys.argv[2]), int(sys.argv[3]), sys.argv[4])
+    if len(sys.argv) in (5, 6) and sys.argv[1] == '--capture':
+        seconds = int(sys.argv[5]) if len(sys.argv) == 6 else 2
+        if not 1 <= seconds <= 60:
+            return 2
+        return capture(int(sys.argv[2]), int(sys.argv[3]), sys.argv[4], seconds)
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--new-bin',type=Path,required=True)
     parser.add_argument('--old-bin',type=Path)
-    parser.add_argument('--assets',type=Path,required=True)
+    parser.add_argument('--assets',type=Path)
     parser.add_argument('--evidence',type=Path,required=True)
-    parser.add_argument('--only',choices=['unix6','all','compat'],default='all')
+    parser.add_argument('--only',choices=['unix6','all','compat','installed-pair6'],default='all')
+    parser.add_argument('--seconds',type=int,choices=range(1,61),default=30)
     options=parser.parse_args()
+    if options.only != 'installed-pair6' and options.assets is None:
+        parser.error('--assets is required for the development matrix')
+    if options.only == 'installed-pair6' and options.assets is not None:
+        parser.error('installed-pair6 refuses --assets; provide installed Content and receipts')
     options.evidence.mkdir(parents=True,exist_ok=False)
+    if options.only == 'installed-pair6':
+        return run_installed_pair(options)
     rows=[] if options.only=='compat' else [run_case(options,'unix6',6,24000,1)]
     if options.only=='all':
         rows += [run_case(options,'unix3-resample44100',3,44100,2),
