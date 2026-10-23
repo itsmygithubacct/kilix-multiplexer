@@ -93,6 +93,9 @@ kmx_grid_equal(const kmx_grid *a, const kmx_grid *b) {
     if (a->cursor_row != b->cursor_row || a->cursor_col != b->cursor_col) return false;
     if (a->cursor_visible != b->cursor_visible) return false;
     count = (size_t)a->rows * (size_t)a->cols;
+    /* Padding may differ in caller-built cells, so an unequal byte comparison
+     * still falls back to the public field-by-field equality semantics. */
+    if (!count || memcmp(a->cells, b->cells, count * sizeof *a->cells) == 0) return true;
     for (index = 0; index < count; index++) {
         if (!kmx_cell_equal(&a->cells[index], &b->cells[index])) return false;
     }

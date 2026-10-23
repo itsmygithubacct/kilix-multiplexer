@@ -265,6 +265,16 @@ kmx_sync_interval_millis(const kmx_sync *sync) {
     return sync ? sync->interval_millis : 0;
 }
 
+unsigned
+kmx_sync_wait_millis(const kmx_sync *sync, uint64_t now_millis) {
+    unsigned interval = sync ? sync->interval_millis : KMX_SEND_INTERVAL_MIN_MS;
+    if (sync && sync->last_send_millis && now_millis >= sync->last_send_millis) {
+        uint64_t elapsed = now_millis - sync->last_send_millis;
+        if (elapsed < interval) return interval - (unsigned)elapsed;
+    }
+    return interval;
+}
+
 uint32_t
 kmx_sync_throughput(const kmx_sync *sync) {
     if (!sync || !sync->acked_span || !sync->acked_bytes) return 0;
@@ -334,6 +344,9 @@ history_next_slot(kmx_sync *sync) {
 static bool
 same_row(const kmx_grid *a, const kmx_grid *b, int row) {
     if (!a || a->rows != b->rows || a->cols != b->cols) return false;
+    if (memcmp(&a->cells[(size_t)row * a->cols],
+               &b->cells[(size_t)row * b->cols],
+               (size_t)b->cols * sizeof *b->cells) == 0) return true;
     for (int col = 0; col < b->cols; col++) {
         if (!kmx_cell_equal(kmx_grid_cell_const(a, row, col),
                             kmx_grid_cell_const(b, row, col))) return false;
@@ -376,9 +389,13 @@ kmx_sync_poll(
     for (int row = 0; row < sync->current.rows; row++) {
         changed_rows[row] = !same_row(last_sent, &sync->current, row);
         changed_since_send |= changed_rows[row];
-        repair_rows[row] = changed_rows[row] ||
+        /* Resizing reallocates the receiver grid. Even rows identical to an
+         * older same-sized baseline must be repopulated after an intermediate
+         * size, including rows absent from the smaller last-sent state. */
+        repair_rows[row] = !last_sent || last_sent->rows != sync->current.rows ||
+            last_sent->cols != sync->current.cols ||
             sync->row_changed_at[row] > sync->acked_sequence;
-        repair_pending |= repair_rows[row];
+        repair_pending |= changed_rows[row] || repair_rows[row];
     }
     cursor_changed = !last_sent ||
         last_sent->cursor_row != sync->current.cursor_row ||

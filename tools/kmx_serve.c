@@ -1076,6 +1076,7 @@ main(int argc, char **argv) {
         }
         if (item->child == 0) {
             setenv("TERM", "xterm-256color", 1);
+            setenv("COLORTERM", "truecolor", 1);
             if (single) {
                 execvp(single[0], single);
             } else {
@@ -1293,7 +1294,20 @@ main(int argc, char **argv) {
             }
         }
 
-        ready = poll(descriptors, descriptor_count, KMX_SEND_INTERVAL_MIN_MS);
+        /* A recent PTY read may have missed its pacing deadline by only a
+         * millisecond. Wait the remainder, not another complete interval. */
+        {
+            unsigned timeout = KMX_SEND_INTERVAL_MIN_MS;
+            uint64_t now = now_millis();
+            for (which = 0; which < KMX_MAX_CLIENTS; which++) {
+                if (clients[which].fd < 0 || !client_idle(&clients[which])) continue;
+                for (slot = 0; slot < count; slot++) {
+                    unsigned wait = kmx_sync_wait_millis(clients[which].sync[slot], now);
+                    if (wait < timeout) timeout = wait;
+                }
+            }
+            ready = poll(descriptors, descriptor_count, (int)timeout);
+        }
         if (ready < 0) {
             if (errno == EINTR) continue;
             break;

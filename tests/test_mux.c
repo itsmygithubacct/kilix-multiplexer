@@ -275,6 +275,58 @@ test_small_change_is_a_small_message(void) {
 }
 
 static void
+test_partial_row_and_forced_repair(void) {
+    kmx_grid before = {0}, after = {0}, received = {0};
+    kmx_buffer message;
+    bool repair[] = {true};
+    CHECK(kmx_grid_init(&before, 1, 1000) == KMX_OK);
+    for (int col = 0; col < before.cols; col++) {
+        before.cells[col].chars[0] = 'a';
+        before.cells[col].width = 1;
+    }
+    CHECK(kmx_grid_copy(&after, &before) == KMX_OK);
+    CHECK(kmx_grid_copy(&received, &before) == KMX_OK);
+    after.cells[500].chars[0] = 'b';
+    kmx_buffer_init(&message);
+    CHECK(kmx_cells_encode(&before, &after, &message) == KMX_OK);
+    CHECK(message.size < 64); /* An uncompressed single-cell update. */
+    CHECK(kmx_cells_apply(&received, message.data, message.size) == KMX_OK);
+    CHECK(kmx_grid_equal(&received, &after));
+    /* Unknown intermediate changes need full repair, including a reversion
+     * whose current value is equal to the acknowledged baseline. */
+    received.cells[900].chars[0] = 'z';
+    kmx_buffer_reset(&message);
+    CHECK(kmx_cells_encode_rows(&before, &after, repair, &message) == KMX_OK);
+    CHECK(kmx_cells_apply(&received, message.data, message.size) == KMX_OK);
+    CHECK(kmx_grid_equal(&received, &after));
+    kmx_buffer_free(&message);
+    kmx_grid_free(&before);
+    kmx_grid_free(&after);
+    kmx_grid_free(&received);
+}
+
+static void
+test_sync_poll_wait_hint(void) {
+    kmx_sync *sync = NULL;
+    kmx_buffer message;
+    bool produced = false;
+    CHECK(kmx_sync_create(&sync, 3, 40) == KMX_OK);
+    kmx_buffer_init(&message);
+    CHECK(kmx_sync_wait_millis(sync, 1000) == KMX_SEND_INTERVAL_MIN_MS);
+    CHECK(kmx_sync_poll(sync, 1000, &message, &produced, NULL) == KMX_OK);
+    CHECK(produced);
+    CHECK(kmx_sync_wait_millis(sync, 1019) == 1);
+    CHECK(kmx_sync_wait_millis(sync, 1020) == KMX_SEND_INTERVAL_MIN_MS);
+    kmx_sync_set_interval(sync, 100);
+    CHECK(kmx_sync_wait_millis(sync, 1050) == 50);
+    CHECK(kmx_sync_wait_millis(sync, 999) == 100); /* clock moved backwards */
+    kmx_sync_reset_baseline(sync);
+    CHECK(kmx_sync_wait_millis(sync, 1050) == 100);
+    kmx_sync_free(sync);
+    kmx_buffer_free(&message);
+}
+
+static void
 test_term_rejects_dimensions_libvterm_would_misindex(void) {
     kmx_term *term = NULL;
     CHECK(kmx_term_create(&term, 0, 80) == KMX_ERR_INVALID);
@@ -367,6 +419,36 @@ test_terminal_query_replies(void) {
     CHECK(replies.size == sizeof expected - 1);
     CHECK(memcmp(replies.data, expected, replies.size) == 0);
     kmx_buffer_reset(&replies);
+    kmx_term_set_output_callback(term, NULL, NULL);
+    CHECK(kmx_term_feed(term, query, sizeof query - 1) == KMX_OK);
+    CHECK(replies.size == 0);
+    kmx_term_free(term);
+    kmx_buffer_free(&replies);
+}
+
+static void
+test_terminal_default_color_queries(void) {
+    kmx_term *term = NULL;
+    kmx_buffer replies;
+    const char query[] = "\033]10;?\007\033]11;?\033\\";
+    const char expected[] = "\033]10;rgb:f0f0/f0f0/f0f0\033\\"
+                            "\033]11;rgb:0000/0000/0000\033\\";
+    kmx_buffer_init(&replies);
+    CHECK(kmx_term_create(&term, 12, 60) == KMX_OK);
+    CHECK(kmx_term_feed(term, query, sizeof query - 1) == KMX_OK);
+    kmx_term_set_output_callback(term, collect_terminal_reply, &replies);
+    CHECK(replies.size == 0);
+    for (size_t n = 0; n < sizeof query - 1; n++) {
+        CHECK(kmx_term_feed(term, query + n, 1) == KMX_OK);
+    }
+    CHECK(replies.size == sizeof expected - 1);
+    CHECK(memcmp(replies.data, expected, replies.size) == 0);
+    kmx_buffer_reset(&replies);
+    const char invalid[] = "\033]10;??\007\033]11;#ffffff\007\033]11;\007\033]12;?\007";
+    for (size_t n = 0; n < sizeof invalid - 1; n++) {
+        CHECK(kmx_term_feed(term, invalid + n, 1) == KMX_OK);
+    }
+    CHECK(replies.size == 0);
     kmx_term_set_output_callback(term, NULL, NULL);
     CHECK(kmx_term_feed(term, query, sizeof query - 1) == KMX_OK);
     CHECK(replies.size == 0);
@@ -2092,9 +2174,67 @@ test_motion_idle_does_not_bank_allowance(void) {
     free(frame);
 }
 
+/* Compare cached incremental snapshots with a fresh full replay. The fresh
+ * terminal has never snapshotted, so no damage callback can hide a changed row.
+ * Include independent destinations and caller mutation of returned copies. */
+static void
+test_snapshot_damage_cache(void) {
+    const char *steps[] = {
+        "first\033[3;4Hsecond", "\033[2;2H\xe4\xb8\xad" "e\xcc\x81",
+        "\033[2;3Hx", "\033[1;1H\033[2@", "\033[2P", "\033[2;4r\033[4;1H\n\n",
+        "\033[r\033[2;1H\033[L", "\033[M", "\033[?5h", "\033[?5l",
+        "\033[?1049hALT", "\033[?1049l", "\033[2J", "\033[H\033[31;44;1mcolours",
+        "\033[?25l\033[3;9H", "\033[?25h", "\033" "c", "after reset",
+        "\033[1;1H\033#6wide line", "\033[1;1H\033#5normal"
+    };
+    kmx_term *term = NULL;
+    kmx_grid first = {0}, second = {0}, reference = {0};
+    CHECK(kmx_term_create(&term, 6, 24) == KMX_OK);
+    for (size_t step = 0; step < sizeof steps / sizeof *steps; step++) {
+        kmx_term *fresh = NULL;
+        CHECK(kmx_term_create(&fresh, 6, 24) == KMX_OK);
+        for (size_t prior = 0; prior <= step; prior++) {
+            CHECK(kmx_term_feed(fresh, steps[prior], strlen(steps[prior])) == KMX_OK);
+        }
+        /* Snapshot at every byte boundary, even inside UTF-8 and escapes. */
+        for (size_t byte = 0; byte < strlen(steps[step]); byte++) {
+            CHECK(kmx_term_feed(term, steps[step] + byte, 1) == KMX_OK);
+            CHECK(kmx_term_snapshot(term, &first) == KMX_OK);
+        }
+        CHECK(kmx_term_snapshot(fresh, &reference) == KMX_OK);
+        CHECK(kmx_grid_equal(&first, &reference));
+        memset(first.cells, 0xff, (size_t)first.rows * first.cols * sizeof *first.cells);
+        CHECK(kmx_term_snapshot(term, &second) == KMX_OK);
+        CHECK(kmx_grid_equal(&second, &reference));
+        CHECK(kmx_term_snapshot(term, &first) == KMX_OK);
+        CHECK(kmx_grid_equal(&first, &reference));
+        kmx_term_free(fresh);
+    }
+    /* Shrink and grow a cached terminal, then exercise the bottom/right edge. */
+    for (int size = 0; size < 3; size++) {
+        int rows = size == 1 ? 3 : 8, cols = size == 1 ? 12 : 32;
+        char stream[64];
+        kmx_term *fresh = NULL;
+        CHECK(kmx_term_resize(term, rows, cols) == KMX_OK);
+        CHECK(kmx_term_create(&fresh, rows, cols) == KMX_OK);
+        snprintf(stream, sizeof stream, "\033" "c\033[%d;%dHedge", rows, cols-4);
+        CHECK(kmx_term_feed(term, stream, strlen(stream)) == KMX_OK);
+        CHECK(kmx_term_feed(fresh, stream, strlen(stream)) == KMX_OK);
+        CHECK(kmx_term_snapshot(term, &first) == KMX_OK);
+        CHECK(kmx_term_snapshot(fresh, &reference) == KMX_OK);
+        CHECK(kmx_grid_equal(&first, &reference));
+        kmx_term_free(fresh);
+    }
+    kmx_grid_free(&first);
+    kmx_grid_free(&second);
+    kmx_grid_free(&reference);
+    kmx_term_free(term);
+}
+
 int
 main(void) {
     RUN(test_grid_basics);
+    RUN(test_snapshot_damage_cache);
     RUN(test_roundtrip_text);
     RUN(test_roundtrip_attributes);
     RUN(test_roundtrip_wide_and_combining);
@@ -2102,11 +2242,14 @@ main(void) {
     RUN(test_roundtrip_randomised);
     RUN(test_stale_receiver_catches_up_in_one_message);
     RUN(test_small_change_is_a_small_message);
+    RUN(test_partial_row_and_forced_repair);
+    RUN(test_sync_poll_wait_hint);
     RUN(test_term_rejects_dimensions_libvterm_would_misindex);
     RUN(test_resize);
     RUN(test_terminal_cursor_visibility);
     RUN(test_terminal_alternate_screen_restores_primary);
     RUN(test_terminal_query_replies);
+    RUN(test_terminal_default_color_queries);
     RUN(test_graphics_captured_in_wire_order);
     RUN(test_graphics_split_across_feeds);
     RUN(test_decoder_rejects_malformed_input);

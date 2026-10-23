@@ -167,16 +167,22 @@ kmx_render_frame(kmx_render *render, const kmx_grid *grid, kmx_buffer *out) {
     for (row = 0; row < grid->rows && result == KMX_OK; row++) {
         int col;
         bool repaint_next = false;
+        /* Most editing frames leave whole rows untouched. Byte equality is
+         * sufficient (not necessary); retain semantic cell comparison below
+         * for callers whose struct padding differs. */
+        if (!full && memcmp(&grid->cells[(size_t)row * grid->cols],
+                            &render->previous.cells[(size_t)row * grid->cols],
+                            (size_t)grid->cols * sizeof *grid->cells) == 0) continue;
         for (col = 0; col < grid->cols && result == KMX_OK; col++) {
-            const kmx_cell *cell = kmx_grid_cell_const(grid, row, col);
+            const kmx_cell *cell = &grid->cells[(size_t)row * grid->cols + col];
             bool forced = repaint_next;
             bool unicode = false;
             repaint_next = false;
             /* The tail of a wide character is drawn by its head. */
             if (cell->width == 0) continue;
             if (!full && !forced) {
-                const kmx_cell *before = kmx_grid_cell_const(&render->previous, row, col);
-                if (before && kmx_cell_equal(before, cell)) continue;
+                const kmx_cell *before = &render->previous.cells[(size_t)row * grid->cols + col];
+                if (kmx_cell_equal(before, cell)) continue;
             }
             if (cursor_row != row || cursor_col != col) {
                 result = move_cursor(out, row, col);

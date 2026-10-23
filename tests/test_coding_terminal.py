@@ -34,17 +34,17 @@ try:
     started=time.monotonic()
     os.write(1,b"\x1b[4;9H\x1b[6")
     time.sleep(.02)
-    os.write(1,b"n\x1b[5n")
+    os.write(1,b"n\x1b[5n\x1b]10;?\x07\x1b]11;?\x1b\\")
     deadline=time.monotonic()+2
     while time.monotonic()<deadline:
-        if b"\x1b[4;9R" in received and b"\x1b[0n" in received: break
+        if all(reply in received for reply in (b"\x1b[4;9R", b"\x1b[0n", b"\x1b]10;rgb:", b"\x1b]11;rgb:0000/0000/0000\x1b\\")): break
         ready,_,_=select.select([0],[],[],max(0,deadline-time.monotonic()))
         if not ready: break
         data=os.read(0,4096)
         if not data: break
         received+=data
     Path(result).write_text(json.dumps({"cursor_reply":b"\x1b[4;9R" in received,
-        "status_reply":b"\x1b[0n" in received,"received_hex":received.hex(),"reply_ms":(time.monotonic()-started)*1000}))
+        "status_reply":b"\x1b[0n" in received,"color_replies":b"\x1b]10;rgb:" in received and b"\x1b]11;rgb:0000/0000/0000\x1b\\" in received,"received_hex":received.hex(),"reply_ms":(time.monotonic()-started)*1000}))
 finally: termios.tcsetattr(0,termios.TCSANOW,original)
 '''
 
@@ -67,14 +67,14 @@ def run(server, expect_missing=False):
                     raise AssertionError("query child did not report within bounded timeout: " +
                                          (folder / "server.log").read_text())
                 observed = json.loads(result.read_text())
-                success = observed["cursor_reply"] and observed["status_reply"]
+                success = observed["cursor_reply"] and observed["status_reply"] and observed["color_replies"]
                 if expect_missing:
-                    assert not success, f"baseline unexpectedly answers both queries: {observed}"
+                    assert not success, f"baseline unexpectedly answers all queries: {observed}"
                     print("BASELINE MISSING terminal query replies: " + json.dumps(observed))
                 else:
                     assert success, f"PTY owner failed to answer terminal queries without a client: {observed}"
                     assert observed["reply_ms"] < 1000, f"local PTY query replies were delayed: {observed}"
-                    print(f"PASS PTY owner answers fragmented cursor and status queries without a client in {observed['reply_ms']:.2f} ms")
+                    print(f"PASS PTY owner answers fragmented cursor, status and default-colour queries without a client in {observed['reply_ms']:.2f} ms")
                 return observed
             finally:
                 stop_owned_child(pid)

@@ -163,6 +163,14 @@ static void resize_and_restore_dimensions(void) {
     feed(&h, "\033[3;1Hwide 界"); send_state(&h);
     idle(&h); done(&h);
 }
+/* Returning to an acknowledged size must restore rows missing from the
+ * intermediate receiver, including unchanged blank rows below the shrink. */
+static void resize_restores_absent_rows(void) {
+    harness h; init(&h, 8, 20); baseline(&h);
+    OK(kmx_sync_resize(h.sync, 3, 20)); send_state(&h);
+    OK(kmx_sync_resize(h.sync, 8, 20)); send_state(&h);
+    idle(&h); done(&h);
+}
 static void reset_with_late_ack(void) {
     harness h; init(&h, 6, 20); baseline(&h);
     feed(&h, "\033[HB"); uint64_t old = send_state(&h);
@@ -494,6 +502,7 @@ int main(int argc, char **argv) {
     style_and_wide_character_reversion();
     scrolling();
     resize_and_restore_dimensions();
+    resize_restores_absent_rows();
     reset_with_late_ack();
     repeated_unchanged_updates_settle();
     randomized_schedules();

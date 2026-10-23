@@ -14,6 +14,7 @@
 
 #include "vterm.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -26,6 +27,10 @@ struct kmx_term {
      * outlive every call into the parser. */
     VTermStateFallbacks fallbacks;
     bool cursor_visible;
+    bool color_query;
+    size_t color_query_size;
+    kmx_grid cached;
+    bool dirty_rows[KMX_MAX_DIMENSION];
     kmx_term_output_callback *output_callback;
     void *output_user;
     kmx_graphics_event graphics[KMX_GRAPHICS_MAX];
@@ -34,6 +39,18 @@ struct kmx_term {
     bool graphics_lost;   /* the queue overflowed; do not fabricate order */
     size_t stream_offset;
 };
+
+/* Cache converted cells, not caller-owned snapshots. Multiple consumers can
+ * snapshot into different grids, or modify/free their copies, independently. */
+static int
+on_damage(VTermRect rect, void *user) {
+    kmx_term *term = user;
+    int end = rect.end_row < KMX_MAX_DIMENSION ? rect.end_row : KMX_MAX_DIMENSION;
+    for (int row = rect.start_row < 0 ? 0 : rect.start_row; row < end; row++) {
+        term->dirty_rows[row] = true;
+    }
+    return 1;
+}
 
 static int
 on_termprop(VTermProp prop, VTermValue *value, void *user) {
@@ -44,6 +61,7 @@ on_termprop(VTermProp prop, VTermValue *value, void *user) {
 
 static const VTermScreenCallbacks screen_callbacks = {
     .settermprop = on_termprop,
+    .damage = on_damage,
 };
 
 static void
@@ -72,6 +90,41 @@ from_vterm_color(const VTermColor *color) {
     out.g = color->rgb.green;
     out.b = color->rgb.blue;
     return out;
+}
+
+/* Applications use OSC 10/11 to choose contrasting input backgrounds.
+ * Answer from this terminal's logical default palette at the PTY owner, even
+ * before a client attaches. Passive replicas have no output callback. Only a
+ * complete, exact "?" request is answered; setters and other OSCs stay inert. */
+static int
+on_osc(int command, VTermStringFragment frag, void *user) {
+    kmx_term *term = user;
+    if (command != 10 && command != 11) return 0;
+    if (frag.initial) {
+        term->color_query = true;
+        term->color_query_size = 0;
+    }
+    if (frag.len) {
+        if (term->color_query_size || frag.len != 1 || frag.str[0] != '?') {
+            term->color_query = false;
+        }
+        term->color_query_size = 1; /* bounded; longer requests are invalid */
+    }
+    if (frag.final && term->color_query && term->color_query_size && term->output_callback) {
+        VTermColor fg, bg, color;
+        VTermState *state = vterm_obtain_state(term->vt);
+        char reply[64];
+        vterm_state_get_default_colors(state, &fg, &bg);
+        color = command == 10 ? fg : bg;
+        vterm_state_convert_color_to_rgb(state, &color);
+        int size = snprintf(reply, sizeof reply, "\033]%d;rgb:%04x/%04x/%04x\033\\",
+                            command, color.rgb.red * 257u,
+                            color.rgb.green * 257u, color.rgb.blue * 257u);
+        if (size > 0 && (size_t)size < sizeof reply) {
+            term->output_callback(reply, (size_t)size, term->output_user);
+        }
+    }
+    return 1;
 }
 
 static int
@@ -135,9 +188,11 @@ kmx_term_create(kmx_term **out, int rows, int cols) {
     }
     memset(&term->fallbacks, 0, sizeof term->fallbacks);
     term->fallbacks.apc = on_apc;
+    term->fallbacks.osc = on_osc;
     vterm_screen_set_unrecognised_fallbacks(term->screen, &term->fallbacks, term);
     vterm_screen_enable_altscreen(term->screen, 1);
     term->cursor_visible = true;
+    memset(term->dirty_rows, 1, sizeof term->dirty_rows);
     vterm_screen_set_callbacks(term->screen, &screen_callbacks, term);
     vterm_screen_reset(term->screen, 1);
     *out = term;
@@ -149,6 +204,7 @@ kmx_term_free(kmx_term *term) {
     if (!term) return;
     kmx_term_graphics_clear(term);
     if (term->vt) vterm_free(term->vt);
+    kmx_grid_free(&term->cached);
     free(term);
 }
 
@@ -176,6 +232,7 @@ kmx_term_resize(kmx_term *term, int rows, int cols) {
     if (!term || rows <= 0 || cols <= 0) return KMX_ERR_INVALID;
     if (!term_dimensions_ok(rows, cols)) return KMX_ERR_LIMIT;
     vterm_set_size(term->vt, rows, cols);
+    memset(term->dirty_rows, 1, sizeof term->dirty_rows);
     vterm_screen_flush_damage(term->screen);
     return KMX_OK;
 }
@@ -192,14 +249,17 @@ kmx_term_snapshot(kmx_term *term, kmx_grid *grid) {
 
     if (!term || !grid) return KMX_ERR_INVALID;
     vterm_get_size(term->vt, &rows, &cols);
-    result = grid->cells ? kmx_grid_resize(grid, rows, cols)
-                         : kmx_grid_init(grid, rows, cols);
+    if (term->cached.rows != rows || term->cached.cols != cols) {
+        memset(term->dirty_rows, 1, sizeof term->dirty_rows);
+    }
+    result = kmx_grid_resize(&term->cached, rows, cols);
     if (result != KMX_OK) return result;
 
     for (row = 0; row < rows; row++) {
+        if (!term->dirty_rows[row]) continue;
         for (col = 0; col < cols; col++) {
             VTermScreenCell source;
-            kmx_cell *cell = kmx_grid_cell(grid, row, col);
+            kmx_cell *cell = &term->cached.cells[(size_t)row * (size_t)cols + (size_t)col];
             VTermPos position = {.row = row, .col = col};
             size_t index;
             memset(cell, 0, sizeof *cell);
@@ -242,12 +302,13 @@ kmx_term_snapshot(kmx_term *term, kmx_grid *grid) {
             cell->bg = from_vterm_color(&source.bg);
         }
     }
+    memset(term->dirty_rows, 0, sizeof term->dirty_rows);
     state = vterm_obtain_state(term->vt);
     vterm_state_get_cursorpos(state, &cursor);
-    grid->cursor_row = cursor.row < 0 ? 0 : (cursor.row >= rows ? rows - 1 : cursor.row);
-    grid->cursor_col = cursor.col < 0 ? 0 : (cursor.col >= cols ? cols - 1 : cursor.col);
-    grid->cursor_visible = term->cursor_visible;
-    return KMX_OK;
+    term->cached.cursor_row = cursor.row < 0 ? 0 : (cursor.row >= rows ? rows - 1 : cursor.row);
+    term->cached.cursor_col = cursor.col < 0 ? 0 : (cursor.col >= cols ? cols - 1 : cursor.col);
+    term->cached.cursor_visible = term->cursor_visible;
+    return kmx_grid_copy(grid, &term->cached);
 }
 
 size_t

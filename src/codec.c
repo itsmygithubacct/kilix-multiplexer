@@ -111,19 +111,39 @@ cell_char_count(const kmx_cell *cell) {
 }
 
 static kmx_result
-put_row(kmx_buffer *out, const kmx_grid *grid, int row) {
+put_row(kmx_buffer *out, const kmx_grid *previous, const kmx_grid *grid, int row) {
     kmx_buffer runs;
     uint64_t run_count = 0;
     int col = 0;
     kmx_result result = KMX_OK;
+    const kmx_cell *cells = &grid->cells[(size_t)row * grid->cols];
+    const kmx_cell *before = previous ? &previous->cells[(size_t)row * grid->cols] : NULL;
 
+    /* Dense redraws are cheaper as one style run than many tiny runs split by
+     * coincidentally equal characters. Sampling only chooses the encoding;
+     * a complete row is always safe, regardless of the estimate. */
+    if (before) {
+        unsigned changed = 0, sampled = 0;
+        int stride = grid->cols / 8;
+        if (!stride) stride = 1;
+        for (int sample = 0; sample < grid->cols; sample += stride) {
+            changed += !kmx_cell_equal(&before[sample], &cells[sample]);
+            sampled++;
+        }
+        if (changed * 2 >= sampled) before = NULL;
+    }
     kmx_buffer_init(&runs);
     while (col < grid->cols) {
-        const kmx_cell *first = kmx_grid_cell_const(grid, row, col);
+        if (before && kmx_cell_equal(&before[col], &cells[col])) {
+            col++;
+            continue;
+        }
+        const kmx_cell *first = &cells[col];
         int end = col + 1;
         int index;
         while (end < grid->cols &&
-               same_style(first, kmx_grid_cell_const(grid, row, end))) {
+               same_style(first, &cells[end]) &&
+               (!before || !kmx_cell_equal(&before[end], &cells[end]))) {
             end++;
         }
         result = put_varint(&runs, (uint64_t)col);
@@ -136,7 +156,7 @@ put_row(kmx_buffer *out, const kmx_grid *grid, int row) {
         if (result == KMX_OK) result = put_color(&runs, &first->fg);
         if (result == KMX_OK) result = put_color(&runs, &first->bg);
         for (index = col; index < end && result == KMX_OK; index++) {
-            const kmx_cell *cell = kmx_grid_cell_const(grid, row, index);
+            const kmx_cell *cell = &cells[index];
             size_t chars = cell_char_count(cell);
             size_t position;
             result = put_varint(&runs, chars);
@@ -162,6 +182,9 @@ row_changed(const kmx_grid *previous, const kmx_grid *current, int row) {
         previous->cols != current->cols) {
         return true;
     }
+    if (memcmp(&previous->cells[(size_t)row * current->cols],
+               &current->cells[(size_t)row * current->cols],
+               (size_t)current->cols * sizeof *current->cells) == 0) return false;
     for (col = 0; col < current->cols; col++) {
         if (!kmx_cell_equal(
                 kmx_grid_cell_const(previous, row, col),
@@ -194,7 +217,13 @@ kmx_cells_encode_rows(
     for (row = 0; row < current->rows && result == KMX_OK; row++) {
         if (!(include_rows && include_rows[row]) &&
             !row_changed(previous, current, row)) continue;
-        result = put_row(&rows, current, row);
+        /* Existing decoders accept partial row runs. Forced repair rows must
+         * still be complete: the peer may hold an unacknowledged intermediate
+         * state, including cells that reverted to the acknowledged baseline. */
+        const kmx_grid *base = previous && previous->rows == current->rows &&
+            previous->cols == current->cols && !(include_rows && include_rows[row])
+                ? previous : NULL;
+        result = put_row(&rows, base, current, row);
         if (result == KMX_OK) changed++;
     }
     if (result != KMX_OK) {

@@ -164,9 +164,10 @@ kmx_result kmx_cells_encode(
     const kmx_grid *current,
     kmx_buffer *out
 );
-/* Also emit rows selected by `include_rows`, even when they match `previous`.
+/* Fully replace rows selected by `include_rows`, even when they match `previous`.
  * A non-NULL mask has current->rows entries. NULL preserves the ordinary diff.
- * This uses the existing row-replacement wire format, so old decoders work. */
+ * Other rows may use partial cell runs against `previous`. Both use the
+ * existing wire format, so old decoders work. */
 kmx_result kmx_cells_encode_rows(
     const kmx_grid *previous,
     const kmx_grid *current,
@@ -273,6 +274,11 @@ void kmx_sync_set_interval(kmx_sync *sync, unsigned millis);
  * before the first sample) unless pinned. */
 unsigned kmx_sync_rtt_millis(const kmx_sync *sync);
 unsigned kmx_sync_interval_millis(const kmx_sync *sync);
+/* Scheduler hint: time remaining until the current send interval expires.
+ * Once due (or before the first send), returns the interval, not zero, so an
+ * idle screen never causes a busy loop. Call poll after each I/O event first;
+ * use this to bound the next blocking wait, not as a send-readiness test. */
+unsigned kmx_sync_wait_millis(const kmx_sync *sync, uint64_t now_millis);
 
 /* Bytes per second the far end has been shown to absorb, or 0 before there is
  * enough evidence.  Intended as the budget the motion plane spends. */
