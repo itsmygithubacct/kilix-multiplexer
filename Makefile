@@ -273,3 +273,11 @@ install: all
 	install -m 0755 "$(SHAPE)" "$(DESTDIR)$(PREFIX)/bin/"
 	install -m 0644 include/kilix_mux.h include/kilix_mux_modes.h include/kilix_mux_input.h include/kilix_mux_input_session.h "$(DESTDIR)$(PREFIX)/include/"
 	install -m 0644 "$(STATIC_LIB)" "$(DESTDIR)$(PREFIX)/lib/"
+
+# Test-only visual comparator: empty erased cells and spaces look identical.
+$(BUILD_DIR)/bench-grid.so: tools/bench_grid.c include/kilix_mux.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -shared -o "$@" tools/bench_grid.c
+
+.PHONY: bench-native
+bench-native: $(SHARED_LIB) $(BUILD_DIR)/bench-grid.so
+	$(PYTHON) tools/native_bench.py --library "$(SHARED_LIB)" --comparator "$(BUILD_DIR)/bench-grid.so" --output "$(BUILD_DIR)/native-bench.json"

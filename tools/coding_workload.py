@@ -10,7 +10,7 @@ import time
 import tty
 
 
-def paint(sequence, tick, rows, cols, full=True):
+def paint_bytes(sequence, tick, rows, cols, full=True):
     # The fixed first row is validated as decoded cells, not ANSI output.
     chunks = ["\x1b[?2026h\x1b[?25l", "\x1b[2J" if full else ""]
     for row in range(2, rows):
@@ -21,7 +21,11 @@ def paint(sequence, tick, rows, cols, full=True):
     chunks.append(f"\x1b[{rows};1H" + f"synthetic.py | seq={sequence} | tick={tick}".ljust(cols)[:cols])
     # Commit marker LAST: a PTY read can split even one write mid-repaint.
     chunks.append("\x1b[H" + f"CONFIRMED {sequence:08d} TICK {tick:08d}".ljust(cols)[:cols] + "\x1b[?2026l")
-    pending = memoryview("".join(chunks).encode())
+    return "".join(chunks).encode()
+
+
+def paint(sequence, tick, rows, cols, full=True):
+    pending = memoryview(paint_bytes(sequence, tick, rows, cols, full))
     while pending:
         written = os.write(1, pending)
         if written <= 0:
@@ -68,6 +72,11 @@ def main():
                         paint(sequence, tick, args.rows, args.cols)
                         if pause:
                             time.sleep(pause)
+                    if args.pid_file:
+                        done = Path(args.pid_file).with_suffix(".done")
+                        temporary = done.with_suffix(".tmp")
+                        temporary.write_text(json.dumps({"sequence": sequence, "tick": tick}))
+                        temporary.replace(done)
                 elif fields[0] == "QUIT":
                     return
     finally:
