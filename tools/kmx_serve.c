@@ -78,7 +78,8 @@ static bool report_encodec_start(const kmx_encodec *codec, unsigned profile) {
 /* Quiescent epoch-start ages: one line per profile, raw 10ms buckets. */
 static void report_epoch_start_ages(const kmx_encodec *codec, unsigned profile) {
     kmx_encodec_epoch_ages ages = kmx_encodec_epoch_start_ages(codec);
-    char line[160 + KMX_ENCODEC_AGE_BUCKETS * 21u];
+    /* 126 fixed bytes, four 20-digit values, 21 bytes per bucket and the NUL. */
+    char line[256 + KMX_ENCODEC_AGE_BUCKETS * 21u];
     int used = snprintf(line, sizeof line,
         "KMX_ENCODEC_EPOCH_AGE v=1 profile=%s instance=1 delivered=%llu undelivered=%llu undelivered_at_start=%llu max_ms=%llu bucket_ms=%u buckets=",
         profile ? "C5-R4" : "C0", (unsigned long long)ages.delivered,
