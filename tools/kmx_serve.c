@@ -75,6 +75,22 @@ static bool report_encodec_start(const kmx_encodec *codec, unsigned profile) {
     return true;
 }
 
+/* Quiescent epoch-start ages: one line per profile, raw 10ms buckets. */
+static void report_epoch_start_ages(const kmx_encodec *codec, unsigned profile) {
+    kmx_encodec_epoch_ages ages = kmx_encodec_epoch_start_ages(codec);
+    char line[160 + KMX_ENCODEC_AGE_BUCKETS * 21u];
+    int used = snprintf(line, sizeof line,
+        "KMX_ENCODEC_EPOCH_AGE v=1 profile=%s instance=1 delivered=%llu undelivered=%llu max_ms=%llu bucket_ms=%u buckets=",
+        profile ? "C5-R4" : "C0", (unsigned long long)ages.delivered,
+        (unsigned long long)ages.undelivered, (unsigned long long)ages.max_delivered_ms,
+        KMX_ENCODEC_AGE_BUCKET_MS);
+    for (unsigned bucket = 0; bucket < KMX_ENCODEC_AGE_BUCKETS && used > 0 && (size_t)used < sizeof line; bucket++)
+        used += snprintf(line + used, sizeof line - (size_t)used, "%s%llu", bucket ? "," : "",
+                         (unsigned long long)ages.buckets[bucket]);
+    /* One write keeps the record whole on a shared stderr. */
+    if (used > 0 && (size_t)used < sizeof line) fprintf(stderr, "%s\n", line);
+}
+
 static kmx_encodec_stats finish_encodec_profile(kmx_encodec *codec, unsigned profile,
     size_t client_drops, bool *start_reported) {
     /* Quiescence precedes EVERY final read, including in-flight inference. */
@@ -89,6 +105,7 @@ static kmx_encodec_stats finish_encodec_profile(kmx_encodec *codec, unsigned pro
         (unsigned long long)stats.calls, (unsigned long long)stats.inference_ns,
         (unsigned long long)stats.input_drops, (unsigned long long)stats.output_drops,
         (unsigned long long)stats.discontinuities, client_drops);
+    report_epoch_start_ages(codec, profile);
     fprintf(stderr, "kmx-serve: encodec_profile calls=%llu rtf=%.6f input_drops=%llu output_drops=%llu discontinuities=%llu client_drops=%zu profile=%s\n",
         (unsigned long long)stats.calls, stats.calls ? (double)stats.inference_ns / ((double)stats.calls * 40000000.0) : 0.0,
         (unsigned long long)stats.input_drops, (unsigned long long)stats.output_drops,

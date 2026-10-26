@@ -179,9 +179,84 @@ static void queued_capture_at_counter_wrap(void) {
     kmx_encodec_close(codec);
 }
 
+static uint64_t bucket_total(const kmx_encodec_epoch_ages *ages) {
+    uint64_t total = 0;
+    for (unsigned i = 0; i < KMX_ENCODEC_AGE_BUCKETS; i++) total += ages->buckets[i];
+    return total;
+}
+static void epoch_start_ages(void) {
+    unsigned char pcm[1920] = {0};
+    kmx_encodec *codec = opened(1), *c0 = opened(0);
+    kmx_encodec_output output;
+    kmx_encodec_epoch_ages ages;
+    uint64_t began;
+    ages = kmx_encodec_epoch_start_ages(codec);
+    CHECK(ages.delivered == 0 && ages.undelivered == 0 && bucket_total(&ages) == 0, "AGE-EMPTY");
+    /* A delivered RESET held 120ms in native work: one sample, at least 120ms
+     * old at hand-off. The following ordinary packets are not samples. */
+    kenc_double_arm();
+    CHECK(kmx_encodec_offer_pcm(codec, pcm, sizeof pcm, 0), "AGE-OFFER");
+    for (unsigned i = 0; i < 2000 && !kenc_double_entered(); i++) pause_ms(1);
+    CHECK(kenc_double_entered(), "AGE-GATE");
+    began = milliseconds();
+    for (unsigned i = 1; i <= 2; i++) {
+        while (milliseconds() - began < i * 40u) pause_ms(1);
+        CHECK(kmx_encodec_offer_pcm(codec, pcm, sizeof pcm, i * 40u), "AGE-OFFER");
+    }
+    while (milliseconds() - began < 120u) pause_ms(1);
+    kenc_double_release();
+    for (unsigned i = 0; i <= 2; i++) {
+        if (!kmx_encodec_receive(codec, &output)) {
+            await_output(codec);
+            CHECK(kmx_encodec_receive(codec, &output), "AGE-OUTPUT");
+        }
+        CHECK(output.pts_ms == i * 40u, "AGE-ORDER");
+    }
+    ages = kmx_encodec_epoch_start_ages(codec);
+    CHECK(ages.delivered == 1 && ages.undelivered == 0 && bucket_total(&ages) == 1, "KILL-AGE-RESET-ONLY");
+    CHECK(ages.max_delivered_ms >= 120 && ages.max_delivered_ms < KMX_ENCODEC_STALE_MS, "KILL-AGE-HANDOFF");
+    CHECK(ages.buckets[ages.max_delivered_ms / KMX_ENCODEC_AGE_BUCKET_MS] == 1, "KILL-AGE-BUCKET");
+    /* A RESET finished after the budget is undelivered, not a late bucket. */
+    kenc_double_arm();
+    CHECK(kmx_encodec_offer_pcm(codec, pcm, sizeof pcm, 1000), "AGE-OFFER");
+    for (unsigned i = 0; i < 2000 && !kenc_double_entered(); i++) pause_ms(1);
+    CHECK(kenc_double_entered(), "AGE-GATE");
+    pause_ms(270);
+    kenc_double_release();
+    for (unsigned i = 0; i < 2000 && kmx_encodec_epoch_start_ages(codec).undelivered != 1; i++) pause_ms(1);
+    ages = kmx_encodec_epoch_start_ages(codec);
+    CHECK(ages.undelivered == 1 && ages.delivered == 1, "KILL-AGE-STALE-ENCODE");
+    CHECK(!kmx_encodec_receive(codec, &output), "AGE-STALE-ENCODE-DROPPED");
+    /* A timely RESET left unreceived past the budget is undelivered too. */
+    CHECK(kmx_encodec_offer_pcm(codec, pcm, sizeof pcm, 2000), "AGE-OFFER");
+    await_output(codec);
+    pause_ms(280);
+    CHECK(!kmx_encodec_receive(codec, &output), "AGE-STALE-RECEIVE");
+    ages = kmx_encodec_epoch_start_ages(codec);
+    CHECK(ages.undelivered == 2 && ages.delivered == 1 && bucket_total(&ages) == 1, "KILL-AGE-STALE-RECEIVE");
+    /* A queued RESET invalidated by a later epoch break is undelivered. */
+    CHECK(kmx_encodec_offer_pcm(codec, pcm, sizeof pcm, 3000), "AGE-OFFER");
+    await_output(codec);
+    CHECK(kmx_encodec_offer_pcm(codec, pcm, sizeof pcm, 3520), "AGE-MISALIGNED-OFFER");
+    for (unsigned i = 0; i < 2000 && atomic_load(&codec->broken_until) < 4000u; i++) pause_ms(1);
+    CHECK(!kmx_encodec_receive(codec, &output), "AGE-INVALIDATED");
+    ages = kmx_encodec_epoch_start_ages(codec);
+    CHECK(ages.undelivered == 3 && ages.delivered == 1, "KILL-AGE-INVALIDATED");
+    /* C0 epoch starts are recorded per codec, and decoders report nothing. */
+    CHECK(kmx_encodec_offer_pcm(c0, pcm, sizeof pcm, 0), "AGE-OFFER");
+    await_output(c0); CHECK(kmx_encodec_receive(c0, &output), "AGE-C0-OUTPUT");
+    ages = kmx_encodec_epoch_start_ages(c0);
+    CHECK(ages.delivered == 1 && ages.undelivered == 0 && ages.buckets[ages.max_delivered_ms / 10u] == 1, "KILL-AGE-C0");
+    kmx_encodec_stop(codec);
+    kmx_encodec_epoch_ages final = kmx_encodec_epoch_start_ages(codec);
+    CHECK(final.undelivered == 3 && final.delivered == 1, "KILL-AGE-QUIESCENT");
+    kmx_encodec_close(codec); kmx_encodec_close(c0);
+    CHECK(kmx_encodec_epoch_start_ages(NULL).delivered == 0, "AGE-NULL");
+}
+
 int main(void) {
     first_boundary(); profiles(); serialized(); in_flight_stop();
-    timely_capture_during_reset(); queued_capture_at_counter_wrap();
+    timely_capture_during_reset(); queued_capture_at_counter_wrap(); epoch_start_ages();
     printf("publication boundary: %u checks PASS (native ABI double; no qualification)\n", checks);
     return 0;
 }

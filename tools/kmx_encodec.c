@@ -151,6 +151,7 @@ struct kmx_encodec {
     pthread_mutex_t statistics_lock;
     kmx_encodec_stats statistics;
     kmx_encodec_boundary boundary;
+    kmx_encodec_epoch_ages ages;
     bool stream_started, worker_running;
     codec_input input[ENCODER_RING_SLOTS];
     codec_output output[OUTPUT_SLOTS];
@@ -195,6 +196,18 @@ static void note_inference(kmx_encodec *codec, uint64_t elapsed_ns) {
     codec->statistics.calls++;
     pthread_mutex_unlock(&codec->statistics_lock);
 }
+/* Epoch-start samples share the accounting mutex; decoder packets are ignored. */
+static void note_epoch_start(kmx_encodec *codec, uint8_t flags, bool delivered, uint64_t age_ms) {
+    if (!codec->encode || !(flags & KENC_PACKET_FLAG_RESET)) return;
+    pthread_mutex_lock(&codec->statistics_lock);
+    if (delivered) {
+        if (age_ms > KMX_ENCODEC_STALE_MS) age_ms = KMX_ENCODEC_STALE_MS;
+        codec->ages.delivered++;
+        codec->ages.buckets[age_ms / KMX_ENCODEC_AGE_BUCKET_MS]++;
+        if (age_ms > codec->ages.max_delivered_ms) codec->ages.max_delivered_ms = age_ms;
+    } else codec->ages.undelivered++;
+    pthread_mutex_unlock(&codec->statistics_lock);
+}
 static void notify(int fd) {
     uint64_t value = 1;
     ssize_t result;
@@ -221,6 +234,7 @@ static bool publish(kmx_encodec *codec, const kmx_encodec_output *output, uint64
     uint64_t head = atomic_load_explicit(&codec->out_head, memory_order_relaxed);
     if (head - atomic_load_explicit(&codec->out_tail, memory_order_acquire) >= OUTPUT_SLOTS) {
         note_output_drop(codec);
+        note_epoch_start(codec, output->flags, false, 0);
         if (codec->encode) break_epoch(codec, output->pts_ms);
         return false;
     }
@@ -347,10 +361,14 @@ static void *worker(void *opaque) {
                     uint64_t began = nanoseconds();
                     kenc_result result = kenc_encoder_push_s16(codec->encoder, accumulated, used, next_pts,
                         output.packet, sizeof output.packet, &output.size);
+                    bool parsed;
                     note_inference(codec, nanoseconds() - began);
                     used = 0;
-                    if (result != KENC_OK || milliseconds() - accumulated_offered_ms > KMX_ENCODEC_STALE_MS ||
-                        kenc_packet_metadata_read(&metadata, output.packet, output.size, &codec->options) != KENC_OK) {
+                    parsed = result == KENC_OK &&
+                        kenc_packet_metadata_read(&metadata, output.packet, output.size, &codec->options) == KENC_OK;
+                    if (!parsed || milliseconds() - accumulated_offered_ms > KMX_ENCODEC_STALE_MS) {
+                        /* A finished but stale RESET packet is an undelivered epoch start. */
+                        if (parsed) note_epoch_start(codec, metadata.packet.flags, false, 0);
                         break_epoch(codec, input.pts_ms); started = false;
                         note_output_drop(codec); break;
                     }
@@ -533,7 +551,7 @@ bool kmx_encodec_receive(kmx_encodec *codec, kmx_encodec_output *output) {
     if (!codec || !output) return false;
     drain_event(codec->output_event);
     for (;;) {
-        uint64_t tail = atomic_load_explicit(&codec->out_tail, memory_order_relaxed);
+        uint64_t tail = atomic_load_explicit(&codec->out_tail, memory_order_relaxed), age;
         codec_output current;
         if (tail == atomic_load_explicit(&codec->out_head, memory_order_acquire)) return false;
         current = codec->output[tail % OUTPUT_SLOTS];
@@ -541,13 +559,18 @@ bool kmx_encodec_receive(kmx_encodec *codec, kmx_encodec_output *output) {
         notify(codec->input_event);
         if (current.generation != generation_now(codec) ||
             (codec->encode && current.value.pts_ms < atomic_load(&codec->broken_until))) {
-            note_output_drop(codec); continue;
-        }
-        if (milliseconds() - current.value.created_ms > KMX_ENCODEC_STALE_MS) {
             note_output_drop(codec);
+            note_epoch_start(codec, current.value.flags, false, 0);
+            continue;
+        }
+        age = milliseconds() - current.value.created_ms;
+        if (age > KMX_ENCODEC_STALE_MS) {
+            note_output_drop(codec);
+            note_epoch_start(codec, current.value.flags, false, 0);
             if (codec->encode) break_epoch(codec, current.value.pts_ms);
             continue;
         }
+        note_epoch_start(codec, current.value.flags, true, age);
         *output = current.value;
         return true;
     }
@@ -572,6 +595,14 @@ bool kmx_encodec_stream_boundary(const kmx_encodec *codec, kmx_encodec_boundary 
     if (started) *boundary = codec->boundary;
     pthread_mutex_unlock((pthread_mutex_t *)&codec->statistics_lock);
     return started;
+}
+kmx_encodec_epoch_ages kmx_encodec_epoch_start_ages(const kmx_encodec *codec) {
+    kmx_encodec_epoch_ages ages = {0};
+    if (!codec || !codec->encode) return ages;
+    pthread_mutex_lock((pthread_mutex_t *)&codec->statistics_lock);
+    ages = codec->ages;
+    pthread_mutex_unlock((pthread_mutex_t *)&codec->statistics_lock);
+    return ages;
 }
 #else
 kmx_encodec *kmx_encodec_open_profile(bool encode, unsigned bitrate, int capture_rate,
@@ -598,6 +629,10 @@ void kmx_encodec_restart(kmx_encodec *codec) { (void)codec; }
 kmx_encodec_stats kmx_encodec_statistics(const kmx_encodec *codec) { (void)codec; return (kmx_encodec_stats){0}; }
 bool kmx_encodec_stream_boundary(const kmx_encodec *codec, kmx_encodec_boundary *boundary) {
     (void)codec; (void)boundary; return false;
+}
+kmx_encodec_epoch_ages kmx_encodec_epoch_start_ages(const kmx_encodec *codec) {
+    kmx_encodec_epoch_ages ages = {0};
+    (void)codec; return ages;
 }
 #endif
 

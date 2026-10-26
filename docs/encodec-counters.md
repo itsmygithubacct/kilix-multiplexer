@@ -32,8 +32,30 @@ profiles. The snapshot excludes only accounting commits before the producer's
 first publication; it does not excuse losses later hidden by a client's readiness
 window. A trace without a usable start has no post-publication counter claim.
 
+## Epoch-start ages
+
+After each profile's `event=end` record and before its `encodec_profile`
+summary, the server writes one `KMX_ENCODEC_EPOCH_AGE v=1` line with
+`profile`, `instance=1`, `delivered`, `undelivered`, `max_ms`, `bucket_ms=10`
+and `buckets`, 26 comma-separated counts. Every RESET packet that finishes
+encoding is one sample, for C0 and C5-R4 alike. When the scheduler receives it,
+its age is the time since the oldest capture block it contains arrived, and it
+is counted in bucket `age / 10`; the last bucket holds exactly 250 ms, the
+largest age the stale budget admits. A RESET packet that is never handed to
+the scheduler, because it finished after the budget, went stale in the output
+ring or was invalidated by a later epoch break, is `undelivered`. Packets
+still queued when the worker stops are not samples.
+
+A p99 over these samples must rank undelivered packets above every bucket:
+they are epoch starts that no peer received within the budget. A RESET that
+never finished encoding is already an input or output drop and is not a
+sample. The age ends at the scheduler's hand-off, before socket queueing and
+network transfer, so it does not include client transport or decoding.
+
 `make test-boundary` exercises the actual worker, output ring, accounting lock
-and server final-log function with a deterministic native ABI double. It uses
+and server final-log function with a deterministic native ABI double. It also
+drives delivered, stale and invalidated RESET packets through the age record
+and checks the server's age line. It uses
 native headers and libsamplerate, opens no model or installed admission path,
 and is neither codec accuracy nor timing qualification. Ordinary native builds
 continue to link the installed EnCodec library.

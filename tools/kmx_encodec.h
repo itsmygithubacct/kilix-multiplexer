@@ -60,6 +60,18 @@ typedef struct {
     uint8_t flags;
     kmx_encodec_stats before;
 } kmx_encodec_boundary;
+/* Encoder-only epoch-start ages. Each RESET packet that finishes encoding is
+ * one sample. A packet that kmx_encodec_receive hands to the scheduler is
+ * counted in the 10ms bucket of its oldest capture's age at that hand-off; the
+ * last bucket holds exactly 250ms. A packet never handed over (output ring full,
+ * stale or invalidated) is undelivered and lies beyond the budget. Packets still
+ * queued when the worker stops are not samples. */
+#define KMX_ENCODEC_AGE_BUCKET_MS 10u
+#define KMX_ENCODEC_AGE_BUCKETS (KMX_ENCODEC_STALE_MS / KMX_ENCODEC_AGE_BUCKET_MS + 1u)
+typedef struct {
+    uint64_t delivered, undelivered, max_delivered_ms;
+    uint64_t buckets[KMX_ENCODEC_AGE_BUCKETS];
+} kmx_encodec_epoch_ages;
 
 /* All admission, graph creation and warm-up complete before success. The
  * normal path admits fresh installed assets via native's embedded F100 API.
@@ -102,5 +114,7 @@ kmx_encodec_stats kmx_encodec_statistics(const kmx_encodec *codec);
  * Later drops, including stale/invalidated delivery of that entry, are after
  * the boundary. Peer reconnects and idle periods never create a new boundary. */
 bool kmx_encodec_stream_boundary(const kmx_encodec *codec, kmx_encodec_boundary *boundary);
+/* A decoder, or an encoder before any RESET packet, reports all zeros. */
+kmx_encodec_epoch_ages kmx_encodec_epoch_start_ages(const kmx_encodec *codec);
 
 #endif
