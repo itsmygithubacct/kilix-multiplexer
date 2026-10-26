@@ -80,6 +80,8 @@ static void report_epoch_start_ages(const kmx_encodec *codec, unsigned profile) 
     kmx_encodec_epoch_ages ages = kmx_encodec_epoch_start_ages(codec);
     /* 126 fixed bytes, four 20-digit values, 21 bytes per bucket and the NUL. */
     char line[256 + KMX_ENCODEC_AGE_BUCKETS * 21u];
+    _Static_assert(sizeof line >= 127u + 4u * 20u + KMX_ENCODEC_AGE_BUCKETS * 21u,
+                   "epoch-age record must fit all uint64 values and the NUL");
     int used = snprintf(line, sizeof line,
         "KMX_ENCODEC_EPOCH_AGE v=1 profile=%s instance=1 delivered=%llu undelivered=%llu undelivered_at_start=%llu max_ms=%llu bucket_ms=%u buckets=",
         profile ? "C5-R4" : "C0", (unsigned long long)ages.delivered,

@@ -283,10 +283,37 @@ static void epoch_start_ages_at_boundary(void) {
     kmx_encodec_close(codec);
 }
 
+static void epoch_start_age_output_full(void) {
+    for (unsigned profile = 0; profile <= 1; profile++) {
+        kmx_encodec *codec = opened(profile);
+        kmx_encodec_output output = {.created_ms = milliseconds(), .epoch = 1};
+        /* Hold the worker stopped and fill the actual publication ring. This
+         * isolates the overflow accounting reached when one resampler input
+         * yields a second packet before the scheduler drains the first. */
+        kmx_encodec_stop(codec);
+        for (unsigned i = 0; i < OUTPUT_SLOTS; i++) {
+            output.pts_ms = i * 40u;
+            CHECK(publish(codec, &output, generation_now(codec)), "AGE-FILL-RING");
+        }
+        output.pts_ms = 1000;
+        output.flags = KENC_PACKET_FLAG_RESET;
+        CHECK(!publish(codec, &output, generation_now(codec)), "AGE-FULL-REFUSAL");
+        kmx_encodec_epoch_ages ages = kmx_encodec_epoch_start_ages(codec);
+        CHECK(ages.undelivered == 1 && ages.delivered == 0 &&
+              ages.undelivered_at_start == 0 && bucket_total(&ages) == 0 &&
+              kmx_encodec_statistics(codec).output_drops == 1, "KILL-AGE-RING-FULL");
+        output.flags = 0;
+        CHECK(!publish(codec, &output, generation_now(codec)), "AGE-FULL-REFUSAL");
+        CHECK(kmx_encodec_epoch_start_ages(codec).undelivered == 1 &&
+              kmx_encodec_statistics(codec).output_drops == 2, "AGE-FULL-RESET-ONLY");
+        kmx_encodec_close(codec);
+    }
+}
+
 int main(void) {
     first_boundary(); profiles(); serialized(); in_flight_stop();
     timely_capture_during_reset(); queued_capture_at_counter_wrap(); epoch_start_ages();
-    epoch_start_ages_at_boundary();
+    epoch_start_ages_at_boundary(); epoch_start_age_output_full();
     printf("publication boundary: %u checks PASS (native ABI double; no qualification)\n", checks);
     return 0;
 }

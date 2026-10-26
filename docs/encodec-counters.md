@@ -39,8 +39,8 @@ summary, the server writes one `KMX_ENCODEC_EPOCH_AGE v=1` line with
 `profile`, `instance=1`, `delivered`, `undelivered`, `undelivered_at_start`,
 `max_ms`, `bucket_ms=10` and `buckets`, 26 comma-separated counts. Every RESET packet that finishes
 encoding is one sample, for C0 and C5-R4 alike. When the scheduler receives it,
-its age is the time since the oldest capture block it contains arrived, and it
-is counted in bucket `age / 10`; the last bucket holds exactly 250 ms, the
+its age is the time since the 40 ms block holding its first sample was offered
+to the encoder, and it is counted in bucket `age / 10`; the last bucket holds exactly 250 ms, the
 largest age the stale budget admits. A RESET packet that is never handed to
 the scheduler, because it finished after the budget, went stale in the output
 ring or was invalidated by a later epoch break, is `undelivered`. Packets
@@ -52,8 +52,22 @@ delivered before it, so post-publication samples are `delivered` plus
 A p99 over these samples must rank undelivered packets above every bucket:
 they are epoch starts that no peer received within the budget. A RESET that
 never finished encoding is already an input or output drop and is not a
-sample. The age ends at the scheduler's hand-off, before socket queueing and
-network transfer, so it does not include client transport or decoding.
+sample. The age ends at `kmx_encodec_receive`, when the codec hands the packet
+to the server scheduler. It excludes capture buffering before the encoder
+offer, subsequent per-client server queues, socket writes, network transfer,
+client decoding and playback. The first 20 ms capture block is already buffered
+when its 40 ms block is offered; at non-24 kHz rates the resampler can also
+retain samples from a previous offer. This is the codec's stale-budget age,
+not the complete time a packet spends in the server.
+
+Because delivered samples are at most 250 ms old, a nearest-rank p99 within
+that same budget is equivalent to `undelivered_post <= floor(n / 100)`, where
+`n = delivered + undelivered_post` and
+`undelivered_post = undelivered - undelivered_at_start`. The histogram describes
+the delivered ages but this threshold does not require additional margin below
+250 ms. Lost encoder inputs and packets dropped after scheduler hand-off must
+be checked separately using input and client drop counters; the age record
+alone does not cover either loss path.
 
 `make test-boundary` exercises the actual worker, output ring, accounting lock
 and server final-log function with a deterministic native ABI double. It also

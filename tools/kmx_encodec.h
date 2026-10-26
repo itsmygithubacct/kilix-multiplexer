@@ -62,7 +62,9 @@ typedef struct {
 } kmx_encodec_boundary;
 /* Encoder-only epoch-start ages. Each RESET packet that finishes encoding is
  * one sample. A packet that kmx_encodec_receive hands to the scheduler is
- * counted in the 10ms bucket of its oldest capture's age at that hand-off; the
+ * counted in the 10ms bucket of the age since the 40ms block holding its first
+ * sample was offered to the encoder, at that hand-off. Capture buffering before
+ * the offer and server/client queueing after hand-off are excluded. The
  * last bucket holds exactly 250ms. A packet never handed over (output ring full,
  * stale or invalidated) is undelivered and lies beyond the budget. Packets still
  * queued when the worker stops are not samples. undelivered_at_start is the
