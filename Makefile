@@ -55,6 +55,7 @@ INPUT_TEST := $(BUILD_DIR)/test-input-transform
 ENCODEC_TEST := $(BUILD_DIR)/test-encodec
 BOUNDARY_TEST := $(BUILD_DIR)/test-encodec-boundary
 PHASE_LOG_TEST := $(BUILD_DIR)/test-encodec-phase-log
+AGE_RECORD_TEST := $(BUILD_DIR)/test-encodec-age-record
 
 .PHONY: all clean test test-input test-coding sanitize fuzz backpressure churn check-vendor install
 
@@ -174,9 +175,13 @@ $(BOUNDARY_TEST): tests/test_encodec_boundary.c tests/encodec_double.c tests/enc
 $(PHASE_LOG_TEST): tests/test_encodec_phase_log.c tests/encodec_double.c tests/encodec_double.h tools/kmx_serve.c tools/kmx_encodec.c $(BUILD_DIR)/kmx_pixel.o $(BUILD_DIR)/kmx_tap.o $(BUILD_DIR)/kmx_tls.o $(STATIC_LIB)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(ENCODEC_CFLAGS) -DKMX_HAVE_ENCODEC=1 -Itools $(LDFLAGS) -o "$@" tests/test_encodec_phase_log.c tests/encodec_double.c tools/kmx_encodec.c $(BUILD_DIR)/kmx_pixel.o $(BUILD_DIR)/kmx_tap.o $(BUILD_DIR)/kmx_tls.o $(STATIC_LIB) $(LDLIBS) -lsamplerate -pthread -lutil -lssl -lcrypto
 
-test-boundary: $(BOUNDARY_TEST) $(PHASE_LOG_TEST)
+$(AGE_RECORD_TEST): tests/test_encodec_age_record.c tests/encodec_double.c tests/encodec_double.h tools/kmx_serve.c tools/kmx_encodec.c $(BUILD_DIR)/kmx_pixel.o $(BUILD_DIR)/kmx_tap.o $(BUILD_DIR)/kmx_tls.o $(STATIC_LIB)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(ENCODEC_CFLAGS) -DKMX_HAVE_ENCODEC=1 -Itools $(LDFLAGS) -Wl,--wrap=kmx_encodec_epoch_start_ages -o "$@" tests/test_encodec_age_record.c tests/encodec_double.c tools/kmx_encodec.c $(BUILD_DIR)/kmx_pixel.o $(BUILD_DIR)/kmx_tap.o $(BUILD_DIR)/kmx_tls.o $(STATIC_LIB) $(LDLIBS) -lsamplerate -pthread -lutil -lssl -lcrypto
+
+test-boundary: $(BOUNDARY_TEST) $(PHASE_LOG_TEST) $(AGE_RECORD_TEST)
 	"$(BOUNDARY_TEST)"
 	"$(PHASE_LOG_TEST)"
+	"$(AGE_RECORD_TEST)"
 
 # Explicit local graph input is required to run this scheduling regression.
 $(BUILD_DIR)/test-encodec-age: tests/test_encodec_age.c $(BUILD_DIR)/kmx_encodec.o
