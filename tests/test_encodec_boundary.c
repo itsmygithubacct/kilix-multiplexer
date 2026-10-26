@@ -253,10 +253,40 @@ static void epoch_start_ages(void) {
     kmx_encodec_close(codec); kmx_encodec_close(c0);
     CHECK(kmx_encodec_epoch_start_ages(NULL).delivered == 0, "AGE-NULL");
 }
+static void epoch_start_ages_at_boundary(void) {
+    unsigned char pcm[1920] = {0};
+    kmx_encodec *codec = opened(1);
+    kmx_encodec_output output;
+    kmx_encodec_epoch_ages ages;
+    /* A stale first RESET precedes the stream boundary; later ones follow it. */
+    kenc_double_arm();
+    CHECK(kmx_encodec_offer_pcm(codec, pcm, sizeof pcm, 0), "AGE-OFFER");
+    for (unsigned i = 0; i < 2000 && !kenc_double_entered(); i++) pause_ms(1);
+    CHECK(kenc_double_entered(), "AGE-GATE");
+    pause_ms(270);
+    kenc_double_release();
+    for (unsigned i = 0; i < 2000 && kmx_encodec_epoch_start_ages(codec).undelivered != 1; i++) pause_ms(1);
+    ages = kmx_encodec_epoch_start_ages(codec);
+    CHECK(ages.undelivered == 1 && ages.undelivered_at_start == 0, "KILL-AGE-START-NOT-YET");
+    CHECK(kmx_encodec_offer_pcm(codec, pcm, sizeof pcm, 1000), "AGE-OFFER");
+    await_output(codec); CHECK(kmx_encodec_receive(codec, &output), "AGE-OUTPUT");
+    CHECK(kmx_encodec_offer_pcm(codec, pcm, sizeof pcm, 2000), "AGE-OFFER");
+    await_output(codec); pause_ms(280);
+    CHECK(!kmx_encodec_receive(codec, &output), "AGE-STALE-RECEIVE");
+    ages = kmx_encodec_epoch_start_ages(codec);
+    CHECK(ages.delivered == 1 && ages.undelivered == 2 && ages.undelivered_at_start == 1, "KILL-AGE-AT-START");
+    /* A later publication never moves the start snapshot. */
+    CHECK(kmx_encodec_offer_pcm(codec, pcm, sizeof pcm, 3000), "AGE-OFFER");
+    await_output(codec); CHECK(kmx_encodec_receive(codec, &output), "AGE-OUTPUT");
+    ages = kmx_encodec_epoch_start_ages(codec);
+    CHECK(ages.delivered == 2 && ages.undelivered == 2 && ages.undelivered_at_start == 1, "KILL-AGE-START-IMMUTABLE");
+    kmx_encodec_close(codec);
+}
 
 int main(void) {
     first_boundary(); profiles(); serialized(); in_flight_stop();
     timely_capture_during_reset(); queued_capture_at_counter_wrap(); epoch_start_ages();
+    epoch_start_ages_at_boundary();
     printf("publication boundary: %u checks PASS (native ABI double; no qualification)\n", checks);
     return 0;
 }

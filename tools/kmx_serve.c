@@ -80,9 +80,10 @@ static void report_epoch_start_ages(const kmx_encodec *codec, unsigned profile) 
     kmx_encodec_epoch_ages ages = kmx_encodec_epoch_start_ages(codec);
     char line[160 + KMX_ENCODEC_AGE_BUCKETS * 21u];
     int used = snprintf(line, sizeof line,
-        "KMX_ENCODEC_EPOCH_AGE v=1 profile=%s instance=1 delivered=%llu undelivered=%llu max_ms=%llu bucket_ms=%u buckets=",
+        "KMX_ENCODEC_EPOCH_AGE v=1 profile=%s instance=1 delivered=%llu undelivered=%llu undelivered_at_start=%llu max_ms=%llu bucket_ms=%u buckets=",
         profile ? "C5-R4" : "C0", (unsigned long long)ages.delivered,
-        (unsigned long long)ages.undelivered, (unsigned long long)ages.max_delivered_ms,
+        (unsigned long long)ages.undelivered, (unsigned long long)ages.undelivered_at_start,
+        (unsigned long long)ages.max_delivered_ms,
         KMX_ENCODEC_AGE_BUCKET_MS);
     for (unsigned bucket = 0; bucket < KMX_ENCODEC_AGE_BUCKETS && used > 0 && (size_t)used < sizeof line; bucket++)
         used += snprintf(line + used, sizeof line - (size_t)used, "%s%llu", bucket ? "," : "",

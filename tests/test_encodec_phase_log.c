@@ -43,7 +43,7 @@ int main(void) {
     CHECK(!reported[0] && zero.calls == 0, "KILL-INACTIVE-LOG");
     const char *end = line_after(text, "KMX_ENCODEC_PHASE v=1 event=end profile=C0 ", NULL);
     const char *age = line_after(text, "KMX_ENCODEC_EPOCH_AGE v=1 profile=C0 instance=1 delivered=0 undelivered=0 "
-        "max_ms=0 bucket_ms=10 buckets=0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0\n", end);
+        "undelivered_at_start=0 max_ms=0 bucket_ms=10 buckets=0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0\n", end);
     const char *summary = line_after(text, "kmx-serve: encodec_profile ", age);
     CHECK(end && age && summary && occurrences(text, "KMX_ENCODEC_EPOCH_AGE") == 1, "KILL-AGE-LINE-INACTIVE");
     unsigned char pcm[1920] = {0};
@@ -60,7 +60,8 @@ int main(void) {
     /* The joined RESET was published but is still queued at stop, so it is
      * not a sample; the record follows the quiescent end record. */
     end = line_after(text, "KMX_ENCODEC_PHASE v=1 event=end profile=C5-R4 ", NULL);
-    age = line_after(text, "KMX_ENCODEC_EPOCH_AGE v=1 profile=C5-R4 instance=1 delivered=0 undelivered=0 ", end);
+    age = line_after(text, "KMX_ENCODEC_EPOCH_AGE v=1 profile=C5-R4 instance=1 delivered=0 undelivered=0 "
+        "undelivered_at_start=0 ", end);
     summary = line_after(text, "kmx-serve: encodec_profile ", age);
     CHECK(end && age && summary, "KILL-AGE-LINE-ACTIVE");
     CHECK(strchr(age, '\n') - age < 4096 && occurrences(text, "KMX_ENCODEC_EPOCH_AGE") == 1, "KILL-AGE-LINE-ACTIVE");

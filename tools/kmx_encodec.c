@@ -244,6 +244,7 @@ static bool publish(kmx_encodec *codec, const kmx_encodec_output *output, uint64
         codec->boundary = (kmx_encodec_boundary){.monotonic_ns = nanoseconds(),
             .pts_ms = output->pts_ms, .epoch = output->epoch,
             .flags = output->flags, .before = codec->statistics};
+        codec->ages.undelivered_at_start = codec->ages.undelivered;
         codec->stream_started = true;
     }
     atomic_store_explicit(&codec->out_head, head + 1, memory_order_release);

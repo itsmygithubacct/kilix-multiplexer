@@ -65,11 +65,13 @@ typedef struct {
  * counted in the 10ms bucket of its oldest capture's age at that hand-off; the
  * last bucket holds exactly 250ms. A packet never handed over (output ring full,
  * stale or invalidated) is undelivered and lies beyond the budget. Packets still
- * queued when the worker stops are not samples. */
+ * queued when the worker stops are not samples. undelivered_at_start is the
+ * undelivered count captured with the first publication boundary; nothing can
+ * be delivered before that boundary. */
 #define KMX_ENCODEC_AGE_BUCKET_MS 10u
 #define KMX_ENCODEC_AGE_BUCKETS (KMX_ENCODEC_STALE_MS / KMX_ENCODEC_AGE_BUCKET_MS + 1u)
 typedef struct {
-    uint64_t delivered, undelivered, max_delivered_ms;
+    uint64_t delivered, undelivered, undelivered_at_start, max_delivered_ms;
     uint64_t buckets[KMX_ENCODEC_AGE_BUCKETS];
 } kmx_encodec_epoch_ages;
 
