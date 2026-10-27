@@ -379,6 +379,8 @@ kmx_sync_poll(
 
     result = kmx_term_snapshot(sync->term, &sync->current);
     if (result != KMX_OK) return result;
+    /* Build and commit the row masks over the same captured snapshot bounds. */
+    const int snapshot_rows = sync->current.rows;
 
     if (sync->next_sequence > 1) {
         sent_state *last = history_at_or_before(sync, sync->next_sequence - 1);
@@ -386,7 +388,7 @@ kmx_sync_poll(
             last_sent = &last->state;
         }
     }
-    for (int row = 0; row < sync->current.rows; row++) {
+    for (int row = 0; row < snapshot_rows; row++) {
         changed_rows[row] = !same_row(last_sent, &sync->current, row);
         changed_since_send |= changed_rows[row];
         /* Resizing reallocates the receiver grid. Even rows identical to an
@@ -461,7 +463,7 @@ kmx_sync_poll(
     slot->sent_at = now_millis;
     slot->wire_bytes = out->size;
     slot->used = true;
-    for (int row = 0; row < sync->current.rows; row++) {
+    for (int row = 0; row < snapshot_rows; row++) {
         if (changed_rows[row]) sync->row_changed_at[row] = sequence;
     }
     if (cursor_changed) sync->cursor_changed_at = sequence;
