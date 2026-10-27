@@ -1143,7 +1143,6 @@ main(int argc, char **argv) {
                 fprintf(stderr, "kmx-serve: could not start pixel input helper: %s\n",
                         strerror(errno));
                 kmx_pixel_stop(&pixel);
-                pixel_running = false;
                 return 1;
             }
             fprintf(stderr, "kmx-serve: pixel input helper enabled\n");

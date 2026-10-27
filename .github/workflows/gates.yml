@@ -60,10 +60,13 @@ jobs:
           # read, a zero-length memcpy from NULL, and a comparison that could
           # read uninitialised bytes.
           status=0
+          version=$(cat VERSION)
           for f in src/*.c tools/*.c; do
+            analyzer_status=0
             out=$(clang --analyze -Iinclude -Isrc -Itools \
-                  -Ithird_party/libvterm/include -std=c11 "$f" 2>&1) || true
-            if printf '%s' "$out" | grep -q "warning:"; then
+                  -Ithird_party/libvterm/include "-DKMX_VERSION=\"$version\"" \
+                  -std=c11 "$f" 2>&1) || analyzer_status=$?
+            if [ "$analyzer_status" -ne 0 ] || grep -q "warning:" <<< "$out"; then
               printf '%s\n' "$out"
               status=1
             fi
