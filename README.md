@@ -13,6 +13,11 @@ where there is actually video — rather than one undifferentiated stream.
 
 This release tree contains the portable implementation and its public design
 and security notes. Machine-specific integration details live outside it.
+Ships in Plebian-OS 0.2.3 as a submodule of
+[Kilix](https://github.com/itsmygithubacct/kilix#readme)
+(`third_party/kilix-multiplexer`). Kilix builds it on first use of
+`kilix remote serve` / `kilix remote attach`, which serve and attach a live
+Kilix pane.
 
 **Status: all six planes work end to end** — layout, cells, stills, motion,
 audio, and input. A multi-pane session can be served over a Unix socket or TCP,
@@ -21,6 +26,22 @@ predictive local echo, client-drawn chrome, and reconnection. Verified between
 two machines in both directions. A live Kilix pane can also be observed through
 `kitty-pty-broker` v2 while RGB frames arrive through the separate
 `kitty-frame-presenter` tap; the observer itself remains read-only.
+
+## What it does
+
+- Serves one or more panes (`kmx-serve`) over an owner-only Unix socket or a
+  TCP port, and attaches to them (`kmx-attach`) from another terminal.
+- Carries six typed planes: layout, cells (lossless diffs against the state
+  the peer holds), still graphics (content-addressed), motion (droppable
+  pixel rectangles), audio (timestamped PCM, optionally compressed) and input.
+- Keeps typing responsive with predictive local echo, and reconnects a
+  client to a running server.
+- Requires a token on TCP, binds loopback unless `--lan` is given, and uses
+  TLS with a pinned, persisted certificate for non-loopback traffic.
+- Observes a live Kilix pane through a `kitty-pty-broker` protocol-v2
+  observer and receives its pixels through the `kitty-frame-presenter` tap.
+
+## Build and test
 
 ```sh
 make               # library and tools
@@ -39,6 +60,9 @@ For coding CLIs, see [coding sessions](docs/coding-sessions.md) for the
 terminal-mode extension, delayed-ACK repair, input delivery guarantees,
 repeatable SSH benchmarks, and remaining history/capability work.
 
+The native build needs zstd, zlib and OpenSSL; `Xvfb` and `ffmpeg` are optional
+for standalone pixel panes. See [docs/design.md](docs/design.md#dependencies).
+
 ## Try it
 
 ```sh
@@ -50,388 +74,51 @@ kmx-serve --socket ./kmx.sock --split horizontal --pane bash --pane 'top -d1'
 kmx-attach --socket ./kmx.sock   # Ctrl-] detaches, Ctrl-O changes pane
 ```
 
-## Local configuration and state
-
-Treat the source checkout as read-only when integrating the multiplexer with a
-particular machine or account. Personal wrappers, configuration, logs, and
-runtime state belong outside the checkout in a location selected by the
-operator. Host aliases, usernames, account/profile choices, local checkout
-paths, tokens, and private endpoints do not belong in this repository.
-
-The client renders the screen, forwards typing, follows resizes, and echoes
-keystrokes optimistically — underlined until the server confirms them.
-`--no-predict` turns that off; `--dump` renders without taking over the
-terminal, which is how the integration tests drive it.
-
-Ordinary motion frames are rendered through compressed, chunked Kitty graphics
-on the attaching Kilix terminal. Audio is sent to `pacat` or `aplay` when one
-is available; `--audio-output COMMAND` selects another raw signed-16-bit PCM
-sink and `--no-audio` disables playback.
-
-An optional EnCodec build adds `--audio-codec auto|encodec|pcm` and
-`--audio-bitrate 3|6|12` to both programs. The default `auto` keeps PCM for
-legacy peers, missing installed mono models and incompatible rate offers.
-`encodec` requires the exact mono profile locally and at the peer; an old peer
-that cannot select it is refused. `pcm` always selects the existing PCM plane.
-After a capability refusal, that connection receives no audio; its other
-planes may continue. PCM fallback applies only to a legacy peer or an explicit
-PCM selection.
-The two endpoints must select the same bitrate. The stereo file profile is
-not a live KMX capability.
-
-New EnCodec peers negotiate the epoch-start profile separately from the existing
-audio capability bytes. Both advertise C0 and, when its context is ready,
-C5-R4; C5-R4 is selected only when both advertise it. A KAC1-only EnCodec peer
-gets C0 on both sides. Legacy PCM peers keep PCM. Each endpoint prewarms at
-most two fixed native contexts before accepting audio, so profile selection
-does not run model loading or inference inside the connection event loop.
-
-The server reports a precise per-profile first-publication counter boundary and
-quiescent final totals; see [EnCodec publication counters](docs/encodec-counters.md).
-
-The optional post-HELLO `AUDIO_PROFILE` message (type13) is exactly12 bytes:
-`KEP1`, kind (0 offer,1 selection), three reserved zero bytes, then a big-endian
-uint32 value. Offers use capability bits0=C0 and1=C5-R4; C0 is required and
-unknown offer bits are ignored. Selection values are markers0=C0 or1=C5-R4;
-unknown or unadvertised markers are refused. The offer precedes KAC1. Only a
-peer that offered the extension receives a selected marker, before its KAC1
-selection. Missing marker means C0. Changed duplicates and profile offers after
-KAC1 are refused; identical KAC1 duplicates retain the committed selection.
-KAC1's size, reserved zeros and strict codec/rate validation are unchanged.
-
-Normal admission uses `KILIX_CONTENT_ROOT`, or the account's NSS home with
-`.local/gpu_terminal/kilix/data/desktop-apps`. Each process checks actual
-packaged catalog membership, receipts and the complete installed population
-through the native provider's embedded F100 adapter, then passes its sealed
-graph descriptors to the strict native loader. Model loading and warm-up
-finish before capability negotiation. KMX performs no download and does not
-substitute a graph directory or an environment-based readiness claim.
-
-Build the optional tools with `ENCODEC=1`, `ENCODEC_CFLAGS` and
-`ENCODEC_LIBS` selecting the reviewed native provider built with `ONNX=1
-CONTENT=1` and an exact `CONTENT_SOURCE`/`CONTENT_COMMIT`. The build also needs
-native epoch-profile setters, libsamplerate and pthreads. Use a separate `BUILD_DIR=build-encodec` when
-switching build modes. The default build retains no native codec dependency.
-
-For local development and oracle tests only,
-`--development-encodec-assets /absolute/graphs` explicitly uses native byte
-validation without installed admission. It prints a development notice and
-is never selected automatically. This path grants no receipt, model supply
-decision or release qualification. Normal desktop launchers do not use it.
-
-EnCodec inference uses two ORT threads by default. Both programs accept
-`--audio-threads 4` to explicitly allocate four inference threads, including
-the inference caller, for the mono codec. This requires a native EnCodec
-runtime supporting that allocation. Each endpoint selects its own local
-budget; it changes no audio negotiation or wire format. The encoder worker has
-a fixed queue for six 40 ms frames to retain timely capture during C5-R4 reset work,
-and two fixed output slots. The decoder retains two input slots and two output
-slots. Capture conversion also
-runs there: 24/44.1/48 kHz interleaved PCM16 with one to eight channels is
-averaged with headroom and resampled to 24 kHz mono, accumulating exactly
-960 samples. Ordinary codec epochs preserve resampler state. Capture gaps
-reset it. The first output sample retains its session PTS; resampler and
-capture accumulation add delivery delay. Decoded mono is passed to the
-existing sink with `KMX_AUDIO_RATE=24000` and `KMX_AUDIO_CHANNELS=1`.
-
-One encoder is shared across clients at each selected epoch profile and rate.
-A late C0 client never changes or resets the shared C5-R4 context; both
-contexts receive the same source PTS and route packets only to matching clients.
-Late clients wait for that profile's next RESET. Idle contexts receive no
-capture work. These fixed contexts add memory and mixed-profile CPU cost;
-functional checks alone do not qualify that additional resource budget.
-Output packets are
-opaque native KMA2 and are never passed through zstd. Queue overflow or work
-older than 250 ms abandons only the affected profile's shared epoch and resumes at the next one-second
-source boundary with native RESET/DISCONTINUITY flags. That age starts at the
-first contributing input offer and includes accumulation, inference and output
-queue residence. Advancing a broken boundary invalidates already queued and
-in-flight encoder work. A client whose own
-application backlog is full or stale abandons only its own epoch. Codec calls,
-RTF, queue drops and discontinuities are reported at shutdown; `--dump` also
-reports selected codec and verified packet PTS/epoch/flags. KMX's existing
-socket flushing coalesces audio with other queued traffic. Token bitrate is
-not a measured TLS wire-rate claim.
-
-Each profile has a separate shutdown counter row; one aggregate row includes
-every context, including earlier profiles used before a reconnect. Client
-decoder input backpressure retains a complete packet in the existing bounded
-framer until an input slot is free and temporarily pauses socket reads. It
-resumes from the codec event without requiring another network read. Retained
-packets keep the oldest contributing read's timestamp, so waiting does not
-refresh the 250ms age budget. Decoder input/output slots remain two each.
-
-With the native library, patched ORT, Content assets and licence receipts
-already installed, a short two-client transport regression uses synthetic
-24kHz mono capture and file sinks, without a playback device:
+From Kilix, serve a pane that the PTY broker owns and attach to it:
 
 ```sh
-python3 -B tests/encodec_transport.py --new-bin /absolute/native-build \
-    --only installed-pair6 --seconds 30 --evidence /absolute/new-test-directory
-```
-
-It requires C5-R4 at 6kbps with the default two inference threads, all 750
-frames at both clients, matching PCM lengths and no codec queue drops. It
-does not replace calibration, long-run, fault or hardware acceptance.
-
-`make test` includes bounded capability/refusal controls. An optional real
-native check is `build-encodec/test-encodec --development-assets /absolute/graphs`.
-With the same native build options, build `build-encodec/test-encodec-age` and
-run it with `/absolute/graphs` to check total acquisition age at all three
-capture rates and recovery after queued or in-flight epoch invalidation.
-This test injects scheduling delays around actual native calls.
-`tests/encodec_transport.py` checks actual capture, decoder/sink bytes, PTS,
-TLS and both legacy directions using synthetic PCM; its arguments select
-exact binaries, local graphs and a new evidence directory. These functional
-controls do not establish listening, consumer timing, multi-client wire
-capacity, memory fit or soak qualification. Motion still has no presentation
-timestamp, so this audio feature makes no A/V synchronization claim.
-`tests/encodec_profiles.py` separately checks actual extension ordering,
-duplicates, C0 fallback and bounded malformed-message refusals. Omitting its
-`--assets` argument uses already-admitted installed assets.
-
-For a broker-owned Kilix pane, the installed frontend supplies the bookkeeping:
-
-```sh
-# PANE_ID comes from: kilix ls --panes
 kilix remote serve PANE_ID --socket 127.0.0.1:47800
-kilix remote attach --socket 127.0.0.1:47800 \
-    --token TOKEN_FROM_SERVER
+kilix remote attach --socket 127.0.0.1:47800 --token TOKEN_FROM_SERVER
 ```
 
-The live server reads PTY output only from a protocol-v2 broker observer.
-Typing uses a separate pane-scoped Kitty remote-control helper, and omitting
-that helper makes the session view-only. Presenter discovery is likewise local
-and session-scoped: applications pay only a one-second socket existence check
-until a server is actually waiting.
+## Usage
 
-## Remote Chrome pixel pane
+| Command | What it does |
+|---|---|
+| `kmx-serve --socket PATH -- COMMAND` | Serve one pane running COMMAND |
+| `kmx-serve --socket PATH --split horizontal\|vertical --pane CMD --pane CMD` | Serve several panes side by side |
+| `kmx-serve --socket PATH --pixel-pane 'COMMAND'` | Serve one X client from a private display as a pixel pane |
+| `kmx-serve --socket PATH --broker-session ID` | Observe a live protocol-v2 broker session |
+| `kmx-serve ... --lan`, `--tls`, `--tls-ephemeral`, `--token` | Reachable TCP bind, TLS and token options |
+| `kmx-attach --socket PATH [--token T] [--tls-fingerprint F]` | Attach; `Ctrl-]` detaches, `Ctrl-O` changes pane |
+| `kmx-attach ... --no-predict`, `--reconnect SECONDS`, `--dump`, `--no-audio`, `--pixel-input` | Client behaviour |
+| `kilix remote serve\|attach\|view` | The Kilix wrapper for a broker-owned pane |
 
-`tools/kmx_remote_chrome.py` is an optional Linux SSH-command helper for one
-interactive Chrome pixel pane. It starts the server on loopback for carriage
-through an SSH tunnel, gives Chrome a private X display, fits its window to the
-framebuffer, and routes authenticated controller input through XTest. The
-helper and `kmx-serve` must come from the same built checkout.
+Client options, audio sinks, live Kilix panes and the remote Chrome helper are
+in [docs/usage.md](docs/usage.md); the compressed-audio build is in
+[docs/encodec-audio.md](docs/encodec-audio.md).
 
-Its lifecycle rule is deliberately strict: after validating the requested
-profile, Kilix source root, required programs, dimensions, port, and token, it
-stops every live process named `chrome` that it can see and refuses to start
-unless the live count reaches zero. Do not use it when another Chrome session
-must remain running.
+## How it works
 
-Pass `--kilix-home KILIX_SOURCE_ROOT`, or set `KILIX_HOME`; there is no
-working-directory-dependent fallback. With no `--user-data-dir`, the helper
-uses and removes an ephemeral profile. To use saved logins, pass an existing
-Chrome user-data directory and optionally `--profile-number N`: zero selects
-`Default`, and a positive number selects `Profile N`. The helper snapshots and
-restores Chrome's general `last_used` and `last_active_profiles` selection so
-that the per-session choice does not become the usual profile.
-
-Keep the SSH destination, checkout locations, Chrome data location, chosen
-profile, launch wrappers, and logs in operator-owned configuration outside
-this checkout, as described above.
-
-## What it costs
-
-Measured by `tools/bench.sh` at 24×80, against the raw PTY byte count a
-byte-forwarding tier would have carried. Every run asserts the receiver ended
-up holding the sender's exact screen and fails if it did not.
-
-| Workload | PTY bytes | Wire bytes | Reduction |
-|---|---|---|---|
-| Idle, 5 s | 0 | one screen, then nothing | — |
-| 200 keystrokes | 200 | 184 | 1.1× |
-| `vim`, 60 page-downs | 39,578 | 790 | **50×** |
-| 1 MB of base64 | 1,062,193 | 12,047 | **88×** |
-| 268 KB of text | 268,386 | 2,009 | **134×** |
-
-Typing is the one case with little to gain — 200 keystrokes really are about
-200 bytes of information. Its problem is latency, not size, which is what the
-predictor is for.
-
-### Reproducing rendering and latency measurements
-
-The optimizations target sparse editing: cached terminal conversion, unchanged
-row comparisons, and partial cell runs. The cache adds one grid per terminal
-and a snapshot copy; dense redraw workloads can regress. Measure your own
-workload before treating these as a general throughput improvement.
-The benchmark tools are development diagnostics, not release acceptance gates;
-the optional SSH mode requires separate qualification in the target environment.
-
-```sh
-make all build/libkilix-mux.so build/bench-grid.so
-make bench-native
-python3 tools/render_bench.py --output build/render-bench.json
-# Use a separately built checkout on an SSH host:
-python3 tools/render_bench.py --remote SSH_HOST --remote-root /path/to/checkout \
-  --output build/render-ssh.json
+```
+ server (kmx-serve)                                    client (kmx-attach)
+ pane PTY / broker observer ──> kmx_term ──> kmx_grid ─┐
+ Kitty graphics escapes ──> content-addressed stills ──┤  ordered KMX stream
+ presenter tap / Xvfb ──> motion rectangles (droppable)├── Unix, TCP, TLS ──> render cells,
+ capture ──> audio blocks (droppable) ─────────────────┤                      stills, motion,
+ layout (pane geometry, sent on change) ───────────────┘ <── input, resize ── audio; predict
 ```
 
-The native benchmark records parsing, encoding, decoding, ANSI generation,
-terminal replay, payload bytes, and complete viewport equality. It uses a
-synthetic clock and immediate acknowledgements; its frame count is **not FPS**.
-Warmups are excluded, cases are shuffled reproducibly, and raw samples are saved.
-`--receiver-library /path/to/older/libkilix-mux.so` checks compatibility with an
-older decoder and renderer.
-
-The render benchmark runs the actual client in a correctly sized PTY, with
-prediction disabled and no second observer. It compares every cell, colour,
-attribute, and cursor with a deterministic expected screen. Read completion is
-timestamped before validation; parsing still adds service time between reads
-and is reported separately. The oracle uses the same terminal implementation,
-so this is not independent terminal conformance or physical display latency.
-Recovery is timed only after an independent control channel confirms that the
-host has finished the burst. Only benchmark-owned processes are suspended or
-terminated.
-
-For an interleaved comparison, add `--baseline-attach /path/to/old/kmx-attach`
-and `--baseline-server /path/to/old/kmx-serve` locally, or
-`--baseline-remote-root /path/to/old/checkout` remotely. Both variants use the
-same validation library; `--library` can pin that independently. Each defaults
-to three runs of 100 samples at four sizes, with ten warmups. Compare the spread
-across runs as well as percentiles; failures exit nonzero and remain in JSON.
-Delay/rate shaping remains available in `tools/coding_bench.py`; it models
-stream scheduling, not packet loss. Generated burst frames may be coalesced.
-
-The PTY owner answers OSC 10/11 default-colour queries using its logical
-palette (light foreground, black background) and advertises truecolour. This
-lets terminal applications choose shaded input areas before a client attaches.
-It does not synchronize a client's custom theme to the host.
-
-## What works today
-
-- **`kmx_term`** — a server-side terminal model fed with a pane's raw output.
-  It answers *what is on screen now*, which is what lets a peer that missed
-  everything be brought current in one message.
-- **`kmx_grid`** — the cell snapshot: characters, attributes, colours, widths,
-  cursor.
-- **`kmx_cells_encode` / `kmx_cells_apply`** — the cell plane. The wire form is
-  a **diff against a state the peer is known to hold**, never a log of what
-  happened. A peer that missed a megabyte of scrollback is caught up by one
-  message describing the screen it should now have, and a lost message is
-  superseded rather than retransmitted. The test suite asserts this directly:
-  600 KB of skipped output costs under 8 KB to catch up on.
-- **Still graphics** — Kitty graphics escapes are collected whole and *in
-  wire order relative to the cells around them*, so an image placement and the
-  text beside it cannot be reordered. Sequences split across reads are
-  reassembled, content-addressed, sent once, and replayed from each client's
-  bounded cache on repeat.
-- **Motion and audio** — RGB frames are delta-compressed per client and audio
-  is framed as timestamped 20 ms PCM blocks. Both are droppable planes: a slow
-  client loses stale media rather than stalling lossless text. A private X
-  display remains available as the standalone pixel source; live Kilix uses
-  the non-blocking presenter tap.
-- **Live pane source and pixel input** — `--broker-session` starts the public
-  broker-v2 observer CLI outside the scheduler and holds no PTY control slot.
-  A separate `--input-command` is the only possible live input descriptor.
-  Pixel panes can use the same option; their helper inherits only the private
-  X display created for that pane. Host-local `t=s`, `t=f` and `t=t` graphics
-  references are suppressed when the tap supplies portable pixels, because
-  replaying their names on another host cannot work.
-- **Layout plane** — where the panes are, in a few dozen bytes. A four-pane
-  arrangement encodes in under 120 bytes, and because the client knows the
-  geometry it draws the dividers and title bars itself rather than receiving
-  pictures of them. Sent only when the arrangement changes.
-- **Still-graphics plane** — Kitty graphics carried under a content-addressed
-  cache, so an image that a client already holds costs a reference rather than
-  a retransmission.
-- **Motion plane** — a pane whose content is pixels, sent as lossless
-  rectangles under a rate allowance. The one plane allowed to drop: a frame
-  that does not fit is discarded rather than queued, because the next frame
-  supersedes it.
-- **Audio plane** — PCM blocks with presentation timestamps against one session
-  clock, taking their allowance first and fixed, so sound never waits on video.
-- **`kmx-serve` / `kmx-attach`** — a multi-pane session served over an
-  owner-only Unix socket or a TCP port, and a client that composites and
-  renders it, with an incremental framer, a diffing renderer, predictive local
-  echo, reconnection, local motion presentation and audio playback. TCP binds
-  loopback unless `--lan` is given, always requires a token, and encrypts
-  non-loopback traffic by default with a pinned certificate.
-
-## Limitations worth knowing before you start
-
-- **A pixel pane is the whole session.** `--pixel-pane` and `--pane` are
-  mutually exclusive: you get a session of text panes, or one pixel pane, not a
-  layout mixing them. Live `--broker-session` is also one selected pane.
-  Mixing native text and pixel panes in one served layout is a refinement the
-  plane model allows and the implementation does not do yet.
-- **A pixel pane is view-only unless it has an input helper.**
-  `--input-command` receives authenticated controller input on stdin and runs
-  with `DISPLAY` set to the pixel pane's private X server. `kmx-attach
-  --pixel-input` requests CSI-u keyboard and SGR-pixel mouse reports and scales
-  mouse coordinates when the local placement and remote framebuffer differ.
-- **A standalone child lives and dies with the server.** If `kmx-serve` owns
-  the command itself, exiting the server ends it. A live `--broker-session`
-  pane is different: `kitty-pty-broker` keeps owning the PTY and the local
-  frontend stays attached when the observer server exits. Client
-  `--reconnect` reconnects to a running server; it does not restart one.
-  Checked rather than assumed: killing the observer with SIGKILL left the
-  broker session alive, and a fresh observer replayed output produced before
-  the kill.
-- **The planes are not synchronised.** Motion and audio are carried
-  independently and neither waits on the other, which is what keeps a stalling
-  video from stuttering the sound — but it also means they are not aligned. The
-  motion plane carries no presentation timestamp at all, so a client renders
-  frames on arrival. For a pane that makes notification sounds this is
-  invisible; for watching video with a soundtrack it will drift. Scoped, with
-  the measurements, in the project's research notes under `AV_SYNC_SCOPE.md`.
-- **Only tapped local graphics are portable.** Inline Kitty graphics remain
-  semantic. Host-local `t=s`, `t=f` and `t=t` references are suppressed when
-  the presenter tap supplies the corresponding RGB, but an unrelated producer
-  outside that tap cannot have an already-consumed local payload reconstructed.
-- **The TLS identity is now persisted** in the user's XDG state directory
-  (0600 in a 0700 directory), so a pinned fingerprint stays valid across
-  restarts. It used to be minted per start, which meant re-copying the
-  fingerprint constantly and, in practice, learning to skip the check.
-  `--tls-ephemeral` restores the old behaviour. The trade is explicit: the
-  private key is on disk now, so it is exposed to backups in a way it was not
-  before.
-- **Eight client slots.** A connection that has not authenticated within
-  `KMX_SETTLE_MS` is dropped, and when every slot is taken a new connection
-  displaces the *oldest un-authenticated* one — so peers that connect and stay
-  silent can no longer lock a session out, which they previously could, for
-  free, from anywhere that could reach the port. A peer that has authenticated
-  is never displaced. Eight simultaneous *legitimate* clients is still the
-  ceiling.
-
-## Properties the tests assert
-
-Losslessness is the gate this design stands or falls on, so it is checked
-rather than argued: every step of every roundtrip test encodes a diff, applies
-it to a separate receiver grid, and asserts the two agree exactly — across
-text, attributes, colours, scrolling, resize, wide characters, combining
-marks, emoji, and 400 steps of randomised cursor motion and erases.
-
-The decoder is the parser a remote peer feeds directly, so it gets more than
-tests: every proper prefix of a valid message must be rejected, single-byte
-corruption must be caught or safely absorbed, trailing bytes are an error, and
-`make fuzz` runs libFuzzer against it under ASan and UBSan.
-
-A peer's claimed grid size is an instruction to allocate, so it is bounded
-(`KMX_MAX_DIMENSION`, `KMX_MAX_CELLS`) rather than trusted.
-
-## Dependencies
-
-`libvterm` (MIT) is vendored under `third_party/libvterm` at the commit recorded
-in `UPSTREAM`, with a numbered patch for dimension and allocation guards.
-The original upstream checksums remain unchanged. `make check-vendor` reverses
-the recorded patch series in a temporary copy and verifies those original
-hashes, rejecting unrecorded source changes. This check needs Python 3 and
-`patch`. Upstream already surfaces Kitty graphics APC sequences in wire order
-through `vterm_screen_set_unrecognised_fallbacks`; no graphics patch is needed.
-
-The native build uses zstd, zlib and OpenSSL. `Xvfb` and `ffmpeg` are
-optional standalone pixel-pane dependencies. Live attachment expects the
-protocol-v2 `kitty-pty-broker` executable and the local presenter tap that
-Kilix pins; neither is copied into this repository. There is no transport
-library or video encoder dependency. The default audio build carries PCM
-under zstd. The optional EnCodec build additionally uses `libkilix-encodec`,
-its ONNX Runtime dependency, libsamplerate and pthreads as described above;
-the legacy PCM transport remains available.
-
-## License
-
-MIT.
+The server keeps a terminal model of each pane and sends cell diffs against
+the screen the client is known to hold, so a lost or skipped stretch of output
+is replaced by one message describing the current screen rather than being
+retransmitted. Still images keep their order relative to the surrounding text
+and are sent once per client cache. Motion and audio are the only planes
+allowed to drop, so a slow link loses stale media rather than stalling text.
+Motion carries no presentation timestamp, so audio and video are not
+synchronised. What each plane does, the current limitations and what the
+tests assert are in [docs/design.md](docs/design.md); wire costs and
+benchmarks are in [docs/performance.md](docs/performance.md).
 
 ## Status
 
@@ -443,3 +130,42 @@ One thing to be plain about before you point it at anything: **the network path
 has not received an independent review.** Treat a reachable bind accordingly —
 prefer an SSH tunnel to a loopback port over `--lan`, which is what the
 documentation recommends anyway.
+
+## Documentation
+
+| Document | Contents |
+|---|---|
+| [docs/usage.md](docs/usage.md) | Local configuration, client behaviour, media playback, live Kilix panes, remote Chrome pixel pane |
+| [docs/encodec-audio.md](docs/encodec-audio.md) | The optional compressed-audio build: selection, negotiation, admission, threads, queues, checks |
+| [docs/encodec-counters.md](docs/encodec-counters.md) | Per-profile publication counters |
+| [docs/coding-sessions.md](docs/coding-sessions.md) | Coding CLIs over KMX: terminal modes, delayed-ACK repair, input delivery, benchmarks |
+| [docs/performance.md](docs/performance.md) | Wire cost per workload, rendering and latency measurements |
+| [docs/design.md](docs/design.md) | The planes, limitations, tested properties and dependencies |
+| [SECURITY.md](SECURITY.md) | What is enforced, and the defects found so far |
+
+## Related repositories
+
+- [kilix](https://github.com/itsmygithubacct/kilix#readme): pins this
+  submodule and wraps it as `kilix remote`.
+- [kitty-pty-broker](https://github.com/itsmygithubacct/kitty-pty-broker#readme):
+  owns the live pane the server observes.
+- [kitty-frame-presenter](https://github.com/itsmygithubacct/kitty-frame-presenter#readme):
+  its frame tap supplies a live pane's pixels.
+- [kilix-encodec](https://github.com/itsmygithubacct/kilix-encodec#readme):
+  the native codec library the optional audio build links.
+
+## Part of Plebian-OS
+
+kilix-multiplexer is one of the repositories behind
+[Plebian-OS](https://github.com/itsmygithubacct/plebian-os#readme), a Debian
+install whose desktop is [Kilix](https://github.com/itsmygithubacct/kilix#readme)
+running the [Kilix 95](https://github.com/itsmygithubacct/kilix-95#readme)
+desktop through [Pleb](https://github.com/itsmygithubacct/pleb#readme).
+It ships inside Kilix as the `third_party/kilix-multiplexer` submodule and is
+built when a user first runs `kilix remote`. The map of every repository and
+how it ships is on the
+[components page](https://github.com/itsmygithubacct/plebian-os/blob/main/docs/components.md).
+
+## License
+
+MIT.
