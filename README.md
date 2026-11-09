@@ -88,7 +88,7 @@ kilix remote attach --socket 127.0.0.1:47800 --token TOKEN_FROM_SERVER
 | `kmx-serve --socket PATH -- COMMAND` | Serve one pane running COMMAND |
 | `kmx-serve --socket PATH --split horizontal\|vertical --pane CMD --pane CMD` | Serve several panes side by side |
 | `kmx-serve --socket PATH --pixel-pane 'COMMAND'` | Serve one X client from a private display as a pixel pane |
-| `kmx-serve --socket PATH --broker-session ID` | Observe a live protocol-v2 broker session |
+| `kmx-serve --socket PATH --broker-session ID --broker-runtime DIR` | Observe a live protocol-v2 broker session (`KITTY_PTY_BROKER_RUNTIME` can supply the runtime directory) |
 | `kmx-serve ... --lan`, `--tls`, `--tls-ephemeral`, `--token` | Reachable TCP bind, TLS and token options |
 | `kmx-attach --socket PATH [--token T] [--tls-fingerprint F]` | Attach; `Ctrl-]` detaches, `Ctrl-O` changes pane |
 | `kmx-attach ... --no-predict`, `--reconnect SECONDS`, `--dump`, `--no-audio`, `--pixel-input` | Client behaviour |
