@@ -27,7 +27,13 @@
 #include <limits.h>
 #include <fcntl.h>
 #include <poll.h>
+#if defined(__FreeBSD__) || defined(__DragonFly__)
+#include <libutil.h>
+#elif defined(__APPLE__) || defined(__NetBSD__) || defined(__OpenBSD__)
+#include <util.h>
+#else
 #include <pty.h>
+#endif
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -394,8 +400,12 @@ peer_is_owner(int fd) {
     if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &credentials, &size) != 0) return false;
     return credentials.uid == geteuid();
 #else
-    (void)fd;
-    return true;
+    /* No SO_PEERCRED (FreeBSD, macOS, the other BSDs): getpeereid() answers
+     * the same question.  Unreadable credentials refuse the peer. */
+    uid_t uid;
+    gid_t gid;
+    if (getpeereid(fd, &uid, &gid) != 0) return false;
+    return uid == geteuid();
 #endif
 }
 

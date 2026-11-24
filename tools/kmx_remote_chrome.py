@@ -8,6 +8,7 @@ helper, and tears down that exact session when the SSH channel goes away.
 
 import argparse
 import ctypes
+import ctypes.util
 import json
 import os
 from pathlib import Path
@@ -44,7 +45,45 @@ def parse_args():
     return parser.parse_args()
 
 
+IS_FREEBSD = sys.platform.startswith("freebsd")
+
+
+def _freebsd_processes(pid=None):
+    """{pid: (state, comm)} from ps(1): FreeBSD mounts no /proc by default."""
+    command = ["ps", "-ww", "-o", "pid=", "-o", "state=", "-o", "comm="]
+    command += ["-p", str(int(pid))] if pid is not None else ["-ax"]
+    try:
+        output = subprocess.run(command, capture_output=True, text=True,
+                                timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    found = {}
+    for line in output.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) == 3 and parts[0].isdigit():
+            found[int(parts[0])] = (parts[1], parts[2].strip())
+    return found
+
+
+def _freebsd_argv(pid):
+    """argv of PID from the kern.proc.args sysctl; None when unreadable."""
+    libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+    mib = (ctypes.c_int * 4)(1, 14, 7, int(pid))  # CTL_KERN KERN_PROC KERN_PROC_ARGS
+    size = ctypes.c_size_t(0)
+    if libc.sysctl(mib, 4, None, ctypes.byref(size), None, ctypes.c_size_t(0)) != 0:
+        return None
+    buffer = ctypes.create_string_buffer(size.value + 1)
+    size = ctypes.c_size_t(len(buffer))
+    if libc.sysctl(mib, 4, buffer, ctypes.byref(size), None, ctypes.c_size_t(0)) != 0:
+        return None
+    return [value.decode("utf-8", "replace")
+            for value in buffer.raw[:size.value].split(b"\0") if value]
+
+
 def process_is_live(pid):
+    if IS_FREEBSD:
+        state = _freebsd_processes(pid).get(int(pid), ("",))[0]
+        return bool(state) and not state.startswith("Z")
     try:
         state = next(
             line.split()[1]
@@ -58,6 +97,14 @@ def process_is_live(pid):
 
 def processes_matching(predicate):
     matches = []
+    if IS_FREEBSD:
+        for pid, (state, comm) in _freebsd_processes().items():
+            if state.startswith("Z"):
+                continue
+            argv = _freebsd_argv(pid)
+            if argv is not None and predicate(comm, argv):
+                matches.append(pid)
+        return matches
     for entry in Path("/proc").iterdir():
         if not entry.name.isdigit():
             continue
@@ -316,11 +363,17 @@ def main():
 
     # sshd normally signals its command when the channel closes, but a killed
     # local ssh client can instead leave that command reparented and alive.
-    # Linux's parent-death signal closes that lifecycle gap; the explicit
-    # parent check covers the small race between reading the parent and prctl.
+    # A parent-death signal closes that lifecycle gap (prctl on Linux, procctl
+    # PROC_PDEATHSIG_CTL on FreeBSD); the explicit parent check covers the small
+    # race between reading the parent and arming the signal.
     parent_pid = os.getppid()
     try:
-        ctypes.CDLL(None).prctl(1, signal.SIGTERM)
+        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        if IS_FREEBSD:
+            libc.procctl.argtypes = [ctypes.c_int, ctypes.c_int64, ctypes.c_int, ctypes.c_void_p]
+            libc.procctl(0, os.getpid(), 11, ctypes.byref(ctypes.c_int(signal.SIGTERM)))
+        else:
+            libc.prctl(1, signal.SIGTERM)
     except (AttributeError, OSError):
         pass
     if os.getppid() != parent_pid:

@@ -14,7 +14,12 @@ CPPFLAGS += -DKMX_VERSION=\"$(VERSION)\"
 CFLAGS ?= -O2
 CFLAGS += -std=c11 -Wall -Wextra -Wpedantic -Werror -fPIC
 LDFLAGS ?=
-LDLIBS += -lzstd -lz -lm
+# zstd flags come from pkg-config when it knows the package: FreeBSD installs
+# libzstd under /usr/local, which its cc does not search by default.
+ZSTD_CFLAGS ?= $(shell pkg-config --cflags libzstd 2>/dev/null)
+ZSTD_LIBS ?= $(shell pkg-config --libs libzstd 2>/dev/null || echo -lzstd)
+CPPFLAGS += $(ZSTD_CFLAGS)
+LDLIBS += $(ZSTD_LIBS) -lz -lm
 
 # Optional installed EnCodec consumer. The supplied native library must be
 # built with ONNX=1 CONTENT=1 and an exact reviewed CONTENT_SOURCE/COMMIT.

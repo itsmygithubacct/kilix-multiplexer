@@ -8,7 +8,12 @@
  *
  * Exposing a non-loopback address is possible but has to be asked for, and
  * says so when it happens. */
+/* The BSDs expose SOCK_CLOEXEC and other non-POSIX-2008 names only while no
+ * strict-POSIX feature macro is set; glibc exposes them either way. */
+#if !defined(__FreeBSD__) && !defined(__DragonFly__) && !defined(__NetBSD__) && \
+    !defined(__OpenBSD__) && !defined(__APPLE__)
 #define _POSIX_C_SOURCE 200809L
+#endif
 
 #include "kilix_mux.h"
 #include "endpoint.h"

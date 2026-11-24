@@ -66,8 +66,14 @@ peer_is_owner(int fd) {
     }
     return credentials.uid == geteuid();
 #else
-    (void)fd;
-    return true;
+    /* No SO_PEERCRED (FreeBSD, macOS, the other BSDs): getpeereid() answers
+     * the same question.  Unreadable credentials refuse the peer. */
+    uid_t uid;
+    gid_t gid;
+    if (getpeereid(fd, &uid, &gid) != 0) {
+        return false;
+    }
+    return uid == geteuid();
 #endif
 }
 
